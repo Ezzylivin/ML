@@ -1,17 +1,10 @@
-# --- Web Framework & CORS ---
 flask==3.0.3
 flask-cors==4.0.1
-
-# --- ML & Data Science ---
+gunicorn==23.0.0
 pandas==2.2.3
 numpy==1.26.4
 scikit-learn==1.5.2
 xgboost==2.1.1
 joblib==1.4.2
-
-# --- Utilities ---
 python-dotenv==1.0.1
 requests==2.32.3
-
-# --- Production Server (instead of flask dev server) ---
-gunicorn==23.0.0

@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: tradingbot-backend
+    env: python
+    plan: free   # or starter/pro depending on your account
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.app:app --host 0.0.0.0 --port 8000
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11
+      - key: COINBASE_API_KEY
+        sync: false
+      - key: COINBASE_API_SECRET
+        sync: false
+      - key: COINBASE_PASSPHRASE
+        sync: false

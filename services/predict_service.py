@@ -3,18 +3,18 @@ import joblib
 import os
 from typing import List
 
-MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models", "saved")
+MODELS_DIR = os.path.join(os.path.dirname(__file__), "..", "models", "saved")
 
 # Ensure directory exists
-os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(MODELS_DIR, exist_ok=True)
 
 def load_model(symbol: str):
     """
     Load a trained model for a symbol.
     Example: BTC-USD -> BTC-USD_model.pkl
     """
-    model_path = os.path.join(MODEL_DIR, f"{symbol}_model.pkl")
-    if not os.path.exists(model_path):
+    model_path = os.path.join(MODELS_DIR, f"{symbol}_xgboost_model.pkl")
+    if not os.path.exists(models_path):
         raise FileNotFoundError(f"No trained model found for {symbol}. Train first!")
     return joblib.load(model_path)
 

@@ -1,9 +1,11 @@
+# File: requirements.txt
 
-gunicorn==23.0.0
-pandas==2.2.3
-numpy==1.26.4
-scikit-learn==1.5.2
-xgboost==2.1.1
-joblib==1.4.2
-python-dotenv==1.0.1
-requests==2.32.3
+fastapi
+uvicorn[standard]
+pandas
+numpy
+scikit-learn
+xgboost
+joblib
+python-dotenv
+requests

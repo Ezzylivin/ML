@@ -1,14 +1,15 @@
 # File: render.yaml
 services:
   - type: web
-    name: trading-ml-backend # A more descriptive name
+    name: trading-ml-backend
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
-    # ✅ FIX: Use the correct startup command for FastAPI/Uvicorn
+    # ✅ FIX: Use uvicorn (for FastAPI) and point it to your new main.py file
     startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-      - key: JWT_SECRET # Example for a secret key
-        sync: false
+      # --- Add your other environment variables here ---
+      - key: JWT_SECRET
+        sync: false # Make sure to set this in the Render dashboard

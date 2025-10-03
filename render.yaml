@@ -1,16 +1,14 @@
+# File: render.yaml
 services:
   - type: web
-    name: tradingbot-backend
+    name: trading-ml-backend # A more descriptive name
     env: python
-    plan: free   # or starter/pro depending on your account
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    # ✅ FIX: Use the correct startup command for FastAPI/Uvicorn
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11
-      - key: COINBASE_API_KEY
-        sync: false
-      - key: COINBASE_API_SECRET
-        sync: false
-      - key: COINBASE_PASSPHRASE
+        value: 3.11.9
+      - key: JWT_SECRET # Example for a secret key
         sync: false

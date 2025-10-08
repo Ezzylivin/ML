@@ -1,4 +1,3 @@
-# services/backtest_service.py
 import pandas as pd
 import numpy as np
 from typing import Dict, Any
@@ -11,87 +10,115 @@ def run_backtest(
     fee: float = 0.001
 ) -> Dict[str, Any]:
     """
-    Run a simple backtest using predicted_target column.
-    Strategy: Buy when predicted_target > 0, Sell when < 0.
-    Returns trading metrics, equity curve, ML metrics, and ML equity.
+    Run a more realistic backtest using the 'predicted_target' column.
+
+    Improvements:
+    - Fixes lookahead bias by using the next candle's 'open' price for trades.
+    - Correctly calculates win rate and other metrics by tracking round-trip trades.
+    - Adds more detailed performance metrics like Profit Factor and total trades.
     """
     if "predicted_target" not in df.columns:
         raise ValueError("Missing 'predicted_target' in DataFrame.")
+    if "open" not in df.columns:
+        raise ValueError("DataFrame must contain 'open' column for realistic backtesting.")
 
     balance = initial_balance
-    position = 0
-    equity_curve = []
+    position_size = 0.0
+    entry_price = 0.0
+    equity_curve = [initial_balance] # Start with initial balance
     trades = []
-    max_balance = initial_balance
-    drawdowns = []
+    
+    # --- Main trading loop ---
+    # We loop to len(df) - 1 because we need the next candle's open to trade.
+    for i in range(len(df) - 1):
+        # The signal is based on the data from the current candle 'i'.
+        signal = np.sign(df["predicted_target"].iloc[i])
+        
+        # The trade is executed at the open of the *next* candle 'i+1'.
+        trade_price = df["open"].iloc[i+1]
 
-    # Ensure datetime index
-    if not isinstance(df.index, pd.DatetimeIndex):
-        if "timestamp" in df.columns:
-            df.index = pd.to_datetime(df["timestamp"])
-        else:
-            df.index = pd.date_range(start="2000-01-01", periods=len(df), freq="D")
-
-    # --- Main trading loop (ML-driven strategy) ---
-    for i in range(len(df)):
-        price = df["close"].iloc[i]
-        signal = np.sign(df["predicted_target"].iloc[i])  # +1 buy, -1 sell, 0 hold
-
-        # Buy
+        # --- Execute Trades ---
+        # Buy Signal: If we get a buy signal and are not in a position.
         if signal > 0 and balance > 0:
-            position = balance / price
+            position_size = balance / trade_price
+            entry_price = trade_price
             balance = 0
-            trades.append({"action": "buy", "price": price, "time": str(df.index[i])})
+            # Record the buy trade
+            trades.append({
+                "action": "buy",
+                "price": trade_price,
+                "time": str(df.index[i+1]),
+                "size": position_size
+            })
 
-        # Sell
-        elif signal < 0 and position > 0:
-            balance = position * price * (1 - fee)
-            position = 0
-            trades.append({"action": "sell", "price": price, "time": str(df.index[i])})
+        # Sell Signal: If we get a sell signal and are currently in a position.
+        elif signal < 0 and position_size > 0:
+            sell_value = position_size * trade_price
+            balance = sell_value * (1 - fee)
+            # Record the sell trade with profit/loss for this round trip
+            pnl_pct = (trade_price / entry_price - 1) * 100
+            trades.append({
+                "action": "sell",
+                "price": trade_price,
+                "time": str(df.index[i+1]),
+                "size": position_size,
+                "pnl_pct": pnl_pct
+            })
+            position_size = 0
+            entry_price = 0
 
-        # Equity = balance + open position
-        equity = balance + position * price
-        equity_curve.append({"time": str(df.index[i]), "equity": equity})
+        # --- Update Equity Curve ---
+        # Calculate current equity at the close of candle 'i'.
+        current_price = df["close"].iloc[i]
+        equity = balance + position_size * current_price
+        equity_curve.append(equity)
 
-        # Track drawdown
-        max_balance = max(max_balance, equity)
-        drawdowns.append((max_balance - equity) / max_balance)
+    # --- Calculate Final Metrics ---
+    equity_series = pd.Series(equity_curve, index=df.index[:len(equity_curve)])
+    
+    final_balance = equity_series.iloc[-1]
+    total_profit_pct = (final_balance / initial_balance - 1) * 100
+    
+    # Calculate Drawdown
+    peak = equity_series.cummax()
+    drawdown = (equity_series - peak) / peak
+    max_drawdown_pct = abs(drawdown.min() * 100)
+    
+    # --- Calculate Trade Statistics from round trips ---
+    sell_trades = [t for t in trades if t['action'] == 'sell']
+    total_trades = len(sell_trades)
+    
+    if total_trades > 0:
+        winning_trades = [t for t in sell_trades if t['pnl_pct'] > 0]
+        losing_trades = [t for t in sell_trades if t['pnl_pct'] <= 0]
+        
+        win_rate = (len(winning_trades) / total_trades) * 100 if total_trades > 0 else 0
+        
+        gross_profit = sum(t['price'] * t['size'] - trades[trades.index(t)-1]['price'] * trades[trades.index(t)-1]['size'] for t in winning_trades)
+        gross_loss = abs(sum(t['price'] * t['size'] - trades[trades.index(t)-1]['price'] * trades[trades.index(t)-1]['size'] for t in losing_trades))
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+    else:
+        win_rate = 0
+        profit_factor = 0
 
-    final_balance = equity_curve[-1]["equity"]
-    total_profit = final_balance - initial_balance
-    max_drawdown = max(drawdowns) * 100 if drawdowns else 0
-    win_trades = sum(
-        1
-        for t in trades if t["action"] == "sell"
-        and trades.index(t) > 0
-        and t["price"] > trades[trades.index(t)-1]["price"]
-    )
-    total_sells = sum(1 for t in trades if t["action"] == "sell")
-    win_rate = (win_trades / total_sells * 100) if total_sells > 0 else 0
-
-    # --- ML metrics (optional, only if true target exists) ---
+    # --- ML Metrics (optional) ---
     ml_metrics = None
     if "target" in df.columns:
         try:
             rmse = math.sqrt(mean_squared_error(df["target"], df["predicted_target"]))
-            ml_metrics = {
-                "rmse_overall": rmse,
-                # place for safe vs lag splits if you want
-            }
+            ml_metrics = {"rmse_overall": rmse}
         except Exception:
             pass
-
-    # --- ML-driven equity curve (just reuse equity_curve for now) ---
-    ml_equity_curve = [{"time": e["time"], "ml_balance": e["equity"]} for e in equity_curve]
 
     return {
         "initial_balance": initial_balance,
         "final_balance": final_balance,
-        "total_profit": total_profit,
-        "max_drawdown": max_drawdown,
+        "total_profit_pct": total_profit_pct,
+        "max_drawdown_pct": max_drawdown_pct,
         "win_rate": win_rate,
+        "profit_factor": profit_factor,
+        "total_trades": total_trades,
         "trades": trades,
-        "equity_curve": equity_curve,    # normal equity
-        "ml_equity_curve": ml_equity_curve,  # ML strategy curve
-        "ml_metrics": ml_metrics,        # RMSE etc.
+        "equity_curve": [{"time": str(t), "equity": v} for t, v in equity_series.items()],
+        "ml_metrics": ml_metrics
     }

@@ -49,6 +49,9 @@ def get_model_metadata(model_name: str):
         # Use the model_name as-is (lowercase) to build the path.
         metadata_path = os.path.join(MODELS_DIR, model_name, "metadata.json")
 
+        # ✅ ADD THIS LINE FOR DEBUGGING
+        print(f"DEBUG: Checking for metadata file at: {metadata_path}")
+
         if not os.path.exists(metadata_path):
             # If the file doesn't exist, return a 404 error.
             raise HTTPException(status_code=404, detail=f"Metadata for model '{model_name}' not found.")

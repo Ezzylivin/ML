@@ -1,6 +1,6 @@
 # File: /root/Project/ML/diamond.py
-# 🚀 UPGRADE: v82.1 - "The Complete Sovereign"
-# 🛠 FIXES: Restored missing 'ensure_tables_exist', Full Audit Compliance.
+# 🚀 UPGRADE: v85.0 - "The Unified Sovereign"
+# 🛠 FEATURES: Multi-Bot Identity, Daily Risk Caps, Verbose Transparency, Stability Fixes.
 
 import os, json, logging, traceback, math, threading, warnings, joblib, time, sqlite3
 import pandas as pd
@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import pandas_ta as ta
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # --- 1. CONFIGURATION ---
 warnings.filterwarnings('ignore')
@@ -32,7 +32,8 @@ SLIPPAGE_BPS = 2.0
 MAX_TOTAL_RISK = 0.30 
 GLOBAL_MODEL_CACHE = {}
 
-app = FastAPI(title="Sovereign Executive v82.1")
+# 🚀 CRITICAL: Initialize App BEFORE defining endpoints
+app = FastAPI(title="Sovereign Executive v85.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,7 +48,6 @@ bots_lock = threading.Lock()
 
 # --- 2. PERSISTENCE LAYER ---
 def ensure_tables_exist():
-    """Restored: Ensures DB tables exist to prevent 'no such table' errors."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
@@ -90,7 +90,6 @@ def execute_db_with_retry(query, params=(), retries=5):
                 return True
         except sqlite3.OperationalError as e:
             if conn: conn.close()
-            # If table missing, try to heal
             if "no such table" in str(e) and attempt == 0:
                 ensure_tables_exist()
                 continue
@@ -180,7 +179,8 @@ def compute_signal(df_slice, strategy_conf, ml_model=None, ml_thresh=0.5):
 
 # --- 4. RISK MANAGER ---
 class PrecisionPyramidManager:
-    def __init__(self, capital, fee=DEFAULT_TAKER_FEE, max_layers=3, base_risk=0.01, risk_mode="static"):
+    def __init__(self, capital, fee=DEFAULT_TAKER_FEE, max_layers=3, base_risk=0.01, risk_mode="static", 
+                 max_daily_loss=5.0, max_trades_per_day=20):
         self.initial_capital = float(capital)
         self.cash = float(capital)
         self.fee = fee
@@ -192,6 +192,34 @@ class PrecisionPyramidManager:
         self.peak = float(capital)
         self.dd_series = [0]
         self.current_equity = float(capital)
+        
+        # Daily Risk Tracking
+        self.max_daily_loss_pct = float(max_daily_loss)
+        self.max_trades_per_day = int(max_trades_per_day)
+        self.today_start_equity = float(capital)
+        self.daily_trades_count = 0
+        self.last_day_reset = datetime.now(timezone.utc).date()
+
+    def check_daily_reset(self, current_time_str):
+        """Resets PnL trackers if a new UTC day has started."""
+        current_date = datetime.fromisoformat(current_time_str).date()
+        if current_date > self.last_day_reset:
+            self.last_day_reset = current_date
+            self.today_start_equity = self.current_equity
+            self.daily_trades_count = 0
+            return True 
+        return False
+
+    def is_trading_allowed(self):
+        """Checks if daily limits have been breached."""
+        if self.daily_trades_count >= self.max_trades_per_day:
+            return False, f"Daily trade limit ({self.max_trades_per_day}) reached."
+            
+        daily_pnl_pct = ((self.current_equity - self.today_start_equity) / self.today_start_equity) * 100
+        if daily_pnl_pct <= -self.max_daily_loss_pct:
+            return False, f"Daily loss limit (-{self.max_daily_loss_pct}%) hit. PnL: {daily_pnl_pct:.2f}%"
+            
+        return True, "OK"
 
     def step_equity(self, price):
         self.current_equity = self.cash + sum(p['qty'] * price for p in self.positions)
@@ -200,6 +228,8 @@ class PrecisionPyramidManager:
         return self.current_equity
 
     def handle(self, signal, price, low, high, time, atr, tsl_mult, slippage_bps=0):
+        self.check_daily_reset(time)
+        
         orders = []
         balance_metric = self.current_equity if self.risk_mode == "dynamic" else self.initial_capital
         
@@ -209,6 +239,11 @@ class PrecisionPyramidManager:
         # Risk Cap Check
         current_risk_exposure = len(self.positions) * self.base_risk
         if (current_risk_exposure + self.base_risk) > MAX_TOTAL_RISK:
+            signal = 0 
+
+        # Daily Limits Check
+        allowed, reason = self.is_trading_allowed()
+        if not allowed and signal == 1:
             signal = 0 
 
         if signal == 1 and len(self.positions) < self.max_layers:
@@ -222,13 +257,14 @@ class PrecisionPyramidManager:
             if self.cash >= (cost + entry_fee):
                 self.positions.append({'qty': qty, 'entry': fill_price, 'time': time, 'peak': fill_price})
                 self.cash -= (cost + entry_fee)
+                self.daily_trades_count += 1 
                 orders.append(('BUY', qty))
         
         elif signal == -1 and self.positions:
             q = sum(p['qty'] for p in self.positions)
             self.close_all(fill_price, time, "SIGNAL_REVERSAL")
             orders.append(('SELL', q))
-            return orders
+            return orders, reason
 
         dist = (atr * tsl_mult) if atr > 0 else (price * 0.05)
         remaining = []
@@ -243,7 +279,7 @@ class PrecisionPyramidManager:
             else:
                 remaining.append(p)
         self.positions = remaining
-        return orders
+        return orders, reason
 
     def close_all(self, price, time, reason):
         for p in self.positions: self.close_position(p, price, time, reason)
@@ -265,12 +301,16 @@ class LiveExecutiveBot:
         self.tf = config.get('timeframe', '1h')
         self.user_id = config.get('userId', 'anon_user')
         
-        clean_symbol = self.symbol.replace('/', '-')
-        self.bot_id = f"{self.user_id}_{clean_symbol}_{self.tf}"
+        # 🚀 UPGRADE: Accept Explicit Bot ID
+        if 'botId' in config:
+            self.bot_id = config['botId']
+        else:
+            clean_symbol = self.symbol.replace('/', '-')
+            self.bot_id = f"{self.user_id}_{clean_symbol}_{self.tf}"
+            
         self.is_paper = config.get('mode', 'paper') == 'paper'
         self.last_processed_ts = 0
         
-        # Logger Setup
         self.logger = logging.getLogger(self.bot_id)
         if not self.logger.handlers:
             try:
@@ -286,7 +326,6 @@ class LiveExecutiveBot:
         self.tsl_mult = float(self.params.get('tslAtrMult', 3.5))
         self.min_adx = float(self.params.get('minAdxLevel', 0))
         
-        # Calls the function defined above to ensure DB is ready
         ensure_tables_exist()
 
         exchange_id = config.get('exchange', 'coinbase').lower()
@@ -298,6 +337,7 @@ class LiveExecutiveBot:
         try:
             if not config.get('apiKey') and self.is_paper:
                 self.exchange = exchange_class({'enableRateLimit': True})
+                self.logger.info("⚠️ Starting Public Paper Mode")
             else:
                 self.exchange = exchange_class({
                     'apiKey': config.get('apiKey', ''), 
@@ -323,10 +363,14 @@ class LiveExecutiveBot:
         
         risk_pct = float(config.get('riskPercentage', 1)) / 100.0
         risk_mode = config.get('riskManagementMode', 'static')
+        
+        # Inject Risk Limits
         self.manager = PrecisionPyramidManager(
             capital=config.get('initialBalance', 1000), 
             base_risk=risk_pct, 
-            risk_mode=risk_mode
+            risk_mode=risk_mode,
+            max_daily_loss=config.get('maxDailyLoss', 5.0),
+            max_trades_per_day=config.get('maxTradesPerDay', 20)
         )
         self._load_state_and_recover()
         self.is_running = False
@@ -362,6 +406,7 @@ class LiveExecutiveBot:
                 df = pd.DataFrame(ohlcv[:-1], columns=['ts','open','high','low','close','volume'])
                 df.set_index(pd.to_datetime(df['ts'], unit='ms', utc=True), inplace=True)
 
+                # Indicators
                 df.ta.sma(length=10, append=True, col_names="fast_sma")
                 df.ta.sma(length=50, append=True, col_names="slow_sma")
                 df.ta.macd(append=True); df.ta.psar(append=True)
@@ -413,8 +458,12 @@ class LiveExecutiveBot:
                     final_verdict = "🟢 BUY" if combined_sig == 1 else ("🔴 SELL" if combined_sig == -1 else "⚪ HOLD")
                     report.append(f"⚖️  FINAL VERDICT: {final_verdict} (Score: {sum(votes)})")
 
-                orders = self.manager.handle(combined_sig, price, low, high, df.index[-1].isoformat(), df[atr].iloc[-1], self.tsl_mult)
+                orders, risk_msg = self.manager.handle(combined_sig, price, low, high, 
+                                             df.index[-1].isoformat(), df[atr].iloc[-1], self.tsl_mult)
                 
+                if risk_msg != "OK":
+                    report.append(f"⚠️ RISK LIMIT: {risk_msg}")
+
                 if orders:
                     report.append("--- ⚡ EXECUTION ---")
                     for action, qty in orders:
@@ -444,17 +493,21 @@ class LiveExecutiveBot:
 
     def stop(self): self.is_running = False
 
-# --- 6. ENDPOINTS ---
+# --- 6. ENDPOINTS (SCOPED) ---
 
 @app.post('/api/bot/start')
 async def start_live_bot(request: Request, bg: BackgroundTasks):
     try:
         body = await request.json()
-        user_id = body.get('userId')
-        if not user_id: return JSONResponse({"error": "Missing userId"}, 400)
+        bot_id = body.get('botId')
         
-        clean_symbol = body['symbol'].replace('/', '-')
-        bot_id = f"{user_id}_{clean_symbol}_{body['timeframe']}"
+        # Fallback for legacy calls without botId
+        if not bot_id and body.get('userId'):
+            clean_symbol = body['symbol'].replace('/', '-')
+            bot_id = f"{body['userId']}_{clean_symbol}_{body['timeframe']}"
+            body['botId'] = bot_id
+
+        if not bot_id: return JSONResponse({"error": "botId required"}, 400)
         
         with bots_lock:
             if bot_id in active_live_bots: 
@@ -475,11 +528,21 @@ async def start_live_bot(request: Request, bg: BackgroundTasks):
 @app.post('/api/bot/stop')
 async def stop_live_bot(request: Request):
     body = await request.json()
-    user_id = body.get('userId')
-    if not user_id: return JSONResponse({"error": "Missing userId"}, 400)
+    bot_id = body.get('botId')
     
-    clean_symbol = body['symbol'].replace('/', '-')
-    bot_id = f"{user_id}_{clean_symbol}_{body['timeframe']}"
+    # Fallback support
+    if not bot_id and 'userId' in body:
+        userId = body['userId']
+        stopped_count = 0
+        with bots_lock:
+            to_remove = [bid for bid in active_live_bots if bid.startswith(userId)]
+            for bid in to_remove:
+                active_live_bots[bid].stop()
+                del active_live_bots[bid]
+                stopped_count += 1
+        return {"status": "stopped", "count": stopped_count}
+
+    if not bot_id: return JSONResponse({"error": "botId required"}, 400)
     
     with bots_lock:
         if bot_id in active_live_bots:
@@ -488,23 +551,34 @@ async def stop_live_bot(request: Request):
             return {"status": "stopped"}
     return JSONResponse({"error": "Bot not found"}, 404)
 
-# --- 7. TELEMETRY ENDPOINTS ---
-
 @app.get('/api/bot/status')
-async def get_bot_status(userId: str = None):
-    if not userId: return JSONResponse({"error": "userId required"}, 400)
-    
+async def get_bot_status(botId: str = None, userId: str = None):
     target_bot = None
-    for bot_id, bot in active_live_bots.items():
-        if bot_id.startswith(userId):
-            target_bot = bot
-            break
+    
+    if botId:
+        target_bot = active_live_bots.get(botId)
+    elif userId:
+        for bid, bot in active_live_bots.items():
+            if bid.startswith(userId):
+                target_bot = bot
+                break
             
     if not target_bot:
-        rows = execute_db_with_retry("SELECT cash, last_ts FROM bots WHERE user_id=?", (userId,))
+        lookup_id = botId if botId else (userId if userId else None)
+        if not lookup_id: return JSONResponse({"error": "ID required"}, 400)
+        
+        rows = execute_db_with_retry("SELECT cash, last_ts FROM bots WHERE bot_id=?", (lookup_id,))
         if rows:
             return {"status": "stopped", "currentBalance": rows[0][0], "active": False}
         return JSONResponse({"status": "not_found"}, 404)
+
+    # Live Metrics
+    trades = target_bot.manager.trades
+    total_trades = len(trades)
+    winning_trades = len([t for t in trades if t['profit'] > 0])
+    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+    dd_series = target_bot.manager.dd_series
+    max_dd = max(dd_series) * 100 if dd_series else 0
 
     return {
         "status": "running",
@@ -512,24 +586,33 @@ async def get_bot_status(userId: str = None):
         "timeframe": target_bot.tf,
         "currentBalance": target_bot.manager.current_equity,
         "positions": target_bot.manager.positions,
-        "trades": target_bot.manager.trades,
+        "trades": trades,
         "performanceMetrics": {
-            "totalTrades": len(target_bot.manager.trades),
-            "netProfit": target_bot.manager.current_equity - target_bot.manager.initial_capital
+            "totalTrades": total_trades,
+            "winRate": round(win_rate, 2),
+            "netProfit": target_bot.manager.current_equity - target_bot.manager.initial_capital,
+            "maxDrawdown": round(max_dd, 2)
         }
     }
 
 @app.get('/api/bot/logs')
-async def get_bot_logs(userId: str = None):
-    if not userId: return JSONResponse({"error": "userId required"}, 400)
-
-    log_files = [f for f in os.listdir(LOG_DIR) if f.startswith(userId)]
-    if not log_files: return []
-
-    latest_log = max([os.path.join(LOG_DIR, f) for f in log_files], key=os.path.getmtime)
+async def get_bot_logs(botId: str = None, userId: str = None):
+    target_file = None
     
+    if botId:
+        target_file = f"{botId}.log"
+    elif userId:
+        files = [f for f in os.listdir(LOG_DIR) if f.startswith(userId)]
+        if files:
+            target_file = max(files, key=lambda x: os.path.getmtime(os.path.join(LOG_DIR, x)))
+            
+    if not target_file: return []
+    
+    log_path = os.path.join(LOG_DIR, target_file)
+    if not os.path.exists(log_path): return []
+
     try:
-        with open(latest_log, 'r') as f:
+        with open(log_path, 'r') as f:
             lines = f.readlines()[-100:]
             
         parsed_logs = []
@@ -593,7 +676,9 @@ async def handle_backtest(request: Request):
             fee=DEFAULT_TAKER_FEE,
             max_layers=max_layers,
             base_risk=risk_pct,
-            risk_mode=risk_mode
+            risk_mode=risk_mode,
+            max_daily_loss=body.get('maxDailyLoss', 5.0),
+            max_trades_per_day=body.get('maxTradesPerDay', 20)
         )
         
         curve = []
@@ -620,12 +705,7 @@ async def handle_backtest(request: Request):
         trades = len(mgr.trades)
         wins = len([t for t in mgr.trades if t['profit'] > 0])
         win_rate = (wins / trades * 100) if trades > 0 else 0
-        
         periods_per_year = 8760
-        if '15m' in tf: periods_per_year = 35040
-        elif '5m' in tf: periods_per_year = 105120
-        elif '1d' in tf: periods_per_year = 365
-        
         returns = pd.Series([c['balance'] for c in curve]).pct_change().dropna()
         sharpe = (returns.mean() / returns.std() * np.sqrt(periods_per_year)) if len(returns) > 0 and returns.std() != 0 else 0
 
@@ -647,26 +727,6 @@ async def handle_backtest(request: Request):
     except Exception as e:
         logger.error(traceback.format_exc())
         return JSONResponse(content={"error": str(e)}, status_code=500)
-
-@app.get("/api/ml/available-models")
-def list_models():
-    if not os.path.exists(MODEL_DIR): return []
-    return [{"id": f.split('.')[0], "name": f.split('.')[0]} for f in os.listdir(MODEL_DIR) if f.endswith('.joblib')]
-
-@app.get("/api/bot/winners")
-def get_winners():
-    winners = []
-    if not os.path.exists(RESULTS_DIR): return []
-    for f in os.listdir(RESULTS_DIR):
-        if f.endswith(".json"):
-            try:
-                with open(os.path.join(RESULTS_DIR, f), 'r') as file:
-                    data = json.load(file)
-                    config_data = {"strategies": data} if isinstance(data, list) else data
-                    winners.append({"id": f, "name": f.replace('.json',''), "config": config_data})
-            except: pass
-    winners.sort(key=lambda x: x['config'].get('metrics', {}).get('totalReturn', 0), reverse=True)
-    return winners
 
 if __name__ == "__main__":
     import uvicorn

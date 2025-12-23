@@ -31,10 +31,13 @@ class StopBotRequest(BaseModel):
     userId: str
 
 class BacktestRequest(BaseModel):
-    symbol: str = "BTC-USD"
-    initial_capital: float = 10000.0
-    timeframe: str = "1h"
-
+    symbol: str = Field(default="BTC-USD", description="Trading pair")
+    timeframe: str = Field(default="1h", description="Candle timeframe")
+    initial_capital: float = Field(default=1000.0, description="Start balance")
+    # New fields added for the updated service:
+    limit: int = Field(default=1000, description="Number of candles to fetch")
+    risk_percentage: float = Field(default=1.0, description="Risk per trade %")
+    risk_mode: str = Field(default="static", description="Risk mode: static or dynamic")
 # --- Endpoints ---
 
 @app.get("/")
@@ -81,10 +84,13 @@ async def get_bot_status(botId: str = None, userId: str = None):
 @app.post("/api/backtest/run")
 def run_backtest(req: BacktestRequest):
     try:
-        result = system_controller.run_backtest_logic(
-            req.symbol, 
-            req.initial_capital, 
-            req.timeframe
+       result = await system_controller.run_backtest_logic(
+            symbol=req.symbol,
+            timeframe=req.timeframe,
+            limit=req.limit,
+            initial_balance=req.initial_capital,
+            risk_percentage=req.risk_percentage,
+            risk_mode=req.risk_mode
         )
         return result
     except FileNotFoundError as fe:

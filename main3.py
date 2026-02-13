@@ -49,11 +49,11 @@ async def lifespan(app: FastAPI):
     for user_id in list(ACTIVE_BOTS.keys()):
         ACTIVE_BOTS[user_id]["status"] = "stopped"
 
-app = FastAPI(title="NEO-V25.7 Hybrid Engine", lifespan=lifespan)
+app = FastAPI(title="NEO-V25.10 Sovereign Engine", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # ==========================================
-# 🧠 1. NEURAL PREDICTOR (v25.7 ML Core)
+# 🧠 1. NEURAL PREDICTOR (v25.10 ML Core)
 # ==========================================
 class NeuralPredictor:
     @staticmethod
@@ -62,20 +62,17 @@ class NeuralPredictor:
             recent = df.tail(10)
             momentum = (recent['close'].iloc[-1] - recent['close'].iloc[0]) / recent['close'].iloc[0]
             model_path = f"./models/{model_id}_model.pkl"
-            
             if os.path.exists(model_path):
                 model = joblib.load(model_path)
                 prediction = model.predict_proba([[momentum]])[0][1] 
                 return float(prediction)
-            
-            # Synthetic Personalities for UI testing
             base = 1.0 / (1.0 + np.exp(-momentum * 100))
             pers = {"xgboost": 1.1, "random_forest": 0.9, "lstm": 1.0, "transformer": 1.2, "stacking": 0.8}
             return float(min(1.0, max(0.0, base * pers.get(model_id, 1.0))))
         except Exception: return 0.5
 
 # ==========================================
-# 🧠 2. SHARED STRATEGY BRAIN (Full 10 Strategists + HD Logic)
+# 🧠 2. SHARED STRATEGY BRAIN (Full 10 Strategists + HD Intent)
 # ==========================================
 class StrategyBrain:
     @staticmethod
@@ -89,39 +86,47 @@ class StrategyBrain:
         ema20 = ta.ema(df['close'], 20).iloc[-1]
         ema50 = ta.ema(df['close'], 50).iloc[-1]
         ema200 = ta.ema(df['close'], 200).iloc[-1]
-        adx = ta.adx(df['high'], df['low'], df['close']).iloc[-1, 0]
         bb = ta.bbands(df['close'], length=20, std=2.0)
         lower, mid, upper = bb.iloc[-1, 0], bb.iloc[-1, 1], bb.iloc[-1, 2]
+        pr = int((current_price - lower) / (upper - lower) * 100)
 
-        # 🟢 HD TREND ENGINE
-        trend_desc = "NEUTRAL (Sideways) ⚪"
+        # 1️⃣ LOGIC: ENSEMBLE CONSENSUS
+        ml_threshold = float(config.get('mlThreshold', 0.5))
+        conf = 1.0
+        if config.get('mlMode') == 'on':
+            conf = NeuralPredictor.get_prediction(config.get('mlModel', 'stacking'), df)
+            logic_desc = f"📊 LOGIC: NEURAL GATE {'PASSED' if conf >= ml_threshold else 'VETOED'} ({int(conf*100)}% vs {int(ml_threshold*100)}% Limit) {'🟢' if conf >= ml_threshold else '🔴'}"
+            if conf < ml_threshold: votes = 0
+        else:
+            logic_desc = f"📊 LOGIC: NEURAL BYPASSED ⚪"
+
+        # 2️⃣ TREND: HD DIRECTION ENGINE
+        trend_desc = "📡 TREND: NEUTRAL (Sideways) ⚪"
         if current_price > ema200:
             if ema50 > ema200:
-                if current_price > ema50: trend_desc = f"🚀 STRONG UPTREND (Price ${int(current_price)} > 50EMA ${int(ema50)}) 🟢"
-                else: trend_desc = f"📈 UPTREND (Pullback: Price ${int(current_price)} < 50EMA ${int(ema50)}) 🟠"
-            else: trend_desc = f"✨ POTENTIAL REVERSAL (Price > 200EMA ${int(ema200)}) 🟢"
+                if current_price > ema50: trend_desc = f"📡 TREND: 🚀 STRONG UPTREND (Price ${int(current_price)} > 50EMA ${int(ema50)}) 🟢"
+                else: trend_desc = f"📡 TREND: 📈 UPTREND (Pullback: Price ${int(current_price)} < 50EMA ${int(ema50)}) 🟠"
+            else: trend_desc = f"📡 TREND: ✨ POTENTIAL REVERSAL (Price > 200EMA ${int(ema200)}) 🟢"
         else:
             if ema50 < ema200:
-                if current_price < ema50: trend_desc = f"🩸 STRONG DOWNTREND (Price ${int(current_price)} < 50EMA ${int(ema50)}) 🔴"
-                else: trend_desc = f"📉 DOWNTREND (Relief: Price ${int(current_price)} > 50EMA ${int(ema50)}) 🟠"
-            else: trend_desc = f"💀 POTENTIAL REVERSAL (Price < 200EMA ${int(ema200)}) 🔴"
+                if current_price < ema50: trend_desc = f"📡 TREND: 🩸 STRONG DOWNTREND (Price ${int(current_price)} < 50EMA ${int(ema50)}) 🔴"
+                else: trend_desc = f"📡 TREND: 📉 DOWNTREND (Relief: Price ${int(current_price)} > 50EMA ${int(ema50)}) 🟠"
+            else: trend_desc = f"📡 TREND: 💀 POTENTIAL REVERSAL (Price < 200EMA ${int(ema200)}) 🔴"
 
-        # 🟢 BIAS & REGIME
+        # 3️⃣ BIAS: MOMENTUM SPREAD
         spread = int(abs(ema20 - ema50))
-        bias_desc = f"MOMENTUM UP (Spread: ${spread}) 🟢" if ema20 > ema50 else f"MOMENTUM DOWN (Spread: ${spread}) 🔴"
-        regime_desc = f"TRENDING (ADX {int(adx)})" if adx > 25 else f"CHOPPY (ADX {int(adx)})"
+        bias_desc = f"⚖️ BIAS: MOMENTUM {'UP' if ema20 > ema50 else 'DOWN'} (EMA20 vs EMA50 Spread: ${spread}) {'🟢' if ema20 > ema50 else '🔴'}"
 
-        # 🟢 MINDSET (5-ZONE)
-        pr = int((current_price - lower) / (upper - lower) * 100)
-        if pr > 85: mindset = f"⚠️ PRICE IS EXPENSIVE ({pr}% > 85% Limit) 🔴"
-        elif pr >= 65: mindset = f"🔭 STALKING RESISTANCE ({pr}% is High -> Waiting for 85%) 🟠"
-        elif pr > 35: mindset = f"⚖️ MARKET IS BALANCED ({pr}% of Range) ⚪"
-        elif pr >= 15: mindset = f"🔭 STALKING SUPPORT ({pr}% is Low -> Waiting for 15%) 🔵"
-        else: mindset = f"🎯 PRICE IS CHEAP ({pr}% < 15% Limit) 🟢"
+        # 4️⃣ MINDSET: 5-ZONE PSYCHOLOGY
+        if pr > 85: mindset_desc = f"🤖 MINDSET: ⚠️ PRICE IS EXPENSIVE ({pr}% > 85% Overbought Limit) 🔴"
+        elif pr >= 65: mindset_desc = f"🤖 MINDSET: 🔭 STALKING RESISTANCE ({pr}% High -> Waiting for 85% Ceiling) 🟠"
+        elif pr > 35: mindset_desc = f"🤖 MINDSET: ⚖️ MARKET IS BALANCED ({pr}% of Bollinger Range) ⚪"
+        elif pr >= 15: mindset_desc = f"🤖 MINDSET: 🔭 STALKING SUPPORT ({pr}% Low -> Waiting for 15% Floor) 🔵"
+        else: mindset_desc = f"🤖 MINDSET: 🎯 PRICE IS CHEAP ({pr}% < 15% Oversold Limit) 🟢"
 
-        numeric_details['market'] = {"trend": trend_desc, "bias": bias_desc, "regime": regime_desc, "mindset": mindset}
+        numeric_details['market'] = {"logic": logic_desc, "trend": trend_desc, "bias": bias_desc, "mindset": mindset_desc}
 
-        # 🟢 ALL 10 STRATEGIES
+        # 🟢 THE 10 STRATEGIES
         for strat in strategies:
             code, params = strat.get('code'), strat.get('params', {})
             try:
@@ -152,21 +157,21 @@ class StrategyBrain:
                     if df['volume'].iloc[-1] > ta.sma(df['volume'], 20).iloc[-1] * 1.5: votes += 1
             except Exception: continue
 
-        # 🟢 NEURAL GATE
+        # 🎯 ENHANCED INTENT BLOCK
+        is_uptrend = "UPTREND" in trend_desc
+        intent = "🎯 INTENT: Scanning for High-Probability Setup... ⚪"
+        if votes > 0 and is_uptrend:
+            intent = f"🎯 INTENT: STALKING LONG (Signals: {len(active_thoughts)}/10 | Target: >${int(ema20)}) 🟢"
+        elif votes < 0 and not is_uptrend:
+            intent = f"🎯 INTENT: STALKING SHORT (Signals: {abs(votes)}/10 | Target: <${int(ema20)}) 🔴"
+        numeric_details['market']['intent'] = intent
+
         score = abs(votes) / total_strats
-        ml_status = "BYPASSED ⚪"
-        if config.get('mlMode') == 'on':
-            ml_id = config.get('mlModel', 'stacking')
-            conf = NeuralPredictor.get_prediction(ml_id, df)
-            ml_status = f"{ml_id.upper()}: {int(conf*100)}% Conf"
-            if conf < float(config.get('mlThreshold', 0.5)): votes = 0
-        
-        numeric_details['Neural'] = ml_status
-        final_sig = 1 if votes > 0 and "UPTREND" in trend_desc and score >= l_thresh else (-1 if votes < 0 and "DOWNTREND" in trend_desc and score >= s_thresh else 0)
+        final_sig = 1 if votes > 0 and is_uptrend and score >= l_thresh else (-1 if votes < 0 and "DOWNTREND" in trend_desc and score >= s_thresh else 0)
         return final_sig, active_thoughts, numeric_details, score
 
 # ==========================================
-# 🚀 3. THE HEARTBEAT (Fixed Unpacking & Logic Stream)
+# 🚀 3. THE HEARTBEAT (Fixed Unpacking)
 # ==========================================
 async def live_neural_heartbeat(user_id: str):
     last_log = 0
@@ -174,11 +179,11 @@ async def live_neural_heartbeat(user_id: str):
         bot = ACTIVE_BOTS[user_id]
         config = bot.get('config', {})
         try:
-            ohlcv = await fetch_live_candles_ccxt(config['symbol'], config.get('timeframe', '1h'), 250)
-            if ohlcv:
-                df = pd.DataFrame(ohlcv)
+            ohlcv_raw = await fetch_live_candles_ccxt(config['symbol'], config.get('timeframe', '1h'), 250)
+            if ohlcv_raw:
+                df = pd.DataFrame(ohlcv_raw)
                 latest_price = df['close'].iloc[-1]
-                live_candles = [{"time": int(c['time']), "open": c['open'], "high": c['high'], "low": c['low'], "close": c['close']} for c in ohlcv[-100:]]
+                live_candles = [{"time": int(c['time']), "open": c['open'], "high": c['high'], "low": c['low'], "close": c['close']} for c in ohlcv_raw[-50:]]
                 upnl = sum([(latest_price - p['entry']) * p['size'] if p['type'] == 'buy' else (p['entry'] - latest_price) * p['size'] for p in bot['positions']])
 
                 emit_status(user_id, {
@@ -190,20 +195,12 @@ async def live_neural_heartbeat(user_id: str):
                 if datetime.now().timestamp() - last_log >= 60:
                     sig, thoughts, nums, score = StrategyBrain.calculate_signals(df, config, 0.5, 0.5)
                     m = nums['market']
-                    emit_log(user_id, f"📡 TREND: {m['trend']} | BIAS: {m['bias']} | 🤖 MINDSET: {m['mindset']}")
-                    emit_log(user_id, f"🧠 NEURAL: {nums['Neural']}")
-                    if thoughts: emit_log(user_id, f"🎯 INTENT: {thoughts[0]}")
-                    emit_log(user_id, f"📊 LOGIC: {' | '.join([f'{k}: {v}' for k, v in nums.items() if k != 'market'])}")
-
-                    # Execution Logic
-                    if sig == 1 and not bot['positions']:
-                        new_p = {"type": "buy", "entry": latest_price, "size": bot['balance']/latest_price, "time": datetime.now().isoformat()}
-                        bot['positions'].append(new_p); bot['trade_history'].append(new_p)
-                        emit_log(user_id, f"🟢 SPOT BUY EXECUTION @ ${latest_price}")
-                    elif sig == -1 and not bot['positions'] and config.get("enable_shorting", True):
-                        new_p = {"type": "short", "entry": latest_price, "size": bot['balance']/latest_price, "time": datetime.now().isoformat()}
-                        bot['positions'].append(new_p); bot['trade_history'].append(new_p)
-                        emit_log(user_id, f"🟠 MARGIN SHORT EXECUTION @ ${latest_price}")
+                    # 🟢 Separate HD Sections
+                    emit_log(user_id, m['trend'])
+                    emit_log(user_id, m['bias'])
+                    emit_log(user_id, m['mindset'])
+                    emit_log(user_id, m['logic'])
+                    emit_log(user_id, m['intent'])
                     last_log = datetime.now().timestamp()
 
             await asyncio.sleep(15)
@@ -223,10 +220,9 @@ async def fetch_live_candles_ccxt(symbol: str, timeframe: str, limit: int):
 @app.post("/api/bot/start")
 async def start_bot(data: BotStartRequest, background_tasks: BackgroundTasks):
     user_id = data.userId.strip()
-    # 💰 Correctly pulls the $200 from UI
     capital = float(data.config.get("capitalAllocation") or 200)
     ACTIVE_BOTS[user_id] = {"status": "running", "config": data.config, "balance": capital, "positions": [], "trade_history": []}
-    emit_log(user_id, f"🚀 Engine Started. Balance: ${capital}")
+    emit_log(user_id, f"🚀 Engine Started. Portfolio Value: ${capital}")
     background_tasks.add_task(live_neural_heartbeat, user_id)
     return {"status": "running"}
 

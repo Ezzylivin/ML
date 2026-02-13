@@ -49,11 +49,11 @@ async def lifespan(app: FastAPI):
     for user_id in list(ACTIVE_BOTS.keys()):
         ACTIVE_BOTS[user_id]["status"] = "stopped"
 
-app = FastAPI(title="NEO-V25.10 Sovereign Engine", lifespan=lifespan)
+app = FastAPI(title="NEO-V25.11 Sovereign Engine", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # ==========================================
-# 🧠 1. NEURAL PREDICTOR (v25.10 ML Core)
+# 🧠 1. NEURAL PREDICTOR
 # ==========================================
 class NeuralPredictor:
     @staticmethod
@@ -64,15 +64,13 @@ class NeuralPredictor:
             model_path = f"./models/{model_id}_model.pkl"
             if os.path.exists(model_path):
                 model = joblib.load(model_path)
-                prediction = model.predict_proba([[momentum]])[0][1] 
-                return float(prediction)
+                return float(model.predict_proba([[momentum]])[0][1])
             base = 1.0 / (1.0 + np.exp(-momentum * 100))
-            pers = {"xgboost": 1.1, "random_forest": 0.9, "lstm": 1.0, "transformer": 1.2, "stacking": 0.8}
-            return float(min(1.0, max(0.0, base * pers.get(model_id, 1.0))))
+            return float(min(1.0, max(0.0, base)))
         except Exception: return 0.5
 
 # ==========================================
-# 🧠 2. SHARED STRATEGY BRAIN (Full 10 Strategists + HD Intent)
+# 🧠 2. SHARED STRATEGY BRAIN (Full 10 Strategies + Color HD)
 # ==========================================
 class StrategyBrain:
     @staticmethod
@@ -92,86 +90,83 @@ class StrategyBrain:
 
         # 1️⃣ LOGIC: ENSEMBLE CONSENSUS
         ml_threshold = float(config.get('mlThreshold', 0.5))
-        conf = 1.0
-        if config.get('mlMode') == 'on':
-            conf = NeuralPredictor.get_prediction(config.get('mlModel', 'stacking'), df)
-            logic_desc = f"📊 LOGIC: NEURAL GATE {'PASSED' if conf >= ml_threshold else 'VETOED'} ({int(conf*100)}% vs {int(ml_threshold*100)}% Limit) {'🟢' if conf >= ml_threshold else '🔴'}"
-            if conf < ml_threshold: votes = 0
-        else:
-            logic_desc = f"📊 LOGIC: NEURAL BYPASSED ⚪"
+        conf = NeuralPredictor.get_prediction(config.get('mlModel', 'stacking'), df) if config.get('mlMode') == 'on' else 1.0
+        logic_desc = f"📊 LOGIC: NEURAL GATE {'PASSED' if conf >= ml_threshold else 'VETOED'} ({int(conf*100)}% vs {int(ml_threshold*100)}% Limit) {'🟢' if conf >= ml_threshold else '🔴'}"
+        if conf < ml_threshold: votes = 0
 
-        # 2️⃣ TREND: HD DIRECTION ENGINE
-        trend_desc = "📡 TREND: NEUTRAL (Sideways) ⚪"
+        # 2️⃣ TREND: HD DIRECTION
         if current_price > ema200:
-            if ema50 > ema200:
-                if current_price > ema50: trend_desc = f"📡 TREND: 🚀 STRONG UPTREND (Price ${int(current_price)} > 50EMA ${int(ema50)}) 🟢"
-                else: trend_desc = f"📡 TREND: 📈 UPTREND (Pullback: Price ${int(current_price)} < 50EMA ${int(ema50)}) 🟠"
-            else: trend_desc = f"📡 TREND: ✨ POTENTIAL REVERSAL (Price > 200EMA ${int(ema200)}) 🟢"
+            trend_desc = f"📡 TREND: 🚀 STRONG UPTREND (${int(current_price)} > 50EMA ${int(ema50)}) 🟢" if current_price > ema50 else f"📡 TREND: 📈 UPTREND (Pullback: ${int(current_price)} < 50EMA ${int(ema50)}) 🟠"
         else:
-            if ema50 < ema200:
-                if current_price < ema50: trend_desc = f"📡 TREND: 🩸 STRONG DOWNTREND (Price ${int(current_price)} < 50EMA ${int(ema50)}) 🔴"
-                else: trend_desc = f"📡 TREND: 📉 DOWNTREND (Relief: Price ${int(current_price)} > 50EMA ${int(ema50)}) 🟠"
-            else: trend_desc = f"📡 TREND: 💀 POTENTIAL REVERSAL (Price < 200EMA ${int(ema200)}) 🔴"
+            trend_desc = f"📡 TREND: 🩸 STRONG DOWNTREND (${int(current_price)} < 50EMA ${int(ema50)}) 🔴" if current_price < ema50 else f"📡 TREND: 📉 DOWNTREND (Relief: ${int(current_price)} > 50EMA ${int(ema50)}) 🟠"
 
         # 3️⃣ BIAS: MOMENTUM SPREAD
         spread = int(abs(ema20 - ema50))
-        bias_desc = f"⚖️ BIAS: MOMENTUM {'UP' if ema20 > ema50 else 'DOWN'} (EMA20 vs EMA50 Spread: ${spread}) {'🟢' if ema20 > ema50 else '🔴'}"
+        bias_desc = f"⚖️ BIAS: MOMENTUM {'UP' if ema20 > ema50 else 'DOWN'} (Spread: ${spread}) {'🟢' if ema20 > ema50 else '🔴'}"
 
-        # 4️⃣ MINDSET: 5-ZONE PSYCHOLOGY
-        if pr > 85: mindset_desc = f"🤖 MINDSET: ⚠️ PRICE IS EXPENSIVE ({pr}% > 85% Overbought Limit) 🔴"
-        elif pr >= 65: mindset_desc = f"🤖 MINDSET: 🔭 STALKING RESISTANCE ({pr}% High -> Waiting for 85% Ceiling) 🟠"
-        elif pr > 35: mindset_desc = f"🤖 MINDSET: ⚖️ MARKET IS BALANCED ({pr}% of Bollinger Range) ⚪"
-        elif pr >= 15: mindset_desc = f"🤖 MINDSET: 🔭 STALKING SUPPORT ({pr}% Low -> Waiting for 15% Floor) 🔵"
-        else: mindset_desc = f"🤖 MINDSET: 🎯 PRICE IS CHEAP ({pr}% < 15% Oversold Limit) 🟢"
+        # 4️⃣ MINDSET: 5-ZONE
+        if pr > 85: mindset_desc = f"🤖 MINDSET: ⚠️ PRICE IS EXPENSIVE ({pr}% > 85% Limit) 🔴"
+        elif pr >= 65: mindset_desc = f"🤖 MINDSET: 🔭 STALKING RESISTANCE ({pr}% High) 🟠"
+        elif pr >= 15: mindset_desc = f"🤖 MINDSET: ⚖️ MARKET IS BALANCED ({pr}%) ⚪"
+        else: mindset_desc = f"🤖 MINDSET: 🎯 PRICE IS CHEAP ({pr}% < 15% Limit) 🟢"
 
-        numeric_details['market'] = {"logic": logic_desc, "trend": trend_desc, "bias": bias_desc, "mindset": mindset_desc}
-
-        # 🟢 THE 10 STRATEGIES
+        # 🟢 THE 10 STRATEGIES (For Chart Markers)
         for strat in strategies:
-            code, params = strat.get('code'), strat.get('params', {})
+            code = strat.get('code')
             try:
                 if code == "rsi_threshold":
                     rsi = ta.rsi(df['close'], 14).iloc[-1]
                     if rsi < 30: votes += 1; active_thoughts.append(f"RSI {int(rsi)} Oversold 🟢")
                     elif rsi > 70: votes -= 1; active_thoughts.append(f"RSI {int(rsi)} Overbought 🔴")
-                elif code == "sma_crossover":
-                    if ta.sma(df['close'], 50).iloc[-1] > ta.sma(df['close'], 200).iloc[-1]: votes += 1
-                elif code == "supertrend":
-                    st = ta.supertrend(df['high'], df['low'], df['close']).iloc[-1]
-                    if st.iloc[1] == 1: votes += 1
-                elif code == "macd_crossover":
-                    macd = ta.macd(df['close']).iloc[-1]
-                    if macd.iloc[0] > macd.iloc[2]: votes += 1
-                elif code == "atr_breakout":
-                    if current_price > (ema20 + ta.atr(df['high'], df['low'], df['close']).iloc[-1] * 1.5): votes += 1
-                elif code == "bb_fade":
-                    if current_price < lower: votes += 1
+                
                 elif code == "stoch":
                     k = ta.stoch(df['high'], df['low'], df['close']).iloc[-1, 0]
                     if k < 20: votes += 1; active_thoughts.append(f"Stoch {int(k)} Oversold 🟢")
+                    elif k > 80: votes -= 1; active_thoughts.append(f"Stoch {int(k)} Overbought 🔴")
+
+                elif code == "bb_fade":
+                    if current_price < lower: votes += 1; active_thoughts.append("BB Floor Fade 🟢")
+                    elif current_price > upper: votes -= 1; active_thoughts.append("BB Ceiling Fade 🔴")
+
+                elif code == "sma_crossover":
+                    if ta.sma(df['close'], 50).iloc[-1] > ta.sma(df['close'], 200).iloc[-1]: votes += 1; active_thoughts.append("SMA Bullish Cross 🟢")
+
+                elif code == "macd_crossover":
+                    macd = ta.macd(df['close']).iloc[-1]
+                    if macd.iloc[0] > macd.iloc[2]: votes += 1; active_thoughts.append("MACD Bullish 🟢")
+
+                elif code == "supertrend":
+                    st = ta.supertrend(df['high'], df['low'], df['close']).iloc[-1]
+                    if st.iloc[1] == 1: votes += 1; active_thoughts.append("SuperTrend Long 🟢")
+
                 elif code == "ema_cloud":
-                    if current_price > ema50: votes += 1
+                    if current_price > ema50: votes += 1; active_thoughts.append("Above EMA Cloud 🟢")
+
+                elif code == "atr_breakout":
+                    atr = ta.atr(df['high'], df['low'], df['close']).iloc[-1]
+                    if current_price > (ema20 + atr * 1.5): votes += 1; active_thoughts.append("ATR Breakout 🟢")
+
                 elif code == "pa_breakout":
-                    if current_price >= df['high'].tail(20).max(): votes += 1
+                    if current_price >= df['high'].tail(20).max(): votes += 1; active_thoughts.append("20-Bar High Break 🟢")
+
                 elif code == "vol_profile":
-                    if df['volume'].iloc[-1] > ta.sma(df['volume'], 20).iloc[-1] * 1.5: votes += 1
+                    if df['volume'].iloc[-1] > ta.sma(df['volume'], 20).iloc[-1] * 1.5: votes += 1; active_thoughts.append("Volume Surge 🟢")
+
             except Exception: continue
 
-        # 🎯 ENHANCED INTENT BLOCK
-        is_uptrend = "UPTREND" in trend_desc
-        intent = "🎯 INTENT: Scanning for High-Probability Setup... ⚪"
-        if votes > 0 and is_uptrend:
-            intent = f"🎯 INTENT: STALKING LONG (Signals: {len(active_thoughts)}/10 | Target: >${int(ema20)}) 🟢"
-        elif votes < 0 and not is_uptrend:
-            intent = f"🎯 INTENT: STALKING SHORT (Signals: {abs(votes)}/10 | Target: <${int(ema20)}) 🔴"
-        numeric_details['market']['intent'] = intent
-
+        # 5️⃣ TARGET INTENT (Numerical & Separated)
+        target_dir = "LONG" if "UPTREND" in trend_desc else "SHORT"
+        stalking_color = "🟢" if target_dir == "LONG" else "🔴"
+        intent_desc = f"🎯 INTENT: STALKING {target_dir} (Signals: {len(active_thoughts)}/10 | Min Req: {config.get('comboConfig', {}).get('minVotesRequired', 1)}) {stalking_color}"
+        
+        numeric_details['market'] = {"logic": logic_desc, "trend": trend_desc, "bias": bias_desc, "mindset": mindset_desc, "intent": intent_desc}
+        
         score = abs(votes) / total_strats
-        final_sig = 1 if votes > 0 and is_uptrend and score >= l_thresh else (-1 if votes < 0 and "DOWNTREND" in trend_desc and score >= s_thresh else 0)
+        final_sig = 1 if votes > 0 and target_dir == "LONG" else (-1 if votes < 0 and target_dir == "SHORT" else 0)
         return final_sig, active_thoughts, numeric_details, score
 
 # ==========================================
-# 🚀 3. THE HEARTBEAT (Fixed Unpacking)
+# 🚀 3. THE HEARTBEAT
 # ==========================================
 async def live_neural_heartbeat(user_id: str):
     last_log = 0
@@ -183,37 +178,32 @@ async def live_neural_heartbeat(user_id: str):
             if ohlcv_raw:
                 df = pd.DataFrame(ohlcv_raw)
                 latest_price = df['close'].iloc[-1]
-                live_candles = [{"time": int(c['time']), "open": c['open'], "high": c['high'], "low": c['low'], "close": c['close']} for c in ohlcv_raw[-50:]]
-                upnl = sum([(latest_price - p['entry']) * p['size'] if p['type'] == 'buy' else (p['entry'] - latest_price) * p['size'] for p in bot['positions']])
+                sig, thoughts, nums, score = StrategyBrain.calculate_signals(df, config, 0.5, 0.5)
+                
+                # 🟢 CHART MARKERS: Strategy events for frontend
+                markers = [{"time": int(c['time']), "position": "belowBar", "color": "#10b981", "shape": "circle", "text": thoughts[0] if thoughts else "Analyzing"} for c in ohlcv_raw[-1:]]
 
                 emit_status(user_id, {
-                    "status": "running", "currentBalance": round(bot['balance'] + upnl, 2),
-                    "unrealizedPnl": round(upnl, 2), "activePositions": bot['positions'],
-                    "tradeMarkers": bot['trade_history'], "candles": live_candles
+                    "status": "running", "currentBalance": round(bot['balance'], 2),
+                    "activePositions": bot['positions'], "tradeMarkers": bot['trade_history'] + markers, 
+                    "candles": [{"time": int(c['time']), "open": c['open'], "high": c['high'], "low": c['low'], "close": c['close']} for c in ohlcv_raw[-50:]]
                 })
 
                 if datetime.now().timestamp() - last_log >= 60:
-                    sig, thoughts, nums, score = StrategyBrain.calculate_signals(df, config, 0.5, 0.5)
-                    m = nums['market']
-                    # 🟢 Separate HD Sections
-                    emit_log(user_id, m['trend'])
-                    emit_log(user_id, m['bias'])
-                    emit_log(user_id, m['mindset'])
-                    emit_log(user_id, m['logic'])
-                    emit_log(user_id, m['intent'])
+                    for key in ['trend', 'bias', 'mindset', 'logic', 'intent']:
+                        emit_log(user_id, nums['market'][key])
                     last_log = datetime.now().timestamp()
-
             await asyncio.sleep(15)
-        except Exception as e:
-            logger.error(f"Sync Error: {e}"); await asyncio.sleep(10)
+        except Exception as e: logger.error(f"Sync Error: {e}"); await asyncio.sleep(10)
 
 # ==========================================
-# 📡 4. ALL ENDPOINTS (Fetch, Start, Stop, Close, Backtest, Status)
+# 📡 4. ALL ENDPOINTS
 # ==========================================
 async def fetch_live_candles_ccxt(symbol: str, timeframe: str, limit: int):
     async with ccxt.coinbase() as ex:
         try:
             ohlcv = await ex.fetch_ohlcv(symbol.replace('-', '/'), timeframe, limit=limit)
+            # Dictionary-based unpacking to handle variable column lengths
             return [{"time": c[0]/1000, "open": c[1], "high": c[2], "low": c[3], "close": c[4], "vol": c[5] if len(c) > 5 else 0} for c in ohlcv]
         except: return []
 
@@ -222,7 +212,7 @@ async def start_bot(data: BotStartRequest, background_tasks: BackgroundTasks):
     user_id = data.userId.strip()
     capital = float(data.config.get("capitalAllocation") or 200)
     ACTIVE_BOTS[user_id] = {"status": "running", "config": data.config, "balance": capital, "positions": [], "trade_history": []}
-    emit_log(user_id, f"🚀 Engine Started. Portfolio Value: ${capital}")
+    emit_log(user_id, f"🚀 Engine Started. Portfolio: ${capital}")
     background_tasks.add_task(live_neural_heartbeat, user_id)
     return {"status": "running"}
 

@@ -365,6 +365,8 @@ async def live_neural_heartbeat(user_id: str):
                     for key in keys_to_check:
                         if key in row and not pd.isna(row[key]): c_obj[key] = float(row[key])
                     candles_to_send.append(c_obj)
+                    
+                    bot["candles"] = candles_to_send
 
                 emit_status(user_id, {
                     "status": "running", 
@@ -504,7 +506,8 @@ async def get_status(userId: str):
             "positions": bot.get("positions", []),
             # 🟢 NEW: Return start time
             "startedAt": bot.get("startedAt"),
-            "config": bot.get("config") 
+            "config": bot.get("config"),
+            "candles": bot.get("candles", [])
         }
     return {"status": "inactive", "balance": 0}
 

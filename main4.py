@@ -208,7 +208,7 @@ class StrategyBrain:
 
             except Exception as e: continue
 
-        # 🚀 2. DYNAMIC DUAL-GATE LOGIC
+        # 🚀 2. DYNAMIC DUAL-GATE LOGIC (Block 1 Logic)
         is_short = current_price < ema200
         ui_limit = float(config.get('mlThresholdShort', 0.90)) if is_short else float(config.get('mlThresholdLong', 0.80))
         
@@ -216,22 +216,48 @@ class StrategyBrain:
         gate_passed = conf >= ui_limit
         logic_desc = f"📊 LOGIC: {'SHORT' if is_short else 'LONG'} GATE {'PASSED' if gate_passed else 'VETOED'} ({int(conf*100)}% vs {int(ui_limit*100)}% UI Limit) {'🟢' if gate_passed else '🔴'}"
 
-        # 🎯 3. INTENT
+        # 🎯 3. INTENT (Block 1 Logic)
         signal_names = " + ".join(active_thoughts) if active_thoughts else "Scanning Setup"
         gap = int(abs(current_price - ema50))
         intent_desc = f"🎯 INTENT: STALKING {'SHORT' if is_short else 'LONG'} ({signal_names} | Gap: ${gap}) {'🔴' if is_short else '🟢'}"
 
-        # 📡 4. CONTEXT
+        # 📡 4. MARKET CONTEXT (Rich Descriptions from Block 2)
+        
+        # 1. Trend Logic (Distance from 200EMA)
+        trend_dist = current_price - ema200
+        trend_pct = (trend_dist / ema200) * 100
+        if trend_dist > 0:
+            trend_str = "STRONG UPTREND" if trend_pct > 1.0 else "WEAK UPTREND"
+        else:
+            trend_str = "STRONG DOWNTREND" if trend_pct < -1.0 else "WEAK DOWNTREND"
+            
+        trend_text = f"📡 TREND: {trend_str} (Price is ${int(abs(trend_dist))} {'above' if trend_dist > 0 else 'below'} 200EMA)"
+
+        # 2. Bias Logic (EMA Spread Strength)
+        spread = ema20 - ema50
+        bias_str = "BULLISH EXPANSION" if spread > 0 else "BEARISH CONTRACTION"
+        bias_text = f"⚖️ BIAS: {bias_str} (Fast EMA is ${int(abs(spread))} {'above' if spread > 0 else 'below'} Slow EMA)"
+
+        # 3. Mindset Logic (Bollinger Percentile)
+        if pr >= 80: mindset_str = "⚠️ OVEREXTENDED (Expensive)"
+        elif pr <= 20: mindset_str = "🎯 ACCUMULATION ZONE (Cheap)"
+        else: mindset_str = "⚖️ EQUILIBRIUM (Balanced)"
+        
+        mindset_text = f"🤖 MINDSET: {mindset_str} - Price is at {pr}% of Bollinger Range"
+
         numeric_details = {
             "market": {
-                "logic": logic_desc, "intent": intent_desc,
-                "trend": f"📡 TREND: {'UP' if current_price > ema200 else 'DOWN'} (${int(current_price)})",
-                "bias": f"⚖️ BIAS: {'BULL' if ema20 > ema50 else 'BEAR'} (Spread: ${int(abs(ema20-ema50))})",
-                "mindset": f"🤖 MINDSET: {pr}% of Range"
+                "logic": logic_desc, 
+                "intent": intent_desc,
+                "trend": trend_text,
+                "bias": bias_text,
+                "mindset": mindset_text
             }
         }
 
+        # Final Signal Calculation
         final_sig = 1 if votes > 0 and not is_short and gate_passed else (-1 if votes < 0 and is_short and gate_passed else 0)
+        
         return final_sig, active_thoughts, numeric_details, conf
 
 # ==========================================
@@ -319,7 +345,7 @@ async def live_neural_heartbeat(user_id: str):
                         msg = nums['market'][key]
                         emit_log(user_id, msg)
                         new_logs.append({"time": datetime.now().isoformat(), "message": msg})
-                    bot["logs"] = (new_logs + bot["logs"])[:50]
+                    bot["logs"] = (new_logs + bot["logs"])[:300]
                     
                     DatabaseHandler.save_state(user_id, bot)
                     last_log = datetime.now().timestamp()
@@ -463,7 +489,8 @@ async def get_status(userId: str):
             "logs": bot.get("logs", []),
             "positions": bot.get("positions", []),
             # 🟢 NEW: Return start time
-            "startedAt": bot.get("startedAt") 
+            "startedAt": bot.get("startedAt"),
+            "config": bot.get("config") 
         }
     return {"status": "inactive", "balance": 0}
 

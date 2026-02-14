@@ -260,6 +260,8 @@ class StrategyBrain:
         
         return final_sig, active_thoughts, numeric_details, conf
 
+
+
 # ==========================================
 # 🚀 3. THE HEARTBEAT (Dynamic Calculation Loop)
 # ==========================================
@@ -328,6 +330,57 @@ async def live_neural_heartbeat(user_id: str):
                 # Logic & Signals
                 sig, thoughts, nums, score = StrategyBrain.calculate_signals(df, config, 0.5, 0.5)
                 
+                
+                # 🟢 4. EXECUTION LOGIC (✅ ADDED THIS BLOCK)
+                # This actually opens the trade when sig != 0
+                if len(bot['positions']) < int(config.get('maxPyramiding', 1)):
+                    
+                    # LONG
+                    if sig == 1:
+                        risk_pct = float(config.get('riskPercentage', 1)) / 100
+                        size = (bot['balance'] * risk_pct) / current_price 
+                        pos = {
+                            "type": "long", "entry": current_price, "size": size, "time": datetime.now().isoformat(),
+                            "sl": current_price * (1 - float(config['params'].get('stop_loss', 0.05))),
+                            "tp": current_price * (1 + float(config['params'].get('take_profit', 0.10)))
+                        }
+                        bot['positions'].append(pos)
+                        bot['trade_history'].append({"type": "buy", "price": current_price, "time": datetime.now().isoformat()})
+                        emit_log(user_id, f"🚀 LONG EXECUTED @ ${current_price} (Signal: {thoughts[0] if thoughts else 'Manual'})")
+                        DatabaseHandler.save_state(user_id, bot)
+
+                    # SHORT
+                    elif sig == -1 and config.get('enable_shorting', True):
+                        risk_pct = float(config.get('riskPercentage', 1)) / 100
+                        size = (bot['balance'] * risk_pct) / current_price 
+                        pos = {
+                            "type": "short", "entry": current_price, "size": size, "time": datetime.now().isoformat(),
+                            "sl": current_price * (1 + float(config['params'].get('stop_loss', 0.05))),
+                            "tp": current_price * (1 - float(config['params'].get('take_profit', 0.10)))
+                        }
+                        bot['positions'].append(pos)
+                        bot['trade_history'].append({"type": "short", "price": current_price, "time": datetime.now().isoformat()})
+                        emit_log(user_id, f"🔻 SHORT EXECUTED @ ${current_price} (Signal: {thoughts[0] if thoughts else 'Manual'})")
+                        DatabaseHandler.save_state(user_id, bot)
+
+                # 🟢 5. EXIT LOGIC (✅ ADDED THIS BLOCK)
+                # This checks SL/TP and closes positions
+                active_pos = bot['positions'][:]
+                for pos in active_pos:
+                    pnl, closed = 0, False
+                    if pos['type'] == 'long':
+                        if current_price >= pos['tp']: pnl = (current_price - pos['entry']) * pos['size']; closed = True; emit_log(user_id, f"💰 TP HIT (Long): +${round(pnl, 2)}")
+                        elif current_price <= pos['sl']: pnl = (current_price - pos['entry']) * pos['size']; closed = True; emit_log(user_id, f"🛑 SL HIT (Long): -${round(abs(pnl), 2)}")
+                    elif pos['type'] == 'short':
+                        if current_price <= pos['tp']: pnl = (pos['entry'] - current_price) * pos['size']; closed = True; emit_log(user_id, f"💰 TP HIT (Short): +${round(pnl, 2)}")
+                        elif current_price >= pos['sl']: pnl = (pos['entry'] - current_price) * pos['size']; closed = True; emit_log(user_id, f"🛑 SL HIT (Short): -${round(abs(pnl), 2)}")
+
+                    if closed:
+                        bot['balance'] += pnl
+                        bot['positions'].remove(pos)
+                        bot['trade_history'].append({"type": "exit", "price": current_price, "pnl": pnl, "time": datetime.now().isoformat()})
+                        DatabaseHandler.save_state(user_id, bot)
+                
                 # Markers
                 markers = [{"time": int(c['time']), "position": "belowBar", "color": "#10b981", "shape": "circle", "text": thoughts[0] if thoughts else ""} for c in ohlcv_raw[-1:] if thoughts]
 
@@ -379,6 +432,11 @@ async def live_neural_heartbeat(user_id: str):
                     "startedAt": bot.get("startedAt"), 
                     "candles": candles_to_send
                 })
+
+            for _ in range(15):
+                if user_id not in ACTIVE_BOTS or ACTIVE_BOTS[user_id]["status"] != "running":
+                    break
+                await asyncio.sleep(1)
 
             await asyncio.sleep(15)
         except Exception as e: 

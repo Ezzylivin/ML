@@ -434,10 +434,24 @@ async def start_bot(data: BotStartRequest, background_tasks: BackgroundTasks):
 @app.post("/api/bot/stop")
 async def stop_bot(data: BotStopRequest):
     if data.userId in ACTIVE_BOTS:
+        # 1. Mark as stopped internally
         ACTIVE_BOTS[data.userId]["status"] = "stopped"
+        
+        # 🟢 2. CRITICAL FIX: Tell the Frontend we stopped!
+        # Without this, the frontend keeps the timer running because it never heard "stopped"
+        emit_status(data.userId, {
+            "status": "stopped",
+            "currentBalance": ACTIVE_BOTS[data.userId]['balance'],
+            "activePositions": [],
+            "tradeMarkers": [],
+            "startedAt": None # Clear timer
+        })
+
+        # 3. Save State
         DatabaseHandler.save_state(data.userId, ACTIVE_BOTS[data.userId])
-        emit_log(data.userId, "🛑 Emergency Halt.")
+        emit_log(data.userId, "🛑 Emergency Halt Signal Received.")
         return {"status": "stopped"}
+    
     raise HTTPException(status_code=404)
 
 @app.post("/api/bot/close_position")

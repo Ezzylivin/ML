@@ -324,6 +324,12 @@ async def live_neural_heartbeat(user_id: str):
         
         try:
             ohlcv_raw = await fetch_live_candles_ccxt(config['symbol'], config.get('timeframe', '1h'), 250)
+            
+            # 🟢 ADDED: Debug log if data is missing
+            if not ohlcv_raw:
+                logger.warning(f"⚠️ No candle data returned for {config['symbol']}")
+                emit_log(user_id, "⚠️ Market Data Feed Unstable - Retrying...")
+            
             if ohlcv_raw:
                 df = pd.DataFrame(ohlcv_raw)
                 
@@ -524,39 +530,55 @@ async def fetch_live_candles_ccxt(symbol: str, timeframe: str, limit: int):
 async def start_bot(data: BotStartRequest, background_tasks: BackgroundTasks):
     user_id = data.userId.strip()
     
-    # 1. Capture the UI balance immediately
-    # We use .get() but ensure we check for both camelCase and snake_case
-    ui_capital = data.config.get("capitalAllocation") or data.config.get("capital_allocation")
-    new_balance = float(ui_capital) if ui_capital else 200.0
+    # 1. robustly get capital (handle string/float/null)
+    raw_cap = data.config.get("capitalAllocation") or data.config.get("capital_allocation")
+    ui_capital = float(raw_cap) if raw_cap else 200.0
 
+    # 2. Check active status
+    if user_id in ACTIVE_BOTS and ACTIVE_BOTS[user_id]["status"] == "running":
+        return {"status": "running", "message": "Bot already active"}
+    
     saved_state = DatabaseHandler.load_state(user_id)
     
     if saved_state:
-        # 🟢 RESUME + UPDATE
+        # 🟢 RESUME + FORCE UPDATE
         ACTIVE_BOTS[user_id] = saved_state
         ACTIVE_BOTS[user_id]["status"] = "running"
         ACTIVE_BOTS[user_id]["config"] = data.config
         
-        # Only override balance if the user actually changed it in the UI 
-        # (e.g., if they are trying to "Refill" the bot)
-        if ACTIVE_BOTS[user_id]["balance"] != new_balance:
-            ACTIVE_BOTS[user_id]["balance"] = new_balance
-            emit_log(user_id, f"💰 Balance Adjusted to: ${new_balance}")
-
+        # 🚀 FORCE UPDATE: Overwrite DB memory with User's new input
+        ACTIVE_BOTS[user_id]["balance"] = ui_capital
+        
+        # 🚀 FORCE RESET TIMER: Start a new "Session" clock
+        ACTIVE_BOTS[user_id]["startedAt"] = datetime.now(timezone.utc).isoformat()
+        
+        emit_log(user_id, f"♻️ SESSION RESUMED: Capital Reset to ${ui_capital}")
     else:
         # 🟢 FRESH START
         ACTIVE_BOTS[user_id] = {
             "status": "running", 
             "config": data.config, 
-            "balance": new_balance,
+            "balance": ui_capital,
             "positions": [], 
             "trade_history": [], 
-            "equityCurve": [], 
+            "equityCurve": [], # Will be filled immediately below
             "logs": [],
             "startedAt": datetime.now(timezone.utc).isoformat()
         }
-        emit_log(user_id, f"🚀 Engine Started. Portfolio: ${new_balance}")
+        emit_log(user_id, f"🚀 Engine Started. Portfolio: ${ui_capital}")
 
+    # 🟢 3. PRE-FILL EQUITY CURVE (Fixes "Missing Charts")
+    # If the curve is empty, add the starting point NOW so the chart isn't blank
+    if not ACTIVE_BOTS[user_id].get("equityCurve"):
+        ACTIVE_BOTS[user_id]["equityCurve"] = [{
+            "time": datetime.now().isoformat(), 
+            "balance": ui_capital, 
+            "confidence": 50
+        }]
+
+    # 4. Save immediately to lock in the new $125/$300 balance
+    DatabaseHandler.save_state(user_id, ACTIVE_BOTS[user_id])
+    
     background_tasks.add_task(live_neural_heartbeat, user_id)
     return {"status": "running"}
 

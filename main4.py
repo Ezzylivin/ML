@@ -124,6 +124,50 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 # ==========================================
 # 🧠 1. NEURAL PREDICTOR
 # ==========================================
+class DiagnosticLayer:
+    @staticmethod
+    def render_progress(current, target, reverse=False):
+        """Generates a [|||||.....] visual bar."""
+        try:
+            # Calculate completion percentage
+            pct = (target / current) if not reverse else (current / target)
+            pct = min(1.0, max(0.0, pct))
+            filled = int(pct * 10)
+            bar = "┃" + "█" * filled + "░" * (10 - filled) + "┃"
+            return f"{bar} {int(pct * 100)}%"
+        except: return "[----------] 0%"
+
+    @staticmethod
+    def get_pending_conditions(df, config, conf, ui_limit):
+        try:
+            current_price = float(df['close'].iloc[-1])
+            ema200_val = ta.ema(df['close'], length=200).iloc[-1]
+            is_uptrend = current_price > ema200_val
+            
+            if conf < ui_limit:
+                return f"🛑 AI VETO: Confidence {DiagnosticLayer.render_progress(conf, ui_limit, True)}"
+
+            pending = []
+            strategies = config.get('strategies', [])
+            for strat in strategies:
+                code = strat.get('code')
+                p = strat.get('params', {})
+                if code == "bb_fade":
+                    bb = ta.bbands(df['close'], length=int(p.get('bb_period', 20)), std=float(p.get('bb_std', 2.0)))
+                    target = bb.iloc[-1, 0] if is_uptrend else bb.iloc[-1, 2]
+                    bar = DiagnosticLayer.render_progress(current_price, target, is_uptrend)
+                    pending.append(f"Price to BB: {bar}")
+                elif code == "stoch":
+                    k = ta.stoch(df['high'], df['low'], df['close']).iloc[-1, 0]
+                    target = 20 if is_uptrend else 80
+                    bar = DiagnosticLayer.render_progress(k, target, not is_uptrend)
+                    pending.append(f"Stoch to Trigg: {bar}")
+            
+            rule = config.get('combinationRule', 'OR')
+            return f"🔍 TARGETS ({rule}): " + " | ".join(pending)
+        except Exception: return "🔍 Scanning Market Conditions..."
+
+
 class NeuralPredictor:
     @staticmethod
     def get_prediction(model_id: str, df: pd.DataFrame) -> float:
@@ -235,6 +279,7 @@ class StrategyBrain:
 
         # 2. Bias Logic (EMA Spread Strength)
         spread = ema20 - ema50
+       
         bias_str = "BULLISH EXPANSION" if spread > 0 else "BEARISH CONTRACTION"
         bias_text = f"⚖️ BIAS: {bias_str} (Fast EMA is ${int(abs(spread))} {'above' if spread > 0 else 'below'} Slow EMA)"
 
@@ -282,6 +327,12 @@ async def live_neural_heartbeat(user_id: str):
             if ohlcv_raw:
                 df = pd.DataFrame(ohlcv_raw)
                 
+                current_price = float(df['close'].iloc[-1])
+                ema200_val = ta.ema(df['close'], 200).iloc[-1]
+
+                # 🟢 Also fix upnl calculation early to avoid errors
+                upnl = sum([(current_price - p['entry']) * p['size'] if p['type'] == 'long' else (p['entry'] - current_price) * p['size'] for p in bot['positions']])
+                current_equity = bot['balance'] + upnl
                 # 🟢 DYNAMIC INDICATOR CALCULATION FOR CHART (ALL 10 STRATEGIES)
                 for strat in strategies:
                     code = strat.get('code')
@@ -329,8 +380,26 @@ async def live_neural_heartbeat(user_id: str):
 
                 # Logic & Signals
                 sig, thoughts, nums, score = StrategyBrain.calculate_signals(df, config, 0.5, 0.5)
-                
-                
+
+                ui_limit = float(config.get('mlThresholdLong', 0.5)) if current_price > ema200_val else float(config.get('mlThresholdShort', 0.5))
+                waiting_msg = DiagnosticLayer.get_pending_conditions(df, config, score, ui_limit)
+
+# 3. Inject into Logs
+                if datetime.now().timestamp() - last_log >= 60:
+                    emit_log(user_id, nums['market']['trend'])
+                    emit_log(user_id, waiting_msg) # 🟢 The New Diagnostic Layer Output
+                    emit_log(user_id, nums['market']['logic']) 
+   
+                    new_logs = [
+                        {"time": datetime.now().isoformat(), "message": nums['market']['trend']},
+                        {"time": datetime.now().isoformat(), "message": waiting_msg},
+                        {"time": datetime.now().isoformat(), "message": nums['market']['logic']}
+                    ]
+                    bot["logs"] = (new_logs + bot["logs"])[:300]
+                    
+                    DatabaseHandler.save_state(user_id, bot)
+                    last_log = datetime.now().timestamp()
+             
                 # 🟢 4. EXECUTION LOGIC (✅ ADDED THIS BLOCK)
                 # This actually opens the trade when sig != 0
                 if len(bot['positions']) < int(config.get('maxPyramiding', 1)):
@@ -420,6 +489,11 @@ async def live_neural_heartbeat(user_id: str):
                     candles_to_send.append(c_obj)
                     
                     bot["candles"] = candles_to_send
+               
+
+                if ACTIVE_BOTS[user_id]["status"] != "running":
+                   logger.info("Stop detected. Aborting final emit.")
+                   return
 
                 emit_status(user_id, {
                     "status": "running", 
@@ -433,10 +507,7 @@ async def live_neural_heartbeat(user_id: str):
                     "candles": candles_to_send
                 })
 
-            for _ in range(15):
-                if user_id not in ACTIVE_BOTS or ACTIVE_BOTS[user_id]["status"] != "running":
-                    break
-                await asyncio.sleep(1)
+
 
             await asyncio.sleep(15)
         except Exception as e: 
@@ -493,23 +564,35 @@ async def start_bot(data: BotStartRequest, background_tasks: BackgroundTasks):
 
 @app.post("/api/bot/stop")
 async def stop_bot(data: BotStopRequest):
-    if data.userId in ACTIVE_BOTS:
-        # 1. Mark as stopped internally
-        ACTIVE_BOTS[data.userId]["status"] = "stopped"
+    user_id = data.userId
+    if user_id in ACTIVE_BOTS:
+        # 1. Kill the loop flag
+        ACTIVE_BOTS[user_id]["status"] = "stopped"
         
-        # 2. Tell the Frontend we stopped immediately
-        emit_status(data.userId, {
+        # 2. Reset the bot data (The "Reset" part)
+        ACTIVE_BOTS[user_id]["positions"] = []
+        ACTIVE_BOTS[user_id]["trade_history"] = []
+        ACTIVE_BOTS[user_id]["equityCurve"] = []
+        ACTIVE_BOTS[user_id]["logs"] = []
+        
+        # 3. Tell Frontend to clear everything NOW
+        emit_status(user_id, {
             "status": "stopped",
-            "currentBalance": ACTIVE_BOTS[data.userId]['balance'],
+            "currentBalance": ACTIVE_BOTS[user_id]['balance'],
             "activePositions": [],
             "tradeMarkers": [],
+            "equityCurve": [],
             "startedAt": None 
         })
-
-        # 3. Save State
-        DatabaseHandler.save_state(data.userId, ACTIVE_BOTS[data.userId])
-        emit_log(data.userId, "🛑 Emergency Halt Signal Received.")
-        return {"status": "stopped"}
+        
+        # 4. Wipe the Database state for this user
+        DatabaseHandler.save_state(user_id, ACTIVE_BOTS[user_id])
+        
+        # 5. Remove from active memory to ensure total death
+        del ACTIVE_BOTS[user_id]
+        
+        emit_log(user_id, "💀 SYSTEM PURGED: Engine stopped and session reset.")
+        return {"status": "stopped", "message": "Bot killed and reset"}
     
     return {"status": "stopped"}
 
@@ -568,6 +651,19 @@ async def get_status(userId: str):
         }
     return {"status": "inactive", "balance": 0}
 
+@app.post("/api/bot/reset")
+async def reset_bot(data: BotStopRequest): # Uses same model as stop
+    if data.userId in ACTIVE_BOTS:
+        ACTIVE_BOTS[data.userId]["status"] = "stopped"
+        ACTIVE_BOTS[data.userId]["positions"] = []
+        ACTIVE_BOTS[data.userId]["trade_history"] = []
+        ACTIVE_BOTS[data.userId]["equityCurve"] = []
+        ACTIVE_BOTS[data.userId]["logs"] = []
+        DatabaseHandler.save_state(data.userId, ACTIVE_BOTS[data.userId])
+        return {"status": "reset"}
+    return {"status": "not_found"}
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 (venv) root@intelligent-mendel:~/Project/ML# 

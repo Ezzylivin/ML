@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import joblib
+import json
+import sqlite3
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
@@ -21,6 +23,75 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("NEO-Engine")
 
 ACTIVE_BOTS = {} 
+
+# ==========================================
+# 🗄️ 0. DATABASE HANDLER (Persistence Layer)
+# ==========================================
+class DatabaseHandler:
+    DB_FILE = "bot_state.db"
+
+    @classmethod
+    def init_db(cls):
+        """Initialize the SQLite database for persistence."""
+        conn = sqlite3.connect(cls.DB_FILE)
+        c = conn.cursor()
+        # Create table to store full bot state
+        c.execute('''CREATE TABLE IF NOT EXISTS bot_sessions
+                     (user_id TEXT PRIMARY KEY, config TEXT, balance REAL, 
+                      positions TEXT, trade_history TEXT, equity_curve TEXT, logs TEXT,
+                      status TEXT, last_update TIMESTAMP)''')
+        conn.commit()
+        conn.close()
+
+    @classmethod
+    def save_state(cls, user_id, bot_data):
+        """Save the current bot state to DB."""
+        conn = sqlite3.connect(cls.DB_FILE)
+        c = conn.cursor()
+        # Serialize complex lists/dicts to JSON
+        c.execute('''INSERT OR REPLACE INTO bot_sessions 
+                     (user_id, config, balance, positions, trade_history, equity_curve, logs, status, last_update)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                  (user_id, 
+                   json.dumps(bot_data['config']), 
+                   bot_data['balance'], 
+                   json.dumps(bot_data['positions']), 
+                   json.dumps(bot_data['trade_history']), 
+                   json.dumps(bot_data.get('equityCurve', [])),
+                   json.dumps(bot_data.get('logs', [])), 
+                   bot_data['status'],
+                   datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+
+    @classmethod
+    def load_state(cls, user_id):
+        """Load bot state from DB if exists."""
+        conn = sqlite3.connect(cls.DB_FILE)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM bot_sessions WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        conn.close()
+        
+        if row:
+            try:
+                return {
+                    "config": json.loads(row['config']),
+                    "balance": row['balance'],
+                    "positions": json.loads(row['positions']),
+                    "trade_history": json.loads(row['trade_history']),
+                    "equityCurve": json.loads(row['equity_curve']),
+                    "logs": json.loads(row['logs']),
+                    "status": "stopped" # Always load as stopped initially
+                }
+            except Exception as e:
+                logger.error(f"DB Load Error: {e}")
+                return None
+        return None
+
+# Initialize DB on start
+DatabaseHandler.init_db()
 
 # --- REQUEST MODELS ---
 class BotStartRequest(BaseModel):
@@ -45,9 +116,12 @@ class BacktestRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 🟢 ON STARTUP: (Optional) Load state logic if needed
     yield
-    for user_id in list(ACTIVE_BOTS.keys()):
-        ACTIVE_BOTS[user_id]["status"] = "stopped"
+    # 🟢 ON SHUTDOWN: Save all active bots to DB
+    for user_id, bot in ACTIVE_BOTS.items():
+        bot["status"] = "stopped"
+        DatabaseHandler.save_state(user_id, bot)
 
 app = FastAPI(title="NEO-V25.12 Sovereign Engine", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -70,14 +144,13 @@ class NeuralPredictor:
         except Exception: return 0.5
 
 # ==========================================
-# 🧠 2. SHARED STRATEGY BRAIN (Full HD)
+# 🧠 2. SHARED STRATEGY BRAIN (Full HD Logic)
 # ==========================================
 class StrategyBrain:
     @staticmethod
     def calculate_signals(df: pd.DataFrame, config: Dict[str, Any], l_thresh: float, s_thresh: float):
         active_thoughts, votes = [], 0
         strategies = config.get('strategies', [])
-        total_strats = len(strategies) if strategies else 1
         current_price = df['close'].iloc[-1]
 
         # 🟢 Indicators
@@ -89,7 +162,6 @@ class StrategyBrain:
         pr = int((current_price - lower) / (upper - lower) * 100)
 
         # 🟢 1. FULL 10 STRATEGY EVALUATION
-        # Only evaluates the strategies the User enabled in the UI
         for strat in strategies:
             code = strat.get('code')
             params = strat.get('params', {})
@@ -124,16 +196,16 @@ class StrategyBrain:
                     if df['volume'].iloc[-1] > ta.sma(df['volume'], 20).iloc[-1] * 1.5: votes += (1 if current_price > ema20 else -1); active_thoughts.append("Volume Surge")
             except Exception: continue
 
-        # 🚀 2. DYNAMIC DUAL-GATE LOGIC (Pulling from UI Limits)
+        # 🚀 2. DYNAMIC DUAL-GATE LOGIC (UI Based)
         is_short = current_price < ema200
-        # Dynamic limits pulled from UI config: Defaulting to 0.8/0.9 if not provided
+        # Dynamic limits from UI config
         ui_limit = float(config.get('mlThresholdShort', 0.90)) if is_short else float(config.get('mlThresholdLong', 0.80))
         
         conf = NeuralPredictor.get_prediction(config.get('mlModel', 'stacking'), df)
         gate_passed = conf >= ui_limit
         logic_desc = f"📊 LOGIC: {'SHORT' if is_short else 'LONG'} GATE {'PASSED' if gate_passed else 'VETOED'} ({int(conf*100)}% vs {int(ui_limit*100)}% UI Limit) {'🟢' if gate_passed else '🔴'}"
 
-        # 🎯 3. DYNAMIC HD INTENT
+        # 🎯 3. DYNAMIC HD INTENT (Dollar Gaps)
         signal_names = " + ".join(active_thoughts) if active_thoughts else "Scanning Setup"
         gap = int(abs(current_price - ema50))
         intent_desc = f"🎯 INTENT: STALKING {'SHORT' if is_short else 'LONG'} ({signal_names} | Gap: ${gap}) {'🔴' if is_short else '🟢'}"
@@ -152,10 +224,18 @@ class StrategyBrain:
         return final_sig, active_thoughts, numeric_details, conf
 
 # ==========================================
-# 🚀 3. THE HEARTBEAT
+# 🚀 3. THE HEARTBEAT (With DB Recording)
 # ==========================================
 async def live_neural_heartbeat(user_id: str):
     last_log = 0
+    
+    # 🟢 Initialize Arrays if Fresh Start
+    if user_id in ACTIVE_BOTS:
+        if "equityCurve" not in ACTIVE_BOTS[user_id]: 
+            ACTIVE_BOTS[user_id]["equityCurve"] = [{"time": datetime.now().isoformat(), "balance": ACTIVE_BOTS[user_id]["balance"], "confidence": 50}]
+        if "logs" not in ACTIVE_BOTS[user_id]: 
+            ACTIVE_BOTS[user_id]["logs"] = []
+
     while user_id in ACTIVE_BOTS and ACTIVE_BOTS[user_id]["status"] == "running":
         bot = ACTIVE_BOTS[user_id]
         config = bot.get('config', {})
@@ -163,23 +243,54 @@ async def live_neural_heartbeat(user_id: str):
             ohlcv_raw = await fetch_live_candles_ccxt(config['symbol'], config.get('timeframe', '1h'), 250)
             if ohlcv_raw:
                 df = pd.DataFrame(ohlcv_raw)
+                latest_price = df['close'].iloc[-1]
                 sig, thoughts, nums, score = StrategyBrain.calculate_signals(df, config, 0.5, 0.5)
                 
-                # 🟢 CHART MARKERS
-                markers = [{"time": int(c['time']), "position": "belowBar", "color": "#10b981", "shape": "circle", "text": thoughts[0] if thoughts else "Analyzing"} for c in ohlcv_raw[-1:]]
+                # Markers for Chart
+                markers = [{"time": int(c['time']), "position": "belowBar", "color": "#10b981", "shape": "circle", "text": thoughts[0] if thoughts else ""} for c in ohlcv_raw[-1:] if thoughts]
 
+                # Unrealized PnL Calculation
+                upnl = sum([(latest_price - p['entry']) * p['size'] if p['type'] == 'buy' else (p['entry'] - latest_price) * p['size'] for p in bot['positions']])
+                current_equity = bot['balance'] + upnl
+
+                # 🟢 RECORD HISTORY (Every 1 minute)
+                if datetime.now().timestamp() - last_log >= 60:
+                    # Save Equity & Confidence
+                    bot["equityCurve"].append({
+                        "time": datetime.now().isoformat(), 
+                        "balance": round(current_equity, 2), 
+                        "confidence": int(score * 100)
+                    })
+                    # Limit curve size to keep payload light
+                    if len(bot["equityCurve"]) > 100: bot["equityCurve"].pop(0)
+
+                    # Save Logs
+                    new_logs = []
+                    for key in ['trend', 'bias', 'mindset', 'logic', 'intent']:
+                        msg = nums['market'][key]
+                        emit_log(user_id, msg)
+                        new_logs.append({"time": datetime.now().isoformat(), "message": msg})
+                    
+                    bot["logs"] = (new_logs + bot["logs"])[:50] 
+                    
+                    # 💾 PERSIST TO DATABASE
+                    DatabaseHandler.save_state(user_id, bot)
+                    
+                    last_log = datetime.now().timestamp()
+
+                # Emit Full Status
                 emit_status(user_id, {
-                    "status": "running", "currentBalance": round(bot['balance'], 2),
-                    "activePositions": bot['positions'], "tradeMarkers": bot['trade_history'] + markers, 
+                    "status": "running", "currentBalance": round(current_equity, 2),
+                    "unrealizedPnl": round(upnl, 2),
+                    "activePositions": bot['positions'], 
+                    "tradeMarkers": bot['trade_history'] + markers, 
+                    "equityCurve": bot["equityCurve"], # Send history to frontend
                     "candles": [{"time": int(c['time']), "open": c['open'], "high": c['high'], "low": c['low'], "close": c['close']} for c in ohlcv_raw[-50:]]
                 })
 
-                if datetime.now().timestamp() - last_log >= 60:
-                    for key in ['trend', 'bias', 'mindset', 'logic', 'intent']:
-                        emit_log(user_id, nums['market'][key])
-                    last_log = datetime.now().timestamp()
             await asyncio.sleep(15)
-        except Exception as e: logger.error(f"Sync Error: {e}"); await asyncio.sleep(10)
+        except Exception as e: 
+            logger.error(f"Sync Error: {e}"); await asyncio.sleep(10)
 
 # ==========================================
 # 📡 4. ALL ENDPOINTS
@@ -194,9 +305,27 @@ async def fetch_live_candles_ccxt(symbol: str, timeframe: str, limit: int):
 @app.post("/api/bot/start")
 async def start_bot(data: BotStartRequest, background_tasks: BackgroundTasks):
     user_id = data.userId.strip()
-    capital = float(data.config.get("capitalAllocation") or 200)
-    ACTIVE_BOTS[user_id] = {"status": "running", "config": data.config, "balance": capital, "positions": [], "trade_history": []}
-    emit_log(user_id, f"🚀 Engine Started. Portfolio: ${capital}")
+    
+    # 🟢 CHECK DB FOR EXISTING SESSION
+    if user_id in ACTIVE_BOTS and ACTIVE_BOTS[user_id]["status"] == "running":
+        return {"status": "running", "message": "Bot already active"}
+    
+    saved_state = DatabaseHandler.load_state(user_id)
+    if saved_state:
+        # Resume Session
+        ACTIVE_BOTS[user_id] = saved_state
+        ACTIVE_BOTS[user_id]["status"] = "running"
+        ACTIVE_BOTS[user_id]["config"] = data.config # Update config
+        emit_log(user_id, "♻️ SESSION RESTORED: History Loaded from Database.")
+    else:
+        # Start New
+        capital = float(data.config.get("capitalAllocation") or 200)
+        ACTIVE_BOTS[user_id] = {
+            "status": "running", "config": data.config, "balance": capital, 
+            "positions": [], "trade_history": [], "equityCurve": [], "logs": []
+        }
+        emit_log(user_id, f"🚀 Engine Started. Portfolio: ${capital}")
+
     background_tasks.add_task(live_neural_heartbeat, user_id)
     return {"status": "running"}
 
@@ -204,7 +333,9 @@ async def start_bot(data: BotStartRequest, background_tasks: BackgroundTasks):
 async def stop_bot(data: BotStopRequest):
     if data.userId in ACTIVE_BOTS:
         ACTIVE_BOTS[data.userId]["status"] = "stopped"
-        emit_log(data.userId, "🛑 Emergency Halt Received.")
+        # Save state on stop
+        DatabaseHandler.save_state(data.userId, ACTIVE_BOTS[data.userId])
+        emit_log(data.userId, "🛑 Emergency Halt Signal Received.")
         return {"status": "stopped"}
     raise HTTPException(status_code=404)
 
@@ -213,6 +344,7 @@ async def close_position(data: BotClosePositionRequest):
     if data.userId in ACTIVE_BOTS and ACTIVE_BOTS[data.userId]['positions']:
         pos = ACTIVE_BOTS[data.userId]['positions'].pop(0)
         emit_log(data.userId, f"⚠️ Manual Exit: {pos['type'].upper()} closed.")
+        DatabaseHandler.save_state(data.userId, ACTIVE_BOTS[data.userId])
         return {"status": "closed"}
     raise HTTPException(status_code=400, detail="No active positions")
 
@@ -226,6 +358,7 @@ async def run_backtest(data: BacktestRequest):
         balance, position, trades, curve = data.initial_capital, None, [], []
         for i in range(20, len(df)):
             window = df.iloc[:i+1]
+            # Use same strategy logic for backtest
             sig, _, _, _ = StrategyBrain.calculate_signals(window, {"strategies": data.strategies}, 0.5, 0.5)
             price, ts = df.iloc[i]['close'], datetime.fromtimestamp(df.iloc[i]['time']/1000, tz=timezone.utc).isoformat()
             if sig == 1 and position is None:
@@ -244,8 +377,20 @@ async def run_backtest(data: BacktestRequest):
 
 @app.get("/api/bot/status")
 async def get_status(userId: str):
+    # 🟢 ENHANCED STATUS: Check memory first, then DB
     bot = ACTIVE_BOTS.get(userId.strip())
-    return {"status": bot["status"] if bot else "inactive", "balance": bot["balance"] if bot else 0}
+    if not bot:
+        bot = DatabaseHandler.load_state(userId.strip())
+    
+    if bot:
+        return {
+            "status": bot["status"], 
+            "balance": bot["balance"],
+            "equityCurve": bot.get("equityCurve", []), # Allows chart hydration
+            "logs": bot.get("logs", []),
+            "positions": bot.get("positions", [])
+        }
+    return {"status": "inactive", "balance": 0}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

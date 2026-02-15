@@ -27,24 +27,33 @@ ACTIVE_BOTS = {}
 # ==========================================
 # 🗄️ 0. DATABASE HANDLER (Persistence Layer)
 # ==========================================
+# In main3.py / main4.py
+
 class DatabaseHandler:
     DB_FILE = "bot_state.db"
 
     @classmethod
     def init_db(cls):
         """Initialize the SQLite database for persistence."""
-        conn = sqlite3.connect(cls.DB_FILE)
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS bot_sessions
-                     (user_id TEXT PRIMARY KEY, config TEXT, balance REAL, 
-                      positions TEXT, trade_history TEXT, equity_curve TEXT, logs TEXT,
-                      status TEXT, last_update TIMESTAMP)''')
-        conn.commit()
-        conn.close()
+        try:
+            conn = sqlite3.connect(cls.DB_FILE)
+            c = conn.cursor()
+            c.execute('''CREATE TABLE IF NOT EXISTS bot_sessions
+                         (user_id TEXT PRIMARY KEY, config TEXT, balance REAL, 
+                          positions TEXT, trade_history TEXT, equity_curve TEXT, logs TEXT,
+                          status TEXT, last_update TIMESTAMP)''')
+            conn.commit()
+            conn.close()
+            print("✅ Database initialized successfully.")
+        except Exception as e:
+            print(f"❌ Database Init Error: {e}")
 
     @classmethod
     def save_state(cls, user_id, bot_data):
         """Save the current bot state to DB."""
+        # 🟢 SELF-HEALING: Ensure table exists before saving
+        cls.init_db() 
+        
         conn = sqlite3.connect(cls.DB_FILE)
         c = conn.cursor()
         c.execute('''INSERT OR REPLACE INTO bot_sessions 
@@ -65,10 +74,23 @@ class DatabaseHandler:
     @classmethod
     def load_state(cls, user_id):
         """Load bot state from DB if exists."""
+        # 🟢 SELF-HEALING: Ensure table exists before loading
+        if not os.path.exists(cls.DB_FILE):
+            cls.init_db()
+            return None
+            
         conn = sqlite3.connect(cls.DB_FILE)
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
-        c.execute("SELECT * FROM bot_sessions WHERE user_id = ?", (user_id,))
+        
+        try:
+            c.execute("SELECT * FROM bot_sessions WHERE user_id = ?", (user_id,))
+        except sqlite3.OperationalError:
+            # 🟢 Table missing? Create it and return None (fresh start)
+            conn.close()
+            cls.init_db()
+            return None
+
         row = c.fetchone()
         conn.close()
         
@@ -88,8 +110,8 @@ class DatabaseHandler:
                 return None
         return None
 
+# Ensure this is called at the module level
 DatabaseHandler.init_db()
-
 # --- REQUEST MODELS ---
 class BotStartRequest(BaseModel):
     userId: str
@@ -530,29 +552,32 @@ async def fetch_live_candles_ccxt(symbol: str, timeframe: str, limit: int):
 async def start_bot(data: BotStartRequest, background_tasks: BackgroundTasks):
     user_id = data.userId.strip()
     
-    # 1. robustly get capital (handle string/float/null)
+    # 1. Get the capital from the UI (e.g., $125)
     raw_cap = data.config.get("capitalAllocation") or data.config.get("capital_allocation")
-    ui_capital = float(raw_cap) if raw_cap else 200.0
+    ui_capital = float(raw_cap) if raw_cap else 200.0 
 
-    # 2. Check active status
+    # 2. Check if already active
     if user_id in ACTIVE_BOTS and ACTIVE_BOTS[user_id]["status"] == "running":
         return {"status": "running", "message": "Bot already active"}
     
+    # 3. Load from DB (This might have the old $200)
     saved_state = DatabaseHandler.load_state(user_id)
     
     if saved_state:
-        # 🟢 RESUME + FORCE UPDATE
+        # 🟢 RESUME SESSION
         ACTIVE_BOTS[user_id] = saved_state
         ACTIVE_BOTS[user_id]["status"] = "running"
         ACTIVE_BOTS[user_id]["config"] = data.config
         
-        # 🚀 FORCE UPDATE: Overwrite DB memory with User's new input
-        ACTIVE_BOTS[user_id]["balance"] = ui_capital
+        # 🚀 FORCE OVERWRITE: This is the specific fix!
+        # Even though we loaded $200 from the DB, we replace it with $125 immediately.
+        ACTIVE_BOTS[user_id]["balance"] = ui_capital 
         
-        # 🚀 FORCE RESET TIMER: Start a new "Session" clock
+        # 🚀 RESET TIMER
         ACTIVE_BOTS[user_id]["startedAt"] = datetime.now(timezone.utc).isoformat()
         
-        emit_log(user_id, f"♻️ SESSION RESUMED: Capital Reset to ${ui_capital}")
+        emit_log(user_id, f"♻️ SESSION RESET: Balance updated to ${ui_capital}")
+
     else:
         # 🟢 FRESH START
         ACTIVE_BOTS[user_id] = {
@@ -561,14 +586,13 @@ async def start_bot(data: BotStartRequest, background_tasks: BackgroundTasks):
             "balance": ui_capital,
             "positions": [], 
             "trade_history": [], 
-            "equityCurve": [], # Will be filled immediately below
+            "equityCurve": [], 
             "logs": [],
             "startedAt": datetime.now(timezone.utc).isoformat()
         }
         emit_log(user_id, f"🚀 Engine Started. Portfolio: ${ui_capital}")
 
-    # 🟢 3. PRE-FILL EQUITY CURVE (Fixes "Missing Charts")
-    # If the curve is empty, add the starting point NOW so the chart isn't blank
+    # 4. PRE-FILL CHART (Prevents "Charts not showing")
     if not ACTIVE_BOTS[user_id].get("equityCurve"):
         ACTIVE_BOTS[user_id]["equityCurve"] = [{
             "time": datetime.now().isoformat(), 
@@ -576,7 +600,8 @@ async def start_bot(data: BotStartRequest, background_tasks: BackgroundTasks):
             "confidence": 50
         }]
 
-    # 4. Save immediately to lock in the new $125/$300 balance
+    # 5. SAVE IMMEDIATELY
+    # This overwrites the "bad" $200 in the file with the new $125 automatically.
     DatabaseHandler.save_state(user_id, ACTIVE_BOTS[user_id])
     
     background_tasks.add_task(live_neural_heartbeat, user_id)

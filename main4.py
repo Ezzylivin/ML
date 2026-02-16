@@ -3,6 +3,8 @@ import logging
 import os
 import joblib
 import json
+import re
+import aiofiles
 import sqlite3
 import numpy as np
 import pandas as pd
@@ -12,12 +14,22 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List, Union
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
 from contextlib import asynccontextmanager
-
+from fastapi.exceptions import RequestValidationError # <--- ADD THIS
+# Update this line to include JSONResponse
+from fastapi.responses import JSONResponse
 # 🟢 SOCKET HELPERS
 from app.services.socket_emitter import emit_log, emit_status
+from app.backtest2 import Backtester 
+from app.config2 import MODEL_DIR
+
+
+MODEL_DIR = "models"
+RESULTS_DIR = "results"
+os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("NEO-Engine")
@@ -124,14 +136,46 @@ class BotClosePositionRequest(BaseModel):
     userId: str
     symbol: str
 
+
+ 
+class Config:
+        populate_by_name = True
+
+
+class StrategyConfig(BaseModel):
+    code: str
+    params: Dict[str, Any]
+
 class BacktestRequest(BaseModel):
-    userId: str
     symbol: str
     timeframe: str
-    start_date: str 
-    end_date: str   
-    strategies: List[Dict[str, Any]]
-    initial_capital: float = 10000.0
+    startDate: str
+    endDate: str
+    initialBalance: float = 1000.0
+    riskPercentage: float = 1.0
+    mlModel: Optional[str] = None
+    trend_strategy: Optional[str] = "atr_breakout"
+    range_strategy: Optional[str] = "bollinger_reversal"
+    ml_confidence_threshold: Optional[float] = 0.10
+    trade_direction: Optional[str] = "BOTH"
+    params: Optional[Dict[str, Any]] = {}
+
+class ComboRequest(BaseModel):
+    symbol: str
+    timeframe: str
+    startDate: str
+    endDate: str
+    initialBalance: float
+    strategies: List[StrategyConfig]
+    combinationRule: str = "OR"
+    risk_percentage: float = 1.0
+    take_profit: Optional[float] = 0.06
+    stop_loss: Optional[float] = 0.03
+    trailing_stop: Optional[float] = 0.02
+    mlMode: Optional[str] = None 
+    advanced_filters: Optional[Dict] = {}
+    params: Optional[Dict[str, Any]] = {}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -142,6 +186,156 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="NEO-V25.14 Sovereign Engine", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    # This prints the EXACT error to your nohup log
+    print(f"❌ DATA ERROR: {exc.errors()}")
+    print(f"❌ RECEIVED BODY: {exc.body}")
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors(), "body": exc.body},
+    )
+
+# ==========================================
+# BACK TEST
+# ==========================================
+def load_data_robust(symbol, timeframe):
+    possible_paths = [
+        f"data/{symbol.replace('/', '-')}-{timeframe}.csv",
+        f"Project/ML/data/{symbol.replace('/', '-')}-{timeframe}.csv",
+        f"{symbol.replace('/', '-')}-{timeframe}.csv"
+    ]
+    
+    file_path = None
+    for p in possible_paths:
+        if os.path.exists(p):
+            file_path = p
+            break
+            
+    if not file_path:
+        logger.error(f"❌ File not found. Searched: {possible_paths}")
+        return None
+
+    try:
+        df = pd.read_csv(file_path)
+        time_col = next((c for c in df.columns if c.lower() in ['timestamp', 'time', 'date']), None)
+        
+        if time_col:
+            first_val = df[time_col].iloc[0]
+            if isinstance(first_val, (int, float, np.number)):
+                unit = 'ms' if first_val > 1e11 else 's'
+                df[time_col] = pd.to_datetime(df[time_col], unit=unit, utc=True)
+            else:
+                df[time_col] = pd.to_datetime(df[time_col], utc=True, errors='coerce')
+            
+            df.rename(columns={time_col: 'timestamp'}, inplace=True)
+            df.set_index('timestamp', inplace=True)
+            df.columns = [c.lower() for c in df.columns]
+            df.sort_index(inplace=True)
+            df = df[~df.index.duplicated(keep='first')]
+            return df
+            
+    except Exception as e:
+        logger.error(f"Data Load Error: {e}")
+    return None
+
+def calculate_strategy_signal(df, code, params):
+    close = df['close']
+    high = df['high']
+    low = df['low']
+    vol = df['volume']
+    signal = pd.Series(0, index=df.index)
+    
+    try:
+        if code == "rsi_threshold":
+            length = int(params.get('rsi_length', 14))
+            rsi = ta.rsi(close, length=length)
+            signal[rsi < params.get('oversold', 30)] = 1
+            signal[rsi > params.get('overbought', 70)] = -1
+            
+        elif code == "sma_crossover":
+            fast = ta.sma(close, length=int(params.get('fast_sma', 50)))
+            slow = ta.sma(close, length=int(params.get('slow_sma', 200)))
+            signal[fast > slow] = 1
+            signal[fast < slow] = -1
+            
+        elif code == "bollinger_bands" or code == "bb_fade":
+            length = int(params.get('bb_period', 20))
+            std = float(params.get('bb_std', 2.0))
+            bb = ta.bbands(close, length=length, std=std)
+            if bb is not None:
+                lower = bb.iloc[:, 0]
+                upper = bb.iloc[:, 2]
+                signal[close < lower] = 1
+                signal[close > upper] = -1
+
+        elif code == "atr_breakout":
+            length = int(params.get('atr_length', 14))
+            mult = float(params.get('multiplier', 1.5))
+            atr = ta.atr(high, low, close, length=length)
+            sma = ta.sma(close, length=20)
+            signal[close > (sma + atr * mult)] = 1
+            signal[close < (sma - atr * mult)] = -1
+
+        elif code == "macd_crossover":
+            fast = int(params.get('fast', 12))
+            slow = int(params.get('slow', 26))
+            sig = int(params.get('signal', 9))
+            macd = ta.macd(close, fast=fast, slow=slow, signal=sig)
+            if macd is not None:
+                macd_line = macd.iloc[:, 0]
+                sig_line = macd.iloc[:, 2]
+                signal[macd_line > sig_line] = 1
+                signal[macd_line < sig_line] = -1
+        
+        elif code == "stoch":
+            k_len = int(params.get('k_period', 14))
+            d_len = int(params.get('d_period', 3))
+            stoch = ta.stoch(high, low, close, k=k_len, d=d_len)
+            if stoch is not None:
+                k, d = stoch.iloc[:, 0], stoch.iloc[:, 1]
+                signal[(k > d) & (k < 30)] = 1
+                signal[(k < d) & (k > 70)] = -1
+
+        elif code == "supertrend":
+            length = int(params.get('st_atr', 10))
+            factor = float(params.get('st_factor', 3.0))
+            st = ta.supertrend(high, low, close, length=length, multiplier=factor)
+            if st is not None:
+                direction = st.iloc[:, 1] 
+                signal[direction == 1] = 1
+                signal[direction == -1] = -1
+
+        elif code == "ema_cloud":
+            fast_len = int(params.get('fast_ema', 9))
+            slow_len = int(params.get('slow_ema', 21))
+            fast_ema = ta.ema(close, length=fast_len)
+            slow_ema = ta.ema(close, length=slow_len)
+            signal[fast_ema > slow_ema] = 1
+            signal[fast_ema < slow_ema] = -1
+
+        elif code == "pa_breakout":
+            lookback = int(params.get('lookback', 20))
+            highest = high.rolling(lookback).max().shift(1)
+            lowest = low.rolling(lookback).min().shift(1)
+            signal[close > highest] = 1
+            signal[close < lowest] = -1
+
+        elif code == "vol_profile":
+            vol_ma_len = int(params.get('vol_ma', 20))
+            threshold = float(params.get('threshold', 1.5))
+            vol_ma = ta.sma(vol, length=vol_ma_len)
+            vol_spike = vol > (vol_ma * threshold)
+            price_up = close > close.shift(1)
+            signal[vol_spike & price_up] = 1
+            signal[vol_spike & ~price_up] = -1
+
+    except Exception as e:
+        logger.error(f"Strategy Error ({code}): {e}")
+    
+    return signal.fillna(0)
+
 
 # ==========================================
 # 🧠 1. NEURAL PREDICTOR
@@ -203,6 +397,96 @@ class NeuralPredictor:
             base = 1.0 / (1.0 + np.exp(-momentum * 100))
             return float(min(1.0, max(0.0, base)))
         except Exception: return 0.5
+
+
+async def execute_backtest_logic(data: BacktestRequest):
+    """Reusable backtest engine that prioritizes CSV files."""
+    try:
+        df = None
+        # 1. Try Loading from Local CSV
+        csv_path = f"data/{data.symbol.replace('/', '-')}_{data.timeframe}.csv"
+        
+        if os.path.exists(csv_path):
+            logger.info(f"📂 Loading historical data from {csv_path}")
+            df = pd.read_csv(csv_path)
+            # Normalize column names
+            df.columns = [c.lower() for c in df.columns]
+            rename_map = {'timestamp': 'time', 'date': 'time', 'volume': 'vol'}
+            df.rename(columns=rename_map, inplace=True)
+            
+            # Ensure time is datetime for filtering
+            df['time'] = pd.to_datetime(df['time'])
+            
+            # Filter by Date Range
+            start_dt = pd.to_datetime(data.start_date).replace(tzinfo=None)
+            end_dt = pd.to_datetime(data.end_date).replace(tzinfo=None)
+            
+            # If CSV time is TZ-aware, strip it for comparison or ensure match
+            if df['time'].dt.tz is not None:
+                df['time'] = df['time'].dt.tz_localize(None)
+                
+            df = df[(df['time'] >= start_dt) & (df['time'] <= end_dt)]
+            
+            # Convert time back to milliseconds for logic consistency if needed, or keep as is
+            # StrategyBrain expects DataFrame. The indices might need reset.
+            df.reset_index(drop=True, inplace=True)
+
+        # 2. Fallback to CCXT if CSV missing
+        if df is None or df.empty:
+            logger.info("⚠️ CSV not found or empty. Falling back to CCXT.")
+            async with ccxt.coinbase() as exchange:
+                since = exchange.parse8601(data.start_date)
+                ohlcv = await exchange.fetch_ohlcv(data.symbol.replace('-', '/'), data.timeframe, since=since, limit=1000)
+                df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
+                df['time'] = pd.to_datetime(df['time'], unit='ms')
+
+        if df.empty:
+            return {"status": "error", "message": "No data found for backtest range"}
+
+        balance, position, trades, curve = data.initial_capital, None, [], []
+        
+        # Prepare Config for StrategyBrain
+        sim_config = {
+            "strategies": data.strategies,
+            "comboConfig": data.comboConfig or {},
+            "mlModel": "stacking" 
+        }
+
+        # 🚀 THE SIMULATION LOOP
+        for i in range(50, len(df)): # Start at 50 to allow indicators to warm up
+            window = df.iloc[:i+1].copy()
+            
+            # Calculate Indicators on the window
+            # Note: For speed, you might want to pre-calc indicators on full DF, but this mimics live behavior
+            sig, _, _, _ = StrategyBrain.calculate_signals(window, sim_config, 0.5, 0.5)
+            
+            row = df.iloc[i]
+            price = row['close']
+            ts = row['time'].isoformat()
+            
+            # Execution Logic
+            if sig == 1 and position is None:
+                position = {"type": "long", "entry": price, "size": balance / price}
+                trades.append({"type": "buy", "price": price, "time": ts})
+            elif sig == -1 and position is None:
+                position = {"type": "short", "entry": price, "size": balance / price}
+                trades.append({"type": "short", "price": price, "time": ts})
+            elif (sig == -1 and position and position['type'] == 'long') or (sig == 1 and position and position['type'] == 'short'):
+                pnl = (price - position['entry']) * position['size'] if position['type'] == 'long' else (position['entry'] - price) * position['size']
+                balance += pnl; position = None
+                trades.append({"type": "exit", "price": price, "time": ts, "pnl": pnl})
+            
+            curve.append({"time": ts, "equity": balance})
+            
+        return {
+            "status": "success", 
+            "metrics": {"final_balance": round(balance, 2), "trade_count": len(trades)}, 
+            "trades": trades, 
+            "equity_curve": curve
+        }
+    except Exception as e: 
+        logger.error(f"Backtest Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
 # 🧠 2. SHARED STRATEGY BRAIN
@@ -548,29 +832,46 @@ async def fetch_live_candles_ccxt(symbol: str, timeframe: str, limit: int):
             return [{"time": c[0]/1000, "open": c[1], "high": c[2], "low": c[3], "close": c[4], "vol": c[5] if len(c) > 5 else 0} for c in ohlcv]
         except: return []
 
+@app.get("/ml/available-models")
+@app.get("/api/models")
+def list_models():
+    if not os.path.exists(MODEL_DIR): return {"status": "success", "models": []}
+    models = [{"id": f.rsplit('.', 1)[0], "name": f.rsplit('.', 1)[0]} 
+              for f in os.listdir(MODEL_DIR) if f.endswith(('.keras', '.joblib'))]
+    return {"status": "success", "models": models}
+
 @app.post("/api/bot/start")
 async def start_bot(data: BotStartRequest, background_tasks: BackgroundTasks):
     user_id = data.userId.strip()
     
     # 1. Get the capital from the UI (e.g., $125)
+    # This logic ensures we prioritize what the user just typed over what's in the DB
     raw_cap = data.config.get("capitalAllocation") or data.config.get("capital_allocation")
     ui_capital = float(raw_cap) if raw_cap else 200.0 
 
     # 2. Check if already active
     if user_id in ACTIVE_BOTS and ACTIVE_BOTS[user_id]["status"] == "running":
         return {"status": "running", "message": "Bot already active"}
-    
-    # 3. Load from DB (This might have the old $200)
+
+    # 3. 🚀 PRE-FETCH CANDLES (Critical Chart Fix)
+    # We do this first so the 'candles' array is ready for the immediate emit
+    initial_ohlcv = await fetch_live_candles_ccxt(data.config['symbol'], data.config.get('timeframe', '1h'), 150)
+    processed_candles = []
+    if initial_ohlcv:
+        df_init = pd.DataFrame(initial_ohlcv)
+        processed_candles = await get_processed_candles(df_init, data.config.get('strategies', []))
+
+    # 4. Load State & Merge Logic
     saved_state = DatabaseHandler.load_state(user_id)
-    
+
     if saved_state:
-        # 🟢 RESUME SESSION
+        # 🟢 RESUME EXISTING SESSION
         ACTIVE_BOTS[user_id] = saved_state
         ACTIVE_BOTS[user_id]["status"] = "running"
         ACTIVE_BOTS[user_id]["config"] = data.config
         
-        # 🚀 FORCE OVERWRITE: This is the specific fix!
-        # Even though we loaded $200 from the DB, we replace it with $125 immediately.
+        # 🚀 FORCE OVERWRITE: Balance Reset Fix
+        # Even if DB had $200, we overwrite it with the UI's $125 here.
         ACTIVE_BOTS[user_id]["balance"] = ui_capital 
         
         # 🚀 RESET TIMER
@@ -581,18 +882,18 @@ async def start_bot(data: BotStartRequest, background_tasks: BackgroundTasks):
     else:
         # 🟢 FRESH START
         ACTIVE_BOTS[user_id] = {
-            "status": "running", 
-            "config": data.config, 
-            "balance": ui_capital,
-            "positions": [], 
-            "trade_history": [], 
-            "equityCurve": [], 
+            "status": "running",
+            "config": data.config,
+            "balance": ui_capital, # Use the UI capital
+            "positions": [],
+            "trade_history": [],
+            "equityCurve": [],
             "logs": [],
             "startedAt": datetime.now(timezone.utc).isoformat()
         }
         emit_log(user_id, f"🚀 Engine Started. Portfolio: ${ui_capital}")
 
-    # 4. PRE-FILL CHART (Prevents "Charts not showing")
+    # 5. PRE-FILL CHART DATA (Prevents "Charts not showing")
     if not ACTIVE_BOTS[user_id].get("equityCurve"):
         ACTIVE_BOTS[user_id]["equityCurve"] = [{
             "time": datetime.now().isoformat(), 
@@ -600,10 +901,18 @@ async def start_bot(data: BotStartRequest, background_tasks: BackgroundTasks):
             "confidence": 50
         }]
 
-    # 5. SAVE IMMEDIATELY
-    # This overwrites the "bad" $200 in the file with the new $125 automatically.
+    # 6. SAVE IMMEDIATELY
+    # Persist the new balance ($125) to disk right now.
     DatabaseHandler.save_state(user_id, ACTIVE_BOTS[user_id])
     
+    # 7. 🚀 EMIT IMMEDIATELY (Sends both Balance & Candles)
+    emit_status(user_id, {
+        "status": "running", 
+        "currentBalance": ACTIVE_BOTS[user_id]["balance"],
+        "candles": processed_candles, # The V2 Fix
+        "startedAt": ACTIVE_BOTS[user_id]["startedAt"]
+    })
+
     background_tasks.add_task(live_neural_heartbeat, user_id)
     return {"status": "running"}
 
@@ -650,31 +959,253 @@ async def close_position(data: BotClosePositionRequest):
         return {"status": "closed"}
     raise HTTPException(status_code=400, detail="No active positions")
 
-@app.post("/api/bot/backtest")
-async def run_backtest(data: BacktestRequest):
+@app.post('/api/backtest/run')
+async def run_backtest(request: BacktestRequest):
+    """
+    Atomic/Single Strategy Endpoint (Upgraded with Risk Fix)
+    """
     try:
-        async with ccxt.coinbase() as exchange:
-            since = exchange.parse8601(data.start_date)
-            ohlcv = await exchange.fetch_ohlcv(data.symbol.replace('-', '/'), data.timeframe, since=since, limit=1000)
-            df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
-        balance, position, trades, curve = data.initial_capital, None, [], []
-        for i in range(20, len(df)):
-            window = df.iloc[:i+1]
-            sig, _, _, _ = StrategyBrain.calculate_signals(window, {"strategies": data.strategies}, 0.5, 0.5)
-            price, ts = df.iloc[i]['close'], datetime.fromtimestamp(df.iloc[i]['time']/1000, tz=timezone.utc).isoformat()
-            if sig == 1 and position is None:
-                position = {"type": "long", "entry": price, "size": balance / price}
-                trades.append({"type": "buy", "price": price, "time": ts})
-            elif sig == -1 and position is None:
-                position = {"type": "short", "entry": price, "size": balance / price}
-                trades.append({"type": "short", "price": price, "time": ts})
-            elif (sig == -1 and position and position['type'] == 'long') or (sig == 1 and position and position['type'] == 'short'):
-                pnl = (price - position['entry']) * position['size'] if position['type'] == 'long' else (position['entry'] - price) * position['size']
-                balance += pnl; position = None
-                trades.append({"type": "exit", "price": price, "time": ts, "pnl": pnl})
-            curve.append({"time": ts, "equity": balance})
-        return {"status": "success", "metrics": {"final_balance": round(balance, 2), "trade_count": len(trades)}, "trades": trades, "equity_curve": curve}
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e)) 
+        config = request.dict()
+        
+        # 🛡️ RISK FIX FOR ATOMIC
+        # Apply the same auto-correction logic here so single strategies behave safely
+        p_dict = config.get('params', {})
+        
+        # Helper to fix percentages
+        def fix_pct(val, default):
+            if val is None: return default
+            return val / 100 if val > 1.0 else val
+
+        # Extract and Fix
+        tp = fix_pct(p_dict.get('take_profit'), 0.06)
+        sl = fix_pct(p_dict.get('stop_loss'), 0.03)
+        ts = fix_pct(p_dict.get('trailing_stop'), 0.02)
+        
+        # Inject back into config for Backtester class to use
+        config['params']['take_profit'] = tp
+        config['params']['stop_loss'] = sl
+        config['params']['trailing_stop'] = ts
+        
+        logger.info(f"🛡️ Atomic Risk Corrected: TP={tp}, SL={sl}, TS={ts}")
+
+        # Run Bot
+        bot = Backtester(config)
+        result = bot.run()
+        
+        # 📊 CANDLE DATA FIX FOR ATOMIC
+        # If the legacy Backtester didn't return candleData, we load it manually here
+        if 'candleData' not in result or not result['candleData']:
+            df = load_data_robust(config['symbol'], config['timeframe'])
+            if df is not None:
+                # Filter if needed (simplified)
+                try:
+                    df = df.loc[config['startDate']:config['endDate']]
+                except: pass
+                
+                chart_df = df.reset_index()[['timestamp', 'open', 'high', 'low', 'close']].copy()
+                chart_df['timestamp'] = chart_df['timestamp'].astype(str)
+                result['candleData'] = chart_df.to_dict('records')
+                result['initialBalance'] = config['initialBalance']
+        
+        return JSONResponse(content=result)
+        
+    except Exception as e:
+        logger.error(f"Atomic API Error: {e}")
+        return JSONResponse(content={"status": "failed", "error": str(e)}, status_code=500)
+
+@app.post('/api/backtest/combo')
+async def run_combo_backtest(req: ComboRequest):
+    """
+    Hybrid/Combo Engine (Fully Loaded)
+    """
+    try:
+        logger.info(f"🔥 COMBO Request: {len(req.strategies)} strategies on {req.symbol}")
+        
+        # 1. Load Data
+        df = load_data_robust(req.symbol, req.timeframe)
+        if df is None:
+            raise HTTPException(status_code=404, detail=f"Data file not found for {req.symbol}")
+            
+        try:
+            df = df.loc[req.startDate:req.endDate]
+            if df.empty: raise Exception("No data in date range")
+        except:
+            pass
+
+        # 2. Calculate Signals
+        signals_list = []
+        for strat in req.strategies:
+            sig_series = calculate_strategy_signal(df, strat.code, strat.params)
+            signals_list.append(sig_series)
+        
+        if not signals_list:
+            return {"status": "error", "message": "No strategies executed"}
+
+        # 3. Vote Logic
+        sig_df = pd.concat(signals_list, axis=1).fillna(0)
+        vote_sum = sig_df.sum(axis=1)
+        
+        final_signal = pd.Series(0, index=df.index)
+        
+        if req.combinationRule == "AND": 
+            n = len(req.strategies)
+            final_signal[vote_sum == n] = 1
+            final_signal[vote_sum == -n] = -1
+        else: 
+            final_signal[vote_sum > 0] = 1
+            final_signal[vote_sum < 0] = -1
+
+        # 4. Event-Driven Simulation
+        balance = req.initialBalance
+        position = 0
+        entry_price = 0.0
+        best_price = 0.0
+        equity_curve = []
+        trades_log = []
+        
+        prices = df['close'].values
+        highs = df['high'].values
+        lows = df['low'].values
+        times = df.index
+        sigs = final_signal.values
+        
+        comm = 0.0006 
+        
+        # 🛡️ RISK PARSING (Robust)
+        p_dict = req.params or {}
+        raw_tp = p_dict.get('take_profit', req.take_profit)
+        raw_sl = p_dict.get('stop_loss', req.stop_loss)
+        raw_ts = p_dict.get('trailing_stop', req.trailing_stop)
+        
+        raw_tp = raw_tp if raw_tp is not None else 0.06
+        raw_sl = raw_sl if raw_sl is not None else 0.03
+        raw_ts = raw_ts if raw_ts is not None else 0.0
+        
+        tp_pct = raw_tp / 100 if raw_tp > 1.0 else raw_tp
+        sl_pct = raw_sl / 100 if raw_sl > 1.0 else raw_sl
+        ts_pct = raw_ts / 100 if raw_ts > 1.0 else raw_ts
+
+        logger.info(f"🛡️ Combo Risk Loaded: TP={tp_pct}, SL={sl_pct}, TS={ts_pct}")
+        
+        for i in range(1, len(prices)):
+            price = prices[i]
+            high = highs[i]
+            low = lows[i]
+            date = str(times[i])
+            signal = sigs[i-1] 
+            
+            # --- CHECK EXITS ---
+            if position == 1: # LONG
+                if high > best_price: best_price = high
+                
+                stop_price = entry_price * (1 - sl_pct)
+                take_price = entry_price * (1 + tp_pct)
+                trail_price = best_price * (1 - ts_pct) if ts_pct > 0 else 0
+                
+                exit_reason = None
+                exit_p = price
+                
+                if low <= stop_price: 
+                    exit_reason = "SL"
+                    exit_p = stop_price
+                elif ts_pct > 0 and low <= trail_price:
+                    exit_reason = "Trail"
+                    exit_p = trail_price
+                elif high >= take_price:
+                    exit_reason = "TP"
+                    exit_p = take_price
+                
+                if exit_reason:
+                    pnl_pct = (exit_p - entry_price) / entry_price
+                    balance *= (1 + pnl_pct - comm)
+                    trades_log.append({"type": "close_long", "price": exit_p, "time": date, "balance": balance, "reason": exit_reason})
+                    position = 0
+
+            elif position == -1: # SHORT
+                if low < best_price: best_price = low
+                
+                stop_price = entry_price * (1 + sl_pct)
+                take_price = entry_price * (1 - tp_pct)
+                trail_price = best_price * (1 + ts_pct) if ts_pct > 0 else 9999999
+                
+                exit_reason = None
+                exit_p = price
+                
+                if high >= stop_price:
+                    exit_reason = "SL"
+                    exit_p = stop_price
+                elif ts_pct > 0 and high >= trail_price:
+                    exit_reason = "Trail"
+                    exit_p = trail_price
+                elif low <= take_price:
+                    exit_reason = "TP"
+                    exit_p = take_price
+                    
+                if exit_reason:
+                    pnl_pct = (entry_price - exit_p) / entry_price
+                    balance *= (1 + pnl_pct - comm)
+                    trades_log.append({"type": "close_short", "price": exit_p, "time": date, "balance": balance, "reason": exit_reason})
+                    position = 0
+            
+            # --- CHECK ENTRIES ---
+            if position == 0:
+                if signal == 1:
+                    position = 1
+                    entry_price = price
+                    best_price = price
+                    balance *= (1 - comm)
+                    trades_log.append({"type": "buy", "price": price, "time": date})
+                elif signal == -1:
+                    position = -1
+                    entry_price = price
+                    best_price = price
+                    balance *= (1 - comm)
+                    trades_log.append({"type": "sell", "price": price, "time": date})
+            
+            elif position == 1 and signal == -1:
+                pnl_pct = (price - entry_price) / entry_price
+                balance *= (1 + pnl_pct - comm)
+                trades_log.append({"type": "flip_to_short", "price": price, "time": date, "balance": balance, "reason": "Signal Flip"})
+                position = -1
+                entry_price = price
+                best_price = price
+                balance *= (1 - comm)
+                
+            elif position == -1 and signal == 1:
+                pnl_pct = (entry_price - price) / entry_price
+                balance *= (1 + pnl_pct - comm)
+                trades_log.append({"type": "flip_to_long", "price": price, "time": date, "balance": balance, "reason": "Signal Flip"})
+                position = 1
+                entry_price = price
+                best_price = price
+                balance *= (1 - comm)
+
+            equity_curve.append({"time": date, "balance": balance})
+
+        roi = ((balance - req.initialBalance) / req.initialBalance) * 100
+        
+        # 📊 CANDLE DATA FIX FOR COMBO
+        chart_df = df.reset_index()[['timestamp', 'open', 'high', 'low', 'close']].copy()
+        chart_df['timestamp'] = chart_df['timestamp'].astype(str)
+        candle_data = chart_df.to_dict('records')
+
+        return {
+            "status": "completed",
+            "metrics": {
+                "final_balance": balance,
+                "roi": roi,
+                "total_trades": len(trades_log)
+            },
+            "equityCurve": equity_curve,
+            "trades": trades_log,
+            "candleData": candle_data,
+            "initialBalance": req.initialBalance
+        }
+
+    except Exception as e:
+        logger.error(f"Combo API Error: {e}")
+        return JSONResponse(content={"status": "failed", "error": str(e)}, status_code=500)
+
 
 @app.get("/api/bot/status")
 async def get_status(userId: str):
@@ -710,5 +1241,3 @@ async def reset_bot(data: BotStopRequest): # Uses same model as stop
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-(venv) root@intelligent-mendel:~/Project/ML# 

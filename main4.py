@@ -1,4 +1,4 @@
-##Main4.py
+(venv) root@intelligent-mendel:~/Project/ML# cat main4.py 
 import asyncio
 import logging
 import os
@@ -23,6 +23,7 @@ from fastapi.exceptions import RequestValidationError # <--- ADD THIS
 from fastapi.responses import JSONResponse
 # 🟢 SOCKET HELPERS
 from app.services.socket_emitter import emit_log, emit_status
+
 from app.backtest2 import Backtester 
 from app.config2 import MODEL_DIR
 
@@ -65,7 +66,7 @@ class DatabaseHandler:
     def save_state(cls, user_id, bot_data):
         """Save the current bot state to DB."""
         # 🟢 SELF-HEALING: Ensure table exists before saving
-        cls.init_db() 
+         
         
         conn = sqlite3.connect(cls.DB_FILE)
         c = conn.cursor()
@@ -88,9 +89,7 @@ class DatabaseHandler:
     def load_state(cls, user_id):
         """Load bot state from DB if exists."""
         # 🟢 SELF-HEALING: Ensure table exists before loading
-        if not os.path.exists(cls.DB_FILE):
-            cls.init_db()
-            return None
+        
             
         conn = sqlite3.connect(cls.DB_FILE)
         conn.row_factory = sqlite3.Row
@@ -199,7 +198,7 @@ async def validation_exception_handler(request, exc):
     )
 
 # ==========================================
-# BACK TEST
+# BACK TEST DATA
 # ==========================================
 def load_data_robust(symbol, timeframe):
     possible_paths = [
@@ -489,6 +488,45 @@ async def execute_backtest_logic(data: BacktestRequest):
         logger.error(f"Backtest Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ==========================================
+# Packet Data
+# ==========================================
+
+async def process_data_packet(df: pd.DataFrame, strategies: list) -> list:
+    """Calculates all indicators and sanitizes candle objects for the chart."""
+    for strat in strategies:
+        code = strat.get('code')
+        p = strat.get('params', {})
+        try:
+            if code == 'bb_fade':
+                bb = ta.bbands(df['close'], length=int(p.get('bb_period', 20)), std=float(p.get('bb_std', 2.0)))
+                df['bb_lower'], df['bb_upper'] = bb.iloc[:, 0], bb.iloc[:, 2]
+            elif code == 'ema_cloud':
+                df['ema_fast'] = ta.ema(df['close'], length=int(p.get('fast_ema', 9)))
+                df['ema_slow'] = ta.ema(df['close'], length=int(p.get('slow_ema', 21)))
+            elif code == 'sma_crossover':
+                df['sma_fast'] = ta.sma(df['close'], length=int(p.get('fast_sma', 50)))
+                df['sma_slow'] = ta.sma(df['close'], length=int(p.get('slow_sma', 200)))
+            elif code == 'supertrend':
+                st = ta.supertrend(df['high'], df['low'], df['close'], length=int(p.get('st_atr', 10)), multiplier=float(p.get('st_factor', 3.0)))
+                df['supertrend'] = st.iloc[:, 0]
+            elif code == 'rsi_threshold':
+                df['rsi'] = ta.rsi(df['close'], length=int(p.get('rsi_length', 14)))
+        except Exception: continue
+
+    # Package into JSON-ready list
+    keys = ['bb_lower', 'bb_upper', 'ema_fast', 'ema_slow', 'sma_fast', 'sma_slow', 'supertrend', 'rsi']
+    candles_to_send = []
+    for _, row in df.tail(100).iterrows():
+        # Ensure time is an integer (Unix seconds)
+        ts = int(row['time']) if 'time' in row else int(row.name.timestamp())
+        c_obj = {"time": ts, "open": row['open'], "high": row['high'], "low": row['low'], "close": row['close']}
+        for k in keys:
+            if k in row and not pd.isna(row[k]): c_obj[k] = float(row[k])
+        candles_to_send.append(c_obj)
+    return candles_to_send
+
 # ==========================================
 # 🧠 2. SHARED STRATEGY BRAIN
 # ==========================================
@@ -614,47 +652,56 @@ class StrategyBrain:
 
 
 
+
+
 # ==========================================
 # 🚀 3. THE HEARTBEAT (Dynamic Calculation Loop)
 # ==========================================
+# 🟢 1. Initialize Global Exchange at the top of main4.py
+global_exchange = ccxt.coinbase({'enableRateLimit': True})
+
 async def live_neural_heartbeat(user_id: str):
     last_log = 0
+    
+    # 🟢 2. INITIAL SETUP
     if user_id in ACTIVE_BOTS:
         if "equityCurve" not in ACTIVE_BOTS[user_id]: 
             ACTIVE_BOTS[user_id]["equityCurve"] = [{"time": datetime.now().isoformat(), "balance": ACTIVE_BOTS[user_id]["balance"], "confidence": 50}]
         if "logs" not in ACTIVE_BOTS[user_id]: ACTIVE_BOTS[user_id]["logs"] = []
 
-    while user_id in ACTIVE_BOTS and ACTIVE_BOTS[user_id]["status"] == "running":
-        bot = ACTIVE_BOTS[user_id]
-        config = bot.get('config', {})
-        strategies = config.get('strategies', [])
-        
-        try:
-            ohlcv_raw = await fetch_live_candles_ccxt(config['symbol'], config.get('timeframe', '1h'), 250)
+    try:
+        while user_id in ACTIVE_BOTS and ACTIVE_BOTS[user_id]["status"] == "running":
+            bot = ACTIVE_BOTS[user_id]
+            config = bot.get('config', {})
+            strategies = config.get('strategies', [])
             
-            # 🟢 ADDED: Debug log if data is missing
-            if not ohlcv_raw:
-                logger.warning(f"⚠️ No candle data returned for {config['symbol']}")
-                emit_log(user_id, "⚠️ Market Data Feed Unstable - Retrying...")
-            
-            if ohlcv_raw:
-                df = pd.DataFrame(ohlcv_raw)
+            try:
+                # 🟢 3. DATA FETCHING (Zero-Drift Patch)
+                ohlcv_raw = await fetch_live_candles_ccxt(config['symbol'], config.get('timeframe', '1h'), 250)
                 
-                current_price = float(df['close'].iloc[-1])
-                ema200_val = ta.ema(df['close'], 200).iloc[-1]
+                if not ohlcv_raw:
+                    logger.warning(f"⚠️ Market feed unstable for {config['symbol']}")
+                    emit_log(user_id, "⚠️ Market Data Feed Unstable - Retrying...")
+                    await asyncio.sleep(10); continue
 
-                # 🟢 Also fix upnl calculation early to avoid errors
-                upnl = sum([(current_price - p['entry']) * p['size'] if p['type'] == 'long' else (p['entry'] - current_price) * p['size'] for p in bot['positions']])
-                current_equity = bot['balance'] + upnl
-                # 🟢 DYNAMIC INDICATOR CALCULATION FOR CHART (ALL 10 STRATEGIES)
+                # Patch last candle with absolute real-time price
+                ticker = await global_exchange.fetch_ticker(config['symbol'].replace('-', '/'))
+                current_price = ticker['last']
+                ohlcv_raw[-1]['close'] = current_price 
+
+                # Real-time drift log
+                last_ts = datetime.fromtimestamp(ohlcv_raw[-1]['time'], tz=timezone.utc)
+                drift = (datetime.now(timezone.utc) - last_ts).total_seconds()
+                logger.info(f"📡 PULSE: ${current_price} | Drift: {drift}s")
+
+                # 🟢 4. DYNAMIC INDICATOR CALCULATION
+                df = pd.DataFrame(ohlcv_raw)
                 for strat in strategies:
-                    code = strat.get('code')
-                    p = strat.get('params', {})
+                    code, p = strat.get('code'), strat.get('params', {})
                     try:
                         if code == 'bb_fade':
                             bb = ta.bbands(df['close'], length=int(p.get('bb_period', 20)), std=float(p.get('bb_std', 2.0)))
-                            df['bb_lower'] = bb.iloc[:, 0]
-                            df['bb_upper'] = bb.iloc[:, 2]
+                            df['bb_lower'], df['bb_upper'] = bb.iloc[:, 0], bb.iloc[:, 2]
                         elif code == 'ema_cloud':
                             df['ema_fast'] = ta.ema(df['close'], length=int(p.get('fast_ema', 9)))
                             df['ema_slow'] = ta.ema(df['close'], length=int(p.get('slow_ema', 21)))
@@ -666,165 +713,107 @@ async def live_neural_heartbeat(user_id: str):
                             df['supertrend'] = st.iloc[:, 0]
                         elif code == 'pa_breakout':
                             lb = int(p.get('lookback', 20))
-                            df['pa_high'] = df['high'].rolling(lb).max()
-                            df['pa_low'] = df['low'].rolling(lb).min()
+                            df['pa_high'], df['pa_low'] = df['high'].rolling(lb).max(), df['low'].rolling(lb).min()
                         elif code == 'atr_breakout':
                             atr = ta.atr(df['high'], df['low'], df['close'], length=int(p.get('atr_length', 14)))
-                            mult = float(p.get('multiplier', 1.5))
-                            ema20 = ta.ema(df['close'], length=20)
-                            df['atr_upper'] = ema20 + (atr * mult)
-                            df['atr_lower'] = ema20 - (atr * mult)
-                        
-                        # 🟢 NEW: Oscillator Calculations (Data only, for tooltips/future use)
+                            ema20 = ta.ema(df['close'], 20)
+                            df['atr_upper'], df['atr_lower'] = ema20 + (atr * float(p.get('multiplier', 1.5))), ema20 - (atr * float(p.get('multiplier', 1.5)))
                         elif code == 'rsi_threshold':
                             df['rsi'] = ta.rsi(df['close'], length=int(p.get('rsi_length', 14)))
                         elif code == 'stoch':
                             stoch = ta.stoch(df['high'], df['low'], df['close'], k=int(p.get('k_period', 14)))
-                            df['stoch_k'] = stoch.iloc[:, 0]
-                            df['stoch_d'] = stoch.iloc[:, 1]
+                            df['stoch_k'], df['stoch_d'] = stoch.iloc[:, 0], stoch.iloc[:, 1]
                         elif code == 'macd_crossover':
                             macd = ta.macd(df['close'], fast=int(p.get('fast', 12)), slow=int(p.get('slow', 26)), signal=int(p.get('signal', 9)))
-                            df['macd'] = macd.iloc[:, 0]
-                            df['macd_signal'] = macd.iloc[:, 2]
+                            df['macd'], df['macd_signal'] = macd.iloc[:, 0], macd.iloc[:, 2]
                         elif code == 'vol_profile':
                             df['vol_ma'] = ta.sma(df['volume'], length=int(p.get('vol_ma', 20)))
-
                     except Exception: continue
 
-                # Logic & Signals
+                # 🟢 5. SIGNAL PROCESSING & DIAGNOSTICS
                 sig, thoughts, nums, score = StrategyBrain.calculate_signals(df, config, 0.5, 0.5)
-
-                ui_limit = float(config.get('mlThresholdLong', 0.5)) if current_price > ema200_val else float(config.get('mlThresholdShort', 0.5))
+                ui_limit = float(config.get('mlThresholdLong', 0.5)) if current_price > ta.ema(df['close'], 200).iloc[-1] else float(config.get('mlThresholdShort', 0.5))
                 waiting_msg = DiagnosticLayer.get_pending_conditions(df, config, score, ui_limit)
 
-# 3. Inject into Logs
-                if datetime.now().timestamp() - last_log >= 60:
-                    emit_log(user_id, nums['market']['trend'])
-                    emit_log(user_id, waiting_msg) # 🟢 The New Diagnostic Layer Output
-                    emit_log(user_id, nums['market']['logic']) 
-   
-                    new_logs = [
-                        {"time": datetime.now().isoformat(), "message": nums['market']['trend']},
-                        {"time": datetime.now().isoformat(), "message": waiting_msg},
-                        {"time": datetime.now().isoformat(), "message": nums['market']['logic']}
-                    ]
-                    bot["logs"] = (new_logs + bot["logs"])[:300]
-                    
-                    DatabaseHandler.save_state(user_id, bot)
-                    last_log = datetime.now().timestamp()
-             
-                # 🟢 4. EXECUTION LOGIC (✅ ADDED THIS BLOCK)
-                # This actually opens the trade when sig != 0
+                # 🟢 6. TRADE EXECUTION LOGIC (Standardized PnL Fix)
+                upnl = sum([(current_price - p['entry']) * p['size'] if p['type'] == 'long' else (p['entry'] - current_price) * p['size'] for p in bot['positions']])
+                current_equity = bot['balance'] + upnl
+
+                # EXECUTION: Open Trades
                 if len(bot['positions']) < int(config.get('maxPyramiding', 1)):
+                    risk_val = float(config.get('riskPercentage', 1)) / 100
+                    size = (bot['balance'] * risk_val) / current_price
                     
-                    # LONG
-                    if sig == 1:
-                        risk_pct = float(config.get('riskPercentage', 1)) / 100
-                        size = (bot['balance'] * risk_pct) / current_price 
-                        pos = {
-                            "type": "long", "entry": current_price, "size": size, "time": datetime.now().isoformat(),
-                            "sl": current_price * (1 - float(config['params'].get('stop_loss', 0.05))),
-                            "tp": current_price * (1 + float(config['params'].get('take_profit', 0.10)))
-                        }
+                    if sig == 1: # LONG
+                        pos = {"type": "long", "entry": current_price, "size": size, "time": datetime.now().isoformat(),
+                               "sl": current_price * (1 - float(config['params'].get('stop_loss', 0.05))),
+                               "tp": current_price * (1 + float(config['params'].get('take_profit', 0.10)))}
                         bot['positions'].append(pos)
                         bot['trade_history'].append({"type": "buy", "price": current_price, "time": datetime.now().isoformat()})
-                        emit_log(user_id, f"🚀 LONG EXECUTED @ ${current_price} (Signal: {thoughts[0] if thoughts else 'Manual'})")
+                        emit_log(user_id, f"🚀 LONG EXECUTED @ ${current_price}")
                         DatabaseHandler.save_state(user_id, bot)
-
-                    # SHORT
-                    elif sig == -1 and config.get('enable_shorting', True):
-                        risk_pct = float(config.get('riskPercentage', 1)) / 100
-                        size = (bot['balance'] * risk_pct) / current_price 
-                        pos = {
-                            "type": "short", "entry": current_price, "size": size, "time": datetime.now().isoformat(),
-                            "sl": current_price * (1 + float(config['params'].get('stop_loss', 0.05))),
-                            "tp": current_price * (1 - float(config['params'].get('take_profit', 0.10)))
-                        }
+                    elif sig == -1 and config.get('enable_shorting', True): # SHORT
+                        pos = {"type": "short", "entry": current_price, "size": size, "time": datetime.now().isoformat(),
+                               "sl": current_price * (1 + float(config['params'].get('stop_loss', 0.05))),
+                               "tp": current_price * (1 - float(config['params'].get('take_profit', 0.10)))}
                         bot['positions'].append(pos)
                         bot['trade_history'].append({"type": "short", "price": current_price, "time": datetime.now().isoformat()})
-                        emit_log(user_id, f"🔻 SHORT EXECUTED @ ${current_price} (Signal: {thoughts[0] if thoughts else 'Manual'})")
+                        emit_log(user_id, f"🔻 SHORT EXECUTED @ ${current_price}")
                         DatabaseHandler.save_state(user_id, bot)
 
-                # 🟢 5. EXIT LOGIC (✅ ADDED THIS BLOCK)
-                # This checks SL/TP and closes positions
+                # EXECUTION: Check Exits
                 active_pos = bot['positions'][:]
                 for pos in active_pos:
                     pnl, closed = 0, False
                     if pos['type'] == 'long':
-                        if current_price >= pos['tp']: pnl = (current_price - pos['entry']) * pos['size']; closed = True; emit_log(user_id, f"💰 TP HIT (Long): +${round(pnl, 2)}")
-                        elif current_price <= pos['sl']: pnl = (current_price - pos['entry']) * pos['size']; closed = True; emit_log(user_id, f"🛑 SL HIT (Long): -${round(abs(pnl), 2)}")
+                        if current_price >= pos['tp']: pnl = (current_price - pos['entry']) * pos['size']; closed = True; emit_log(user_id, f"💰 TP HIT: +${round(pnl, 2)}")
+                        elif current_price <= pos['sl']: pnl = (current_price - pos['entry']) * pos['size']; closed = True; emit_log(user_id, f"🛑 SL HIT: -${round(abs(pnl), 2)}")
                     elif pos['type'] == 'short':
-                        if current_price <= pos['tp']: pnl = (pos['entry'] - current_price) * pos['size']; closed = True; emit_log(user_id, f"💰 TP HIT (Short): +${round(pnl, 2)}")
-                        elif current_price >= pos['sl']: pnl = (pos['entry'] - current_price) * pos['size']; closed = True; emit_log(user_id, f"🛑 SL HIT (Short): -${round(abs(pnl), 2)}")
+                        if current_price <= pos['tp']: pnl = (pos['entry'] - current_price) * pos['size']; closed = True; emit_log(user_id, f"💰 TP HIT: +${round(pnl, 2)}")
+                        elif current_price >= pos['sl']: pnl = (pos['entry'] - current_price) * pos['size']; closed = True; emit_log(user_id, f"🛑 SL HIT: -${round(abs(pnl), 2)}")
 
                     if closed:
-                        bot['balance'] += pnl
-                        bot['positions'].remove(pos)
+                        bot['balance'] += pnl; bot['positions'].remove(pos)
                         bot['trade_history'].append({"type": "exit", "price": current_price, "pnl": pnl, "time": datetime.now().isoformat()})
                         DatabaseHandler.save_state(user_id, bot)
-                
-                # Markers
-                markers = [{"time": int(c['time']), "position": "belowBar", "color": "#10b981", "shape": "circle", "text": thoughts[0] if thoughts else ""} for c in ohlcv_raw[-1:] if thoughts]
 
-                # Update PnL & History
-                latest_price = df['close'].iloc[-1]
-                upnl = sum([(latest_price - p['entry']) * p['size'] if p['type'] == 'buy' else (p['entry'] - latest_price) * p['size'] for p in bot['positions']])
-                current_equity = bot['balance'] + upnl
-
+                # 🟢 7. LOGGING & STATE SYNC
                 if datetime.now().timestamp() - last_log >= 60:
+                    emit_log(user_id, nums['market']['trend'])
+                    emit_log(user_id, waiting_msg)
                     bot["equityCurve"].append({"time": datetime.now().isoformat(), "balance": round(current_equity, 2), "confidence": int(score * 100)})
                     if len(bot["equityCurve"]) > 100: bot["equityCurve"].pop(0)
-                    
-                    new_logs = []
-                    for key in ['trend', 'bias', 'mindset', 'logic', 'intent']:
-                        msg = nums['market'][key]
-                        emit_log(user_id, msg)
-                        new_logs.append({"time": datetime.now().isoformat(), "message": msg})
-                    bot["logs"] = (new_logs + bot["logs"])[:300]
-                    
+                    bot["logs"] = ([{"time": datetime.now().isoformat(), "message": m} for m in [nums['market']['trend'], waiting_msg]] + bot["logs"])[:300]
                     DatabaseHandler.save_state(user_id, bot)
                     last_log = datetime.now().timestamp()
 
-                # Package Candle Data (Handling Dynamic Columns)
+                # 🟢 8. PACKAGING FOR UI
                 candles_to_send = []
-                # List of potential keys to send to frontend if they exist
-                keys_to_check = [
-                    'bb_lower', 'bb_upper', 'ema_fast', 'ema_slow', 
-                    'sma_fast', 'sma_slow', 'supertrend', 'pa_high', 'pa_low', 
-                    'atr_upper', 'atr_lower', 
-                    'rsi', 'stoch_k', 'stoch_d', 'macd', 'macd_signal', 'vol_ma' # 🟢 Added Oscillators
-                ]
-                
-                for index, row in df.tail(100).iterrows():
+                keys = ['bb_lower', 'bb_upper', 'ema_fast', 'ema_slow', 'sma_fast', 'sma_slow', 'supertrend', 'pa_high', 'pa_low', 'atr_upper', 'atr_lower', 'rsi', 'stoch_k', 'stoch_d', 'macd', 'macd_signal', 'vol_ma']
+                for _, row in df.tail(100).iterrows():
                     c_obj = {"time": int(row['time']), "open": row['open'], "high": row['high'], "low": row['low'], "close": row['close']}
-                    for key in keys_to_check:
-                        if key in row and not pd.isna(row[key]): c_obj[key] = float(row[key])
+                    for k in keys:
+                        if k in row and not pd.isna(row[k]): c_obj[k] = float(row[k])
                     candles_to_send.append(c_obj)
-                    
-                    bot["candles"] = candles_to_send
-               
 
-                if ACTIVE_BOTS[user_id]["status"] != "running":
-                   logger.info("Stop detected. Aborting final emit.")
-                   return
+                markers = [{"time": int(c['time']), "position": "belowBar", "color": "#10b981", "text": thoughts[0] if thoughts else ""} for c in ohlcv_raw[-1:] if thoughts]
 
                 emit_status(user_id, {
-                    "status": "running", 
-                    "currentBalance": round(current_equity, 2),
-                    "unrealizedPnl": round(upnl, 2),
-                    "activePositions": bot['positions'], 
-                    "tradeMarkers": bot['trade_history'] + markers, 
-                    "equityCurve": bot["equityCurve"], 
-                    # 🟢 NEW: Send start time so timer works
-                    "startedAt": bot.get("startedAt"), 
-                    "candles": candles_to_send
+                    "status": "running", "currentBalance": round(current_equity, 2), "unrealizedPnl": round(upnl, 2),
+                    "activePositions": bot['positions'], "tradeMarkers": bot['trade_history'] + markers,
+                    "equityCurve": bot["equityCurve"], "startedAt": bot.get("startedAt"), "candles": candles_to_send
                 })
 
+                await asyncio.sleep(15)
 
-
-            await asyncio.sleep(15)
-        except Exception as e: 
-            logger.error(f"Sync Error: {e}"); await asyncio.sleep(10)
+            except Exception as e:
+                logger.error(f"❌ Loop Sync Error: {e}"); await asyncio.sleep(10)
+    finally:
+        logger.info(f"🔌 Heartbeat loop terminated for {user_id}")
+        
+# =============================================================
+# ENDPOINTS
+# =============================================================
 
 async def fetch_live_candles_ccxt(symbol: str, timeframe: str, limit: int):
     async with ccxt.coinbase() as ex:
@@ -860,7 +849,7 @@ async def start_bot(data: BotStartRequest, background_tasks: BackgroundTasks):
     processed_candles = []
     if initial_ohlcv:
         df_init = pd.DataFrame(initial_ohlcv)
-        processed_candles = await get_processed_candles(df_init, data.config.get('strategies', []))
+        processed_candles = await process_data_packet(df_init, data.config.get('strategies', []))
 
     # 4. Load State & Merge Logic
     saved_state = DatabaseHandler.load_state(user_id)
@@ -1190,6 +1179,8 @@ async def run_combo_backtest(req: ComboRequest):
         chart_df['timestamp'] = chart_df['timestamp'].astype(str)
         candle_data = chart_df.to_dict('records')
 
+        print(f"DEBUG: Returning {len(candle_data)} candles to Frontend")
+
         return {
             "status": "completed",
             "metrics": {
@@ -1240,6 +1231,9 @@ async def reset_bot(data: BotStopRequest): # Uses same model as stop
         return {"status": "reset"}
     return {"status": "not_found"}
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
 
+
+if __name__ == "__main__":
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+(venv) root@intelligent-mendel:~/Project/ML# 

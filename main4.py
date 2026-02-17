@@ -385,18 +385,53 @@ class DiagnosticLayer:
 
 
 class NeuralPredictor:
+    # 🟢 1. Initialize an in-memory cache
+    _model_cache = {}
+
     @staticmethod
     def get_prediction(model_id: str, df: pd.DataFrame) -> float:
         try:
-            recent = df.tail(10)
+            # Feature Engineering: Use a 20-bar window for better stability
+            recent = df.tail(20)
+            if len(recent) < 10:
+                return 0.5
+            
             momentum = (recent['close'].iloc[-1] - recent['close'].iloc[0]) / recent['close'].iloc[0]
-            model_path = f"./models/{model_id}_model.pkl"
-            if os.path.exists(model_path):
-                model = joblib.load(model_path)
-                return float(model.predict_proba([[momentum]])[0][1])
+            
+            # 🟢 2. Caching Logic
+            # Only load from disk if the model isn't already in memory
+            if model_id not in NeuralPredictor._model_cache:
+                model_path = f"./models/{model_id}_model.pkl"
+                
+                if os.path.exists(model_path):
+                    logger.info(f"🧠 Loading Neural Model into Cache: {model_id}")
+                    NeuralPredictor._model_cache[model_id] = joblib.load(model_path)
+                else:
+                    # If file doesn't exist, use None to trigger fallback
+                    NeuralPredictor._model_cache[model_id] = None
+
+            # 🟢 3. Execute Prediction
+            cached_model = NeuralPredictor._model_cache.get(model_id)
+            
+            if cached_model:
+                # Scikit-learn expects 2D array for predictions
+                prediction = cached_model.predict_proba([[momentum]])[0][1]
+                return float(prediction)
+            
+            # 🟢 4. Intelligent Fallback (Sigmoid)
+            # Ensures the bot remains operational even if the .pkl is missing
             base = 1.0 / (1.0 + np.exp(-momentum * 100))
-            return float(min(1.0, max(0.0, base)))
-        except Exception: return 0.5
+            return float(min(0.99, max(0.01, base))) # Clamp between 1% and 99%
+            
+        except Exception as e:
+            logger.error(f"🧠 Neural Predictor Error: {e}")
+            return 0.5
+
+    @classmethod
+    def clear_cache(cls):
+        """Call this if you upload a new model file to refresh it."""
+        cls._model_cache = {}
+        logger.info("🧠 Neural Cache Purged.")
 
 
 async def execute_backtest_logic(data: BacktestRequest):
@@ -537,82 +572,109 @@ class StrategyBrain:
         strategies = config.get('strategies', [])
         current_price = df['close'].iloc[-1]
 
-        # 🟢 Indicators
-        ema20 = ta.ema(df['close'], 20).iloc[-1]
-        ema50 = ta.ema(df['close'], 50).iloc[-1]
-        ema200 = ta.ema(df['close'], 200).iloc[-1]
+        # 🟢 1. GLOBAL INDICATORS (Foundational)
+        ema20 = ta.ema(df['close'], length=20).iloc[-1]
+        ema50 = ta.ema(df['close'], length=50).iloc[-1]
+        ema200 = ta.ema(df['close'], length=200).iloc[-1]
         bb = ta.bbands(df['close'], length=20, std=2.0)
         lower, mid, upper = bb.iloc[-1, 0], bb.iloc[-1, 1], bb.iloc[-1, 2]
         pr = int((current_price - lower) / (upper - lower) * 100)
 
-        # 🟢 1. FULL DYNAMIC STRATEGY EVALUATION
+        # 🟢 2. FULL 10-STRATEGY DYNAMIC EVALUATION
         for strat in strategies:
             code = strat.get('code')
-            params = strat.get('params', {})
+            p = strat.get('params', {})
             try:
+                # 1. RSI Threshold
                 if code == "rsi_threshold":
-                    rsi = ta.rsi(df['close'], length=int(params.get('rsi_length', 14))).iloc[-1]
-                    if rsi < params.get('oversold', 30): votes += 1; active_thoughts.append(f"RSI Low ({int(rsi)})")
-                    elif rsi > params.get('overbought', 70): votes -= 1; active_thoughts.append(f"RSI High ({int(rsi)})")
+                    rsi = ta.rsi(df['close'], length=int(p.get('rsi_length', 14))).iloc[-1]
+                    if rsi < p.get('oversold', 30): 
+                        votes += 1; active_thoughts.append(f"RSI Low ({int(rsi)})")
+                    elif rsi > p.get('overbought', 70): 
+                        votes -= 1; active_thoughts.append(f"RSI High ({int(rsi)})")
 
+                # 2. Stochastic Oscillator
                 elif code == "stoch":
-                    k = ta.stoch(df['high'], df['low'], df['close'], k=int(params.get('k_period', 14))).iloc[-1, 0]
-                    if k < 20: votes += 1; active_thoughts.append(f"Stoch Low ({int(k)})")
-                    elif k > 80: votes -= 1; active_thoughts.append(f"Stoch High ({int(k)})")
+                    stoch = ta.stoch(df['high'], df['low'], df['close'], k=int(p.get('k_period', 14)))
+                    k_val = stoch.iloc[-1, 0]
+                    if k_val < 20: 
+                        votes += 1; active_thoughts.append(f"Stoch Low ({int(k_val)})")
+                    elif k_val > 80: 
+                        votes -= 1; active_thoughts.append(f"Stoch High ({int(k_val)})")
 
-                elif code == "bb_fade":
-                    # Note: Visualization handled in Heartbeat loop
-                    p_bb = ta.bbands(df['close'], length=int(params.get('bb_period', 20)), std=float(params.get('bb_std', 2.0)))
-                    if current_price < p_bb.iloc[-1, 0]: votes += 1; active_thoughts.append("Price < BB Floor")
-                    elif current_price > p_bb.iloc[-1, 2]: votes -= 1; active_thoughts.append("Price > BB Ceiling")
-
-                elif code == "sma_crossover":
-                    fast = ta.sma(df['close'], length=int(params.get('fast_sma', 50))).iloc[-1]
-                    slow = ta.sma(df['close'], length=int(params.get('slow_sma', 200))).iloc[-1]
-                    if fast > slow: votes += 1; active_thoughts.append("SMA Golden Cross")
-
+                # 3. MACD Crossover (Standardized Indexing)
                 elif code == "macd_crossover":
-                    macd = ta.macd(df['close'], fast=int(params.get('fast', 12)), slow=int(params.get('slow', 26)), signal=int(params.get('signal', 9))).iloc[-1]
-                    if macd.iloc[0] > macd.iloc[2]: votes += 1; active_thoughts.append("MACD Bullish")
+                    macd_df = ta.macd(df['close'], fast=int(p.get('fast', 12)), slow=int(p.get('slow', 26)), signal=int(p.get('signal', 9)))
+                    if macd_df.iloc[-1, 0] > macd_df.iloc[-1, 2]: 
+                        votes += 1; active_thoughts.append("MACD Bullish")
+                    else:
+                        votes -= 1
 
+                # 4. Supertrend
                 elif code == "supertrend":
-                    st = ta.supertrend(df['high'], df['low'], df['close'], length=int(params.get('st_atr', 10)), multiplier=float(params.get('st_factor', 3.0))).iloc[-1]
-                    if st.iloc[1] == 1: votes += 1; active_thoughts.append("SuperTrend Long")
+                    st_df = ta.supertrend(df['high'], df['low'], df['close'], length=int(p.get('st_atr', 10)), multiplier=float(p.get('st_factor', 3.0)))
+                    if st_df.iloc[-1, 1] == 1: 
+                        votes += 1; active_thoughts.append("SuperTrend Long")
+                    else:
+                        votes -= 1
 
+                # 5. EMA Cloud
                 elif code == "ema_cloud":
-                    if current_price > ema50: votes += 1; active_thoughts.append("Above EMA Cloud")
+                    if current_price > ema50: 
+                        votes += 1; active_thoughts.append("Above EMA Cloud")
+                    else:
+                        votes -= 1
 
+                # 6. SMA Crossover
+                elif code == "sma_crossover":
+                    sma_fast = ta.sma(df['close'], length=int(p.get('fast_sma', 50))).iloc[-1]
+                    sma_slow = ta.sma(df['close'], length=int(p.get('slow_sma', 200))).iloc[-1]
+                    if sma_fast > sma_slow: 
+                        votes += 1; active_thoughts.append("SMA Golden Cross")
+
+                # 7. Bollinger Band Fade
+                elif code == "bb_fade":
+                    if current_price < lower: 
+                        votes += 1; active_thoughts.append("Price < BB Floor")
+                    elif current_price > upper: 
+                        votes -= 1; active_thoughts.append("Price > BB Ceiling")
+
+                # 8. ATR Breakout
                 elif code == "atr_breakout":
-                    atr = ta.atr(df['high'], df['low'], df['close'], length=int(params.get('atr_length', 14))).iloc[-1]
-                    if current_price > (ema20 + atr * float(params.get('multiplier', 1.5))): votes += 1; active_thoughts.append("ATR Breakout")
+                    atr = ta.atr(df['high'], df['low'], df['close'], length=int(p.get('atr_length', 14))).iloc[-1]
+                    if current_price > (ema20 + atr * float(p.get('multiplier', 1.5))):
+                        votes += 1; active_thoughts.append("ATR Breakout")
 
+                # 9. Price Action Breakout
                 elif code == "pa_breakout":
-                    if current_price >= df['high'].tail(int(params.get('lookback', 20))).max(): votes += 1; active_thoughts.append("PA High Break")
+                    lookback = int(p.get('lookback', 20))
+                    if current_price >= df['high'].tail(lookback).max():
+                        votes += 1; active_thoughts.append("PA High Break")
 
+                # 10. Volume Profile
                 elif code == "vol_profile":
-                    vol_ma = ta.sma(df['volume'], length=int(params.get('vol_ma', 20))).iloc[-1]
-                    if df['volume'].iloc[-1] > vol_ma * float(params.get('threshold', 1.5)): 
-                        votes += (1 if current_price > ema20 else -1)
+                    vol_ma = ta.sma(df['volume'], length=int(p.get('vol_ma', 20))).iloc[-1]
+                    if df['volume'].iloc[-1] > vol_ma * float(p.get('threshold', 1.5)):
+                        votes += (1 if current_price > mid else -1)
                         active_thoughts.append("Volume Surge")
 
-            except Exception as e: continue
+            except Exception: continue
 
-        # 🚀 2. DYNAMIC DUAL-GATE LOGIC (Block 1 Logic)
+        # 🚀 3. DYNAMIC DUAL-GATE LOGIC (ML Filtering)
         is_short = current_price < ema200
         ui_limit = float(config.get('mlThresholdShort', 0.90)) if is_short else float(config.get('mlThresholdLong', 0.80))
         
         conf = NeuralPredictor.get_prediction(config.get('mlModel', 'stacking'), df)
         gate_passed = conf >= ui_limit
+        
         logic_desc = f"📊 LOGIC: {'SHORT' if is_short else 'LONG'} GATE {'PASSED' if gate_passed else 'VETOED'} ({int(conf*100)}% vs {int(ui_limit*100)}% UI Limit) {'🟢' if gate_passed else '🔴'}"
 
-        # 🎯 3. INTENT (Block 1 Logic)
+        # 🎯 4. INTENT LOGIC
         signal_names = " + ".join(active_thoughts) if active_thoughts else "Scanning Setup"
         gap = int(abs(current_price - ema50))
         intent_desc = f"🎯 INTENT: STALKING {'SHORT' if is_short else 'LONG'} ({signal_names} | Gap: ${gap}) {'🔴' if is_short else '🟢'}"
 
-        # 📡 4. MARKET CONTEXT (Rich Descriptions from Block 2)
-        
-        # 1. Trend Logic (Distance from 200EMA)
+        # 📡 5. MARKET CONTEXT (Rich Descriptions)
         trend_dist = current_price - ema200
         trend_pct = (trend_dist / ema200) * 100
         if trend_dist > 0:
@@ -622,13 +684,10 @@ class StrategyBrain:
             
         trend_text = f"📡 TREND: {trend_str} (Price is ${int(abs(trend_dist))} {'above' if trend_dist > 0 else 'below'} 200EMA)"
 
-        # 2. Bias Logic (EMA Spread Strength)
         spread = ema20 - ema50
-       
         bias_str = "BULLISH EXPANSION" if spread > 0 else "BEARISH CONTRACTION"
         bias_text = f"⚖️ BIAS: {bias_str} (Fast EMA is ${int(abs(spread))} {'above' if spread > 0 else 'below'} Slow EMA)"
 
-        # 3. Mindset Logic (Bollinger Percentile)
         if pr >= 80: mindset_str = "⚠️ OVEREXTENDED (Expensive)"
         elif pr <= 20: mindset_str = "🎯 ACCUMULATION ZONE (Cheap)"
         else: mindset_str = "⚖️ EQUILIBRIUM (Balanced)"
@@ -645,8 +704,14 @@ class StrategyBrain:
             }
         }
 
-        # Final Signal Calculation
-        final_sig = 1 if votes > 0 and not is_short and gate_passed else (-1 if votes < 0 and is_short and gate_passed else 0)
+        # 🎯 6. FINAL SIGNAL CALCULATION
+        # Must pass Gate AND have positive/negative votes matching trend direction
+        final_sig = 0
+        if gate_passed:
+            if votes > 0 and not is_short: 
+                final_sig = 1
+            elif votes < 0 and is_short: 
+                final_sig = -1
         
         return final_sig, active_thoughts, numeric_details, conf
 
@@ -674,6 +739,12 @@ async def live_neural_heartbeat(user_id: str):
             bot = ACTIVE_BOTS[user_id]
             config = bot.get('config', {})
             strategies = config.get('strategies', [])
+            upnl = 0
+            current_equity = bot['balance']
+            markers = []
+            candles_to_send = []
+            current_confidence = 50
+            new_data_point = {}
             
             try:
                 # 🟢 3. DATA FETCHING (Zero-Drift Patch)
@@ -686,8 +757,11 @@ async def live_neural_heartbeat(user_id: str):
 
                 # Patch last candle with absolute real-time price
                 ticker = await global_exchange.fetch_ticker(config['symbol'].replace('-', '/'))
-                current_price = ticker['last']
-                ohlcv_raw[-1]['close'] = current_price 
+                current_price = float(ticker['last'])
+                ohlcv_raw[-1]['close'] = current_price
+
+                upnl = sum([(current_price - p['entry']) * p['size'] if p['type'] == 'long' else (p['entry'] - current_price) * p['size'] for p in bot['positions']])
+                current_equity = bot['balance'] + upnl
 
                 # Real-time drift log
                 last_ts = datetime.fromtimestamp(ohlcv_raw[-1]['time'], tz=timezone.utc)
@@ -735,9 +809,24 @@ async def live_neural_heartbeat(user_id: str):
                 ui_limit = float(config.get('mlThresholdLong', 0.5)) if current_price > ta.ema(df['close'], 200).iloc[-1] else float(config.get('mlThresholdShort', 0.5))
                 waiting_msg = DiagnosticLayer.get_pending_conditions(df, config, score, ui_limit)
 
+
+                emit_log(user_id, nums['market']['trend'])
+                emit_log(user_id, waiting_msg) # Shows INTENT (e.g., Stalking Long)
+                emit_log(user_id, nums['market']['logic']) # Shows GATE status
+
+                clean_curve = [p for p in bot.get("equityCurve", []) if p and isinstance(p, dict) and 'time' in p]
+
+                if datetime.now().timestamp() - last_log >= 60:
+                    
+                    bot["equityCurve"].append({"time": datetime.now().isoformat(), "balance": round(current_equity, 2), "confidence": int(score * 100)})
+                    if len(bot["equityCurve"]) > 100: bot["equityCurve"].pop(0)
+                    bot["logs"] = ([{"time": datetime.now().isoformat(), "message": m} for m in [nums['market']['trend'], waiting_msg]] + bot["logs"])[:300]
+                    DatabaseHandler.save_state(user_id, bot)
+                    last_log = datetime.now().timestamp()
+
                 # 🟢 6. TRADE EXECUTION LOGIC (Standardized PnL Fix)
-                upnl = sum([(current_price - p['entry']) * p['size'] if p['type'] == 'long' else (p['entry'] - current_price) * p['size'] for p in bot['positions']])
-                current_equity = bot['balance'] + upnl
+               
+
 
                 # EXECUTION: Open Trades
                 if len(bot['positions']) < int(config.get('maxPyramiding', 1)):
@@ -777,17 +866,9 @@ async def live_neural_heartbeat(user_id: str):
                         bot['trade_history'].append({"type": "exit", "price": current_price, "pnl": pnl, "time": datetime.now().isoformat()})
                         DatabaseHandler.save_state(user_id, bot)
 
-                # 🟢 7. LOGGING & STATE SYNC
-                if datetime.now().timestamp() - last_log >= 60:
-                    emit_log(user_id, nums['market']['trend'])
-                    emit_log(user_id, waiting_msg)
-                    bot["equityCurve"].append({"time": datetime.now().isoformat(), "balance": round(current_equity, 2), "confidence": int(score * 100)})
-                    if len(bot["equityCurve"]) > 100: bot["equityCurve"].pop(0)
-                    bot["logs"] = ([{"time": datetime.now().isoformat(), "message": m} for m in [nums['market']['trend'], waiting_msg]] + bot["logs"])[:300]
-                    DatabaseHandler.save_state(user_id, bot)
-                    last_log = datetime.now().timestamp()
+                
 
-                # 🟢 8. PACKAGING FOR UI
+                # 🟢 7. PACKAGING FOR UI
                 candles_to_send = []
                 keys = ['bb_lower', 'bb_upper', 'ema_fast', 'ema_slow', 'sma_fast', 'sma_slow', 'supertrend', 'pa_high', 'pa_low', 'atr_upper', 'atr_lower', 'rsi', 'stoch_k', 'stoch_d', 'macd', 'macd_signal', 'vol_ma']
                 for _, row in df.tail(100).iterrows():
@@ -799,10 +880,34 @@ async def live_neural_heartbeat(user_id: str):
                 markers = [{"time": int(c['time']), "position": "belowBar", "color": "#10b981", "text": thoughts[0] if thoughts else ""} for c in ohlcv_raw[-1:] if thoughts]
 
                 emit_status(user_id, {
-                    "status": "running", "currentBalance": round(current_equity, 2), "unrealizedPnl": round(upnl, 2),
-                    "activePositions": bot['positions'], "tradeMarkers": bot['trade_history'] + markers,
-                    "equityCurve": bot["equityCurve"], "startedAt": bot.get("startedAt"), "candles": candles_to_send
+                    "status": "running", 
+                    "currentBalance": round(current_equity, 2), 
+                    "unrealizedPnl": round(upnl, 2),
+                    "activePositions": bot['positions'], 
+                    "tradeMarkers": bot['trade_history'] + markers,
+                    "equityCurve": clean_curve, 
+                    "startedAt": bot.get("startedAt"), 
+                    "candles": candles_to_send
                 })
+
+                if datetime.now().timestamp() - last_log >= 60:
+    # This new point adds to the history shown on your line charts
+                   new_data_point = {
+                   "time": datetime.now().isoformat(), 
+                   "balance": round(current_equity, 2), 
+                   "confidence": current_confidence # This draws the historical confidence line
+                }
+    
+                bot["equityCurve"].append(new_data_point)
+    
+    # Prune history to keep the chart snappy (last 100 points)
+                if len(bot["equityCurve"]) > 100: 
+                    bot["equityCurve"].pop(0)
+
+    # Persist to disk
+                DatabaseHandler.save_state(user_id, bot)
+                last_log = datetime.now().timestamp()
+
 
                 await asyncio.sleep(15)
 
@@ -834,9 +939,13 @@ def list_models():
 async def start_bot(data: BotStartRequest, background_tasks: BackgroundTasks):
     user_id = data.userId.strip()
     
-    # 1. Get the capital from the UI (e.g., $125)
-    # This logic ensures we prioritize what the user just typed over what's in the DB
-    raw_cap = data.config.get("capitalAllocation") or data.config.get("capital_allocation")
+    # 🟢 1. GET CAPITAL FROM UI (Consolidated Greedy Search)
+    # This checks for every possible naming convention to ensure the $300 is captured
+    raw_cap = (
+        data.config.get("capitalAllocation") or 
+        data.config.get("capital_allocation") or 
+        data.config.get("initialBalance")
+    )
     ui_capital = float(raw_cap) if raw_cap else 200.0 
 
     # 2. Check if already active
@@ -844,7 +953,6 @@ async def start_bot(data: BotStartRequest, background_tasks: BackgroundTasks):
         return {"status": "running", "message": "Bot already active"}
 
     # 3. 🚀 PRE-FETCH CANDLES (Critical Chart Fix)
-    # We do this first so the 'candles' array is ready for the immediate emit
     initial_ohlcv = await fetch_live_candles_ccxt(data.config['symbol'], data.config.get('timeframe', '1h'), 150)
     processed_candles = []
     if initial_ohlcv:
@@ -861,7 +969,7 @@ async def start_bot(data: BotStartRequest, background_tasks: BackgroundTasks):
         ACTIVE_BOTS[user_id]["config"] = data.config
         
         # 🚀 FORCE OVERWRITE: Balance Reset Fix
-        # Even if DB had $200, we overwrite it with the UI's $125 here.
+        # This officially unlocks the $200 lock by forcing the UI's $300 into the state
         ACTIVE_BOTS[user_id]["balance"] = ui_capital 
         
         # 🚀 RESET TIMER
@@ -874,7 +982,7 @@ async def start_bot(data: BotStartRequest, background_tasks: BackgroundTasks):
         ACTIVE_BOTS[user_id] = {
             "status": "running",
             "config": data.config,
-            "balance": ui_capital, # Use the UI capital
+            "balance": ui_capital, # Use the UI capital ($300)
             "positions": [],
             "trade_history": [],
             "equityCurve": [],
@@ -892,14 +1000,14 @@ async def start_bot(data: BotStartRequest, background_tasks: BackgroundTasks):
         }]
 
     # 6. SAVE IMMEDIATELY
-    # Persist the new balance ($125) to disk right now.
+    # Persist the new $300 balance to disk right now
     DatabaseHandler.save_state(user_id, ACTIVE_BOTS[user_id])
     
     # 7. 🚀 EMIT IMMEDIATELY (Sends both Balance & Candles)
     emit_status(user_id, {
         "status": "running", 
         "currentBalance": ACTIVE_BOTS[user_id]["balance"],
-        "candles": processed_candles, # The V2 Fix
+        "candles": processed_candles,
         "startedAt": ACTIVE_BOTS[user_id]["startedAt"]
     })
 

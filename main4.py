@@ -845,20 +845,27 @@ async def live_neural_heartbeat(user_id: str):
 
                 active_results = []     
                 for strat in strategies:
-
-                    
                     max_name_len = max([len(s['code'].replace('_', ' ')) for s in strategies]) if strategies else 10
                     code = strat['code']
                     val = int(signals_map.get(code, 0) * 100)
-                            
                     display_name = code.replace('_', ' ').upper().ljust(max_name_len)
-                            
                     filled = max(0, min(10, val // 10))
                     bar = "┃" + "█" * filled + "░" * (10 - filled) + "┃"
                     active_results.append(f"{display_name}: {bar} {val}%")
+                
                 targets_str = " | ".join(active_results)
-                combined_status = f"{status_header} | {nums['market']['logic']} | 🔍 TARGETS ({hybrid_mode}): {targets_str}"
-                    
+
+                # 🟢 NEW: UNIFIED DUAL-MODE LOGIC
+                # This prevents the Scanning string from overwriting the Exit string
+                if len(bot['positions']) > 0:
+                    # We are in a trade: Use the exit logic we calculated earlier in the loop
+                    exit_section = nums['market']['intent'] 
+                    combined_status = f"{status_header} | {exit_section} | 🔍 TARGETS ({hybrid_mode}): {targets_str}"
+                else:
+                    # We are scanning: Just show logic gates and targets
+                    combined_status = f"{status_header} | {nums['market']['logic']} | 🔍 TARGETS ({hybrid_mode}): {targets_str}"
+
+                # 🟢 EMIT LOG (Every 15s)
                 now_ts = datetime.now().timestamp()
                 if (now_ts - last_log >= 15):
                     await emit_log(user_id, combined_status)
@@ -881,7 +888,7 @@ async def live_neural_heartbeat(user_id: str):
                         "status": "running", "currentBalance": round(current_equity, 2), "exposure": exposure_pct,
                         "activePositions": bot['positions'], "unrealizedPnl": round(upnl, 2),
                         "tradeMarkers": bot['trade_history'], "candles": await process_data_packet(df, config.get('strategies', [])),
-                        "currentConfidence": int(score * 100)
+                        "currentConfidence": int(score * 100), "signalsMap": signals_map
                 })
                 last_ui_update = now_ts
                     
@@ -1029,9 +1036,21 @@ async def live_neural_heartbeat(user_id: str):
                 await asyncio.sleep(0.1) # Yield for network
 
                 # Housekeeping
+                # 🟢 1. UI HEARTBEAT (Execute every loop)
+                # This appends to the curve immediately so the UI charts draw lines instantly.
+                bot["equityCurve"].append({
+                    "time": datetime.now().isoformat(), 
+                    "balance": round(current_equity, 2), 
+                    "confidence": int(score * 100)
+                })
+                
+                # Keep the memory buffer lean (last 100-300 points)
+                if len(bot["equityCurve"]) > 300: 
+                    bot["equityCurve"].pop(0)
+                
+                # 🟢 2. DATABASE SYNC (Execute every 60s)
+                # We only write to the disk/database periodically to save performance.
                 if datetime.now().timestamp() - last_log >= 60:
-                    bot["equityCurve"].append({"time": datetime.now().isoformat(), "balance": round(current_equity, 2), "confidence": int(score * 100)})
-                    if len(bot["equityCurve"]) > 100: bot["equityCurve"].pop(0)
                     DatabaseHandler.save_state(user_id, bot)
                     last_log = datetime.now().timestamp()
 

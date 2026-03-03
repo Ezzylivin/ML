@@ -863,7 +863,8 @@ async def live_neural_heartbeat(user_id: str):
                     combined_status = f"{status_header} | {exit_section} | 🔍 TARGETS ({hybrid_mode}): {targets_str}"
                 else:
                     # We are scanning: Just show logic gates and targets
-                    combined_status = f"{status_header} | {nums['market']['logic']} | 🔍 TARGETS ({hybrid_mode}): {targets_str}"
+                    intent_section = nums['market']['intent']
+                    combined_status = f"{status_header} | {intent_section} | {nums['market']['logic']} | 🔍 TARGETS ({hybrid_mode}): {targets_str}"
 
                 # 🟢 EMIT LOG (Every 15s)
                 now_ts = datetime.now().timestamp()
@@ -893,50 +894,71 @@ async def live_neural_heartbeat(user_id: str):
                 last_ui_update = now_ts
                     
                  
-                # 🟢 6. TRADE EXECUTION: Automated Risk Distribution
-                # 🟢 6. TRADE EXECUTION: Confidence Climb Logic (Max 5)
-                # Ensure we respect the UI limit but cap at 5
+                # 🟢 6. TRADE EXECUTION: Confidence Climb & 60m Stability Logic
                 max_p = min(5, int(config.get('maxPyramiding', 5)))
                 
+                # ⏳ --- STEP A: STABILITY TIME GATE ---
+                current_time = datetime.now(timezone.utc)
+                last_trade_str = bot.get('last_trade_time')
+                time_gate_passed = True
+                minutes_remaining = 0
+
+                if last_trade_str:
+                    last_trade_dt = datetime.fromisoformat(last_trade_str)
+                    minutes_since_last = (current_time - last_trade_dt).total_seconds() / 60
+                    
+                    if minutes_since_last < 60:
+                        time_gate_passed = False
+                        minutes_remaining = int(60 - minutes_since_last)
+
+                # 💰 --- STEP B: RISK & SIZE CALCULATIONS ---
+                ui_total_risk = float(config.get('riskPercentage', 30.0))
+                leg_risk_pct = max(5.0, ui_total_risk / max_p)
+                risk_decimal = leg_risk_pct / 100
+                size = (bot['balance'] * risk_decimal) / current_price
+                
+                # 🧠 --- STEP C: CONFIDENCE CLIMB CHECK (+10% Rule) ---
+                last_pos = bot['positions'][-1] if bot['positions'] else None
+                last_conf = last_pos.get('entry_conf', 0) if last_pos else 0
+                
+                # Requirement: Score must be 0.10 (10%) higher than the last leg
+                climb_satisfied = (score >= last_conf + 0.10) if last_pos else True
+
+                # 🚀 --- STEP D: EXECUTION DECISION ---
                 if len(bot['positions']) < max_p:
-                    # 💰 1. CALCULATE AUTOMATED RISK (30% / 5 = 6%)
-                    ui_total_risk = float(config.get('riskPercentage', 30.0))
-                    # Calculate share per leg, but force a minimum of 5%
-                    leg_risk_pct = max(5.0, ui_total_risk / max_p)
-                    risk_decimal = leg_risk_pct / 100
-                    
-                    # Calculate size based on this specific leg's risk
-                    size = (bot['balance'] * risk_decimal) / current_price
-                
-                    # 🧠 2. CONFIDENCE CLIMB CHECK (+10% Rule)
-                    last_pos = bot['positions'][-1] if bot['positions'] else None
-                    last_conf = last_pos.get('entry_conf', 0) if last_pos else 0
-                    
-                    # Requirement: Score must be 0.10 (10%) higher than the last leg
-                    # If no legs exist, we just need to pass the base UI threshold
-                    climb_satisfied = (score >= last_conf + 0.10) if last_pos else True
-                
-                    # Directional check: Allow scaling into the same trend if confidence rises
+                    # Directional checks
                     can_long = (sig == 1) and (not last_pos or (last_pos['type'] == 'long' and climb_satisfied) or (last_pos['type'] == 'short'))
                     can_short = (sig == -1) and (not last_pos or (last_pos['type'] == 'short' and climb_satisfied) or (last_pos['type'] == 'long'))
-                
-                    if can_long:
-                        bot['positions'].append({
-                            "symbol": symbol, "type": "long", "entry": current_price, "size": size, 
-                            "time": datetime.now(timezone.utc).isoformat(), "tp": current_price * (1 + ui_tp),
-                            "sl": current_price * (1 - ui_sl), "tsl": current_price * (1 - ui_sl),
-                            "entry_conf": score  # 🟢 Crucial: Store this for the next +10% check
-                        })
-                        await emit_log(user_id, f"🚀 LONG LEG {len(bot['positions'])} | Conf: {int(score*100)}% (Next: {int((score+0.1)*100)}%) | Size: {leg_risk_pct}%")
-                
-                    elif can_short:
-                        bot['positions'].append({
-                            "symbol": symbol, "type": "short", "entry": current_price, "size": size, 
-                            "time": datetime.now(timezone.utc).isoformat(), "tp": current_price * (1 - ui_tp),
-                            "sl": current_price * (1 + ui_sl), "tsl": current_price * (1 + ui_sl),
-                            "entry_conf": score  # 🟢 Crucial: Store this for the next +10% check
-                        })
-                        await emit_log(user_id, f"🔻 SHORT LEG {len(bot['positions'])} | Conf: {int(score*100)}% (Next: {int((score+0.1)*100)}%) | Size: {leg_risk_pct}%")
+
+                    if (can_long or can_short):
+                        # 🛡️ THE STABILITY LOCK: Check if we are still in the 60m window
+                        if not time_gate_passed:
+                            # Log every 15s to let you know we are stalking the next leg
+                            if (now_ts - last_log >= 15):
+                                await emit_log(user_id, f"⏳ STABILITY GATE: Signal is valid ({int(score*100)}%), but waiting {minutes_remaining}m to confirm trend stability.")
+                        else:
+                            # 🟢 EXECUTE THE TRADE
+                            trade_type = "long" if can_long else "short"
+                            bot['positions'].append({
+                                "symbol": symbol, 
+                                "type": trade_type, 
+                                "entry": current_price, 
+                                "size": size, 
+                                "time": current_time.isoformat(), 
+                                "tp": current_price * (1 + ui_tp) if can_long else current_price * (1 - ui_tp),
+                                "sl": current_price * (1 - ui_sl) if can_long else current_price * (1 + ui_sl), 
+                                "tsl": current_price * (1 - ui_sl) if can_long else current_price * (1 + ui_sl),
+                                "entry_conf": score 
+                            })
+
+                            # 🟢 UPDATE TIMESTAMPS FOR NEXT LEG
+                            bot['last_trade_time'] = current_time.isoformat()
+                            
+                            icon = "🚀" if can_long else "🔻"
+                            await emit_log(user_id, f"{icon} {trade_type.upper()} LEG {len(bot['positions'])} | Conf: {int(score*100)}% | Stability Window Reset (60m)")
+                            
+                            # Save state immediately after trade
+                            DatabaseHandler.save_state(user_id, bot)
                 
 
                 # 🟢 6. TRADE EXECUTION: Exit Monitoring (Individually per Leg)

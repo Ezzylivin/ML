@@ -81,39 +81,48 @@ class RawModelAdapter:
 
 class Backtester:
     def __init__(self, config: dict):
+        self.config = config # Keep original for reference
         self.symbol = config.get('symbol')
         self.timeframe = config.get('timeframe')
-        self.start_date = pd.to_datetime(config.get('startDate')).tz_localize(None) if config.get('startDate') else None
-        self.end_date = pd.to_datetime(config.get('endDate')).tz_localize(None) if config.get('endDate') else None
-        self.initial_balance = config.get('initialBalance', 1000)
+        
+        # 🟢 Use the exact keys from your Pydantic model
+        self.start_str = config.get('startDate')
+        self.end_str = config.get('endDate')
+        
+        # Convert for internal logic
+        self.start_date = pd.to_datetime(self.start_str).tz_localize(None) if self.start_str else None
+        self.end_date = pd.to_datetime(self.end_str).tz_localize(None) if self.end_str else None
+        
+        self.initial_balance = float(config.get('initialBalance', 1000))
         self.model_name = config.get('mlModel')
-        self.trend_strat = config.get('trend_strategy', 'atr_breakout')
-        self.ml_conf_threshold = config.get('ml_confidence_threshold', 0.10)
         self.params = config.get('params', {})
+        self.ml_conf_threshold = float(config.get('ml_confidence_threshold', 0.10))
 
-    def load_data(self):
-        clean_symbol = self.symbol.replace("/", "-")
-        file_path = f"data/{clean_symbol}-{self.timeframe}.csv"
-        
-        if not os.path.exists(file_path):
-            raise HTTPException(status_code=404, detail=f"Missing data file: {file_path}")
-
-        df = pd.read_csv(file_path)
-        df.columns = [c.lower() for c in df.columns]
-        
-        if 'datetime' in df.columns:
-            df['datetime'] = pd.to_datetime(df['datetime'], utc=True).dt.tz_localize(None)
-            df.set_index('datetime', inplace=True)
-        elif 'timestamp' in df.columns:
-            df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True).dt.tz_localize(None)
-            df.set_index('datetime', inplace=True)
-        
-        if self.start_date and self.end_date:
-            df = df[(df.index >= self.start_date) & (df.index <= self.end_date)]
-        
-        if df.empty:
-            raise HTTPException(status_code=400, detail="No data in range.")
-        return df
+    async def load_data(self):
+        """
+        Refreshes data from US-based exchanges if local file is missing or outdated.
+        """
+        try:
+            # 🟢 CALL THE FETCH-ON-DEMAND LOGIC
+            # We 'await' this because ensure_full_data is an async function
+            from main4 import ensure_full_data 
+            df = await ensure_full_data(
+                self.symbol, 
+                self.timeframe, 
+                self.start_str, 
+                self.end_str
+            )
+            
+            if df is None or df.empty:
+                raise HTTPException(status_code=400, detail="Data gap could not be filled.")
+            
+            # Ensure index is clean
+            df.index = df.index.tz_localize(None)
+            return df
+            
+        except Exception as e:
+            logger.error(f"Data Sync Error: {e}")
+            raise HTTPException(status_code=500, detail=f"Data Sync Failed: {str(e)}")
 
     def calculate_indicators(self, df):
         if len(df) < 50: return df 
@@ -209,12 +218,27 @@ class Backtester:
                     position = None
                     trades.append({'type': 'close_short', 'price': row['close'], 'time': str(row.name), 'balance': balance})
 
+                    equity_curve.append({"time": current_time, "balance": round(balance, 2)})
+
+            # 🟢 STEP 3: PREPARE FINAL STRUCTURE FOR NODE.JS
+            # We must include 'candleData' and 'metrics' as top-level keys
+            chart_df = df.reset_index().rename(columns={'index': 'time', 'datetime': 'time', 'timestamp': 'time'})
+            chart_df['time'] = chart_df['time'].astype(str)
+            candle_data = chart_df[['time', 'open', 'high', 'low', 'close']].to_dict('records')
+
             roi = ((balance - self.initial_balance) / self.initial_balance) * 100
             
             return {
-                "status": "completed",
-                "metrics": {"final_balance": round(balance, 2), "roi": round(roi, 2), "total_trades": len(trades) // 2},
-                "trades": trades[-5:]
+                "status": "success",
+                "metrics": {
+                    "final_balance": round(balance, 2),
+                    "roi": round(roi, 2),
+                    "total_trades": len(trades) // 2
+                },
+                "candleData": candle_data,
+                "trades": trades,
+                "equityCurve": equity_curve,
+                "initialBalance": self.initial_balance
             }
         except Exception as e:
             logger.error(f"Backtest Error: {e}")

@@ -168,7 +168,9 @@ class Backtester:
 
             balance = self.initial_balance
             position = None
+            entry_price = 0
             trades = []
+            equity_curve = []
 
             for i in range(len(df)):
                 row = df.iloc[i]

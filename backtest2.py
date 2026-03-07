@@ -228,6 +228,7 @@ class Backtester:
 
             balance, position, entry_price = self.initial_balance, None, 0
             equity_curve, trades = [], []
+            vetoed_logs = []
 
             for i in range(len(df)):
                 row = df.iloc[i]
@@ -243,6 +244,15 @@ class Backtester:
                     limit = self.ml_limit_short if is_short_trend else self.ml_limit_long
                     if conf_score < limit:
                         gate_passed = False
+
+                if signal != 0 and not gate_passed and position is None:
+                    vetoed_logs.append({
+                        "time": str(row.name),
+                        "signal": "Long" if signal == 1 else "Short",
+                        "conf_score": round(conf_score, 4),
+                        "limit": round(limit, 4),
+                        "price": row['close']
+                    })
 
 
                # 🟢 1. CHECK EXITS FIRST (Allows same-candle flipping)
@@ -304,6 +314,7 @@ class Backtester:
                 },
                 "candleData": chart_df[['time', 'open', 'high', 'low', 'close']].to_dict('records'),
                 "equityCurve": equity_curve,
+                "vetoed_signals": vetoed_logs,
                 "trades": trades
             }
         except Exception as e:

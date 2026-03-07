@@ -95,8 +95,188 @@ class Backtester:
         
         self.initial_balance = float(config.get('initialBalance', 1000))
         self.model_name = config.get('mlModel')
-        self.params = config.get('params', {})
-        self.ml_conf_threshold = float(config.get('ml_confidence_threshold', 0.10))
+        self.combination_rule = config.get('combinationRule', 'OR').upper()
+        
+        self.strategies = config.get('strategies', [])
+        if not self.strategies and config.get('code'):
+            self.strategies = [{"code": config.get('code'), "params": config.get('params', {})}]
+
+        # 🟢 Risk Parameters (Synced with fix_pct)
+        params = config.get('params', {})
+        self.tp_pct = params.get('take_profit', 0.06)
+        self.sl_pct = params.get('stop_loss', 0.03)
+        self.ts_pct = params.get('trailing_stop', 0.0)
+        
+        self.ml_limit_long = float(config.get('mlThresholdLong', 0.80))
+        self.ml_limit_short = float(config.get('mlThresholdShort', 0.90))
+        self.model_name = config.get('mlModel', 'stacking')
+
+
+    def get_signal(self, row, strategies):
+        """ Calculates the combined 'Vote' of all active strategies """
+        votes = 0
+        for strat in strategies:
+            code = strat.get('code')
+            p = strat.get('params', {})
+            
+            # 1. RSI Threshold
+            if code == "rsi_threshold":
+                rsi = row.get('rsi', 50)
+                if rsi < p.get('oversold', 30): votes += 1
+                elif rsi > p.get('overbought', 70): votes -= 1
+            
+            # 2. Bollinger Fade
+            elif code == "bb_fade" or code == "bollinger_bands":
+                if row['close'] < row.get('BBL_20_2.0', 0): votes += 1
+                elif row['close'] > row.get('BBU_20_2.0', 999999): votes -= 1
+
+            # 3. SMA Crossover
+            elif code == "sma_crossover":
+                if row.get('sma_50', 0) > row.get('sma_200', 0): votes += 1
+                elif row.get('sma_50', 0) < row.get('sma_200', 0): votes -= 1
+
+            # 4. MACD Crossover
+            elif code == "macd_crossover":
+                if row.get('MACD_12_26_9', 0) > row.get('MACDs_12_26_9', 0): votes += 1
+                else: votes -= 1
+
+            # 5. Supertrend
+            elif code == "supertrend":
+                if row.get('SUPERTd_7_3.0', 0) == 1: votes += 1
+                else: votes -= 1
+
+            # 6. ATR Breakout
+            elif code == "atr_breakout":
+                target = row.get('ema_20', 0) + (row.get('atr', 0) * p.get('multiplier', 1.5))
+                if row['close'] > target: votes += 1
+                elif row['close'] < (row.get('ema_20', 0) - (row.get('atr', 0) * p.get('multiplier', 1.5))): votes -= 1
+
+            # 7. Stochastic
+            elif code == "stoch":
+                if row.get('STOCHk_14_3_3', 50) < 20: votes += 1
+                elif row.get('STOCHk_14_3_3', 50) > 80: votes -= 1
+
+            # 8. EMA Cloud
+            elif code == "ema_cloud":
+                if row.get('ema_9', 0) > row.get('ema_21', 0): votes += 1
+                else: votes -= 1
+
+            # 9. Price Action Breakout (20-period high/low)
+            elif code == "pa_breakout":
+                if row['close'] >= row.get('pa_high', 999999): votes += 1
+                elif row['close'] <= row.get('pa_low', 0): votes -= 1
+
+            # 10. Volume Profile (Volume Surge)
+            elif code == "vol_profile":
+                if row.get('volume', 0) > (row.get('vol_ma', 0) * p.get('threshold', 1.5)):
+                    votes += (1 if row['close'] > row.get('sma_50', 0) else -1)
+
+        # Combination Logic
+        if self.combination_rule == "AND":
+            if votes >= len(strategies): return 1
+            if votes <= -len(strategies): return -1
+            return 0
+        else: # OR Logic
+            if votes > 0: return 1
+            if votes < 0: return -1
+            return 0
+
+    async def run(self):
+        try:
+            df = await self.load_data()
+            
+            # --- PRE-CALCULATE ALL INDICATORS FOR ALL 10 STRATEGIES ---
+            df['sma_50'] = ta.sma(df['close'], 50)
+            df['sma_200'] = ta.sma(df['close'], 200)
+            df['ema_9'] = ta.ema(df['close'], 9)
+            df['ema_20'] = ta.ema(df['close'], 20)
+            df['ema_21'] = ta.ema(df['close'], 21)
+            df['rsi'] = ta.rsi(df['close'], 14)
+            df['atr'] = ta.atr(df['high'], df['low'], df['close'], 14)
+            
+            # Complex Indicators
+            df = pd.concat([df, ta.bbands(df['close'], 20, 2)], axis=1)
+            df = pd.concat([df, ta.macd(df['close'])], axis=1)
+            df = pd.concat([df, ta.stoch(df['high'], df['low'], df['close'])], axis=1)
+            df = pd.concat([df, ta.supertrend(df['high'], df['low'], df['close'], 7, 3)], axis=1)
+            
+            # Price Action & Volume
+            df['pa_high'] = df['high'].rolling(20).max()
+            df['pa_low'] = df['low'].rolling(20).min()
+            df['vol_ma'] = ta.sma(df['volume'], 20)
+            
+            df = df.dropna()
+
+            ml_model = None
+            if self.model_name and self.model_name != "off":
+                from app.predictors.model_factory import ModelFactory
+                payload = ModelFactory.load_model(self.model_name, self.symbol, self.timeframe)
+                if payload:
+                    from app.backtest2 import RawModelAdapter
+                    ml_model = RawModelAdapter(payload)
+
+            balance, position, entry_price = self.initial_balance, None, 0
+            equity_curve, trades = [], []
+
+            for i in range(len(df)):
+                row = df.iloc[i]
+                current_time = str(row.name)
+                signal = self.get_signal(row, self.strategies)
+
+                gate_passed = True
+                conf_score = 1.0
+                if ml_model:
+                    conf_score = ml_model.predict_direction(df_slice)
+                    # Use 200EMA to determine which gate to use
+                    is_short_trend = row['close'] < row['sma_200']
+                    limit = self.ml_limit_short if is_short_trend else self.ml_limit_long
+                    if conf_score < limit:
+                        gate_passed = False
+
+                
+
+                if position is None and gate_passed:
+                    if signal == 1:
+                        position = 'long'; entry_price = row['close']
+                        trades.append({"type": "buy", "price": entry_price, "time": current_time})
+                    elif signal == -1:
+                        position = 'short'; entry_price = row['close']
+                        trades.append({"type": "sell", "price": entry_price, "time": current_time})
+                
+                elif position == 'long':
+                    pnl = (row['close'] - entry_price) / entry_price
+                    if pnl >= self.tp_pct or pnl <= -self.sl_pct or signal == -1:
+                        balance *= (1 + pnl)
+                        trades.append({"type": "exit", "price": row['close'], "time": current_time, "pnl": round(pnl*100, 2)})
+                        position = None
+                
+                elif position == 'short':
+                    pnl = (entry_price - row['close']) / entry_price
+                    if pnl >= self.tp_pct or pnl <= -self.sl_pct or signal == 1:
+                        balance *= (1 + pnl)
+                        trades.append({"type": "exit", "price": row['close'], "time": current_time, "pnl": round(pnl*100, 2)})
+                        position = None
+
+                equity_curve.append({"time": current_time, "balance": round(balance, 2)})
+
+            chart_df = df.reset_index().rename(columns={'index': 'time', 'datetime': 'time'})
+            chart_df['time'] = chart_df['time'].astype(str)
+            
+            return {
+                "status": "success",
+                "metrics": {
+                    "finalBalance": round(balance, 2),
+                    "roi": round(((balance - self.initial_balance) / self.initial_balance) * 100, 2),
+                    "totalTrades": len(trades)
+                },
+                "candleData": chart_df[['time', 'open', 'high', 'low', 'close']].to_dict('records'),
+                "equityCurve": equity_curve,
+                "trades": trades
+            }
+        except Exception as e:
+            logger.error(f"Universal Engine Error: {e}")
+            return {"status": "failed", "error": str(e)}
+            
 
     async def load_data(self):
         """
@@ -123,6 +303,8 @@ class Backtester:
         except Exception as e:
             logger.error(f"Data Sync Error: {e}")
             raise HTTPException(status_code=500, detail=f"Data Sync Failed: {str(e)}")
+
+    
 
     def calculate_indicators(self, df):
         if len(df) < 50: return df 

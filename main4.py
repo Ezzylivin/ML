@@ -8,6 +8,7 @@ import aiofiles
 import sqlite3
 import numpy as np
 import pandas as pd
+import time
 import pandas_ta as ta
 import ccxt.async_support as ccxt
 import ccxt.pro as ccxtpro
@@ -132,9 +133,9 @@ class StrategyConfig(BaseModel):
 class BacktestRequest(BaseModel):
     symbol: str
     timeframe: str
-    start_date: str
+    startDate: str
     endDate: str
-    initial_capital: float = 1000.0
+    initialBalance: float = 1000.0
     riskPercentage: float = 1.0
     mlModel: Optional[str] = None
     trend_strategy: Optional[str] = "atr_breakout"
@@ -222,6 +223,79 @@ def load_data_robust(symbol, timeframe):
     except Exception as e:
         logger.error(f"Data Load Error: {e}")
     return None
+
+
+def ensure_full_data(symbol, timeframe, start_str, end_str):
+    """
+    Checks local DB for data gaps and fetches from Binance/Exchange if necessary.
+    """
+    # 1. Convert strings to UTC timestamps
+    start_ts = int(pd.to_datetime(start_str).timestamp() * 1000)
+    end_ts = int(pd.to_datetime(end_str).timestamp() * 1000)
+
+    # 2. Try to load from your local Database first
+    df = load_data_robust(symbol, timeframe)
+
+    # 🟢 SAFETY FIX: Handle 'None' return from load_data_robust
+    if df is None:
+        df = pd.DataFrame()
+
+    # 3. Detect if data starts too late or ends too early
+    needs_fetch = False
+    if df.empty:
+        needs_fetch = True
+        current_since = start_ts
+    else:
+        # Check if local data starts after our target start
+        local_start = int(df.index.min().timestamp() * 1000)
+        if local_start > start_ts + 3600000: # 1 hour buffer
+            needs_fetch = True
+            current_since = start_ts
+        else:
+            current_since = int(df.index.max().timestamp() * 1000)
+
+    # 4. Fetch missing chunks from Exchange
+    if needs_fetch or current_since < end_ts:
+        print(f"📡 Data Gap Detected. Fetching {symbol} from {start_str}...")
+        exchange = ccxt.binance() # Binance is standard for OHLCV
+        
+        all_new_candles = []
+        try:
+            while current_since < end_ts:
+                # fetch_ohlcv returns [timestamp, open, high, low, close, volume]
+                new_batch = exchange.fetch_ohlcv(symbol.replace("-", "/"), timeframe, since=current_since, limit=1000)
+                if not new_batch: break
+                
+                all_new_candles.extend(new_batch)
+                current_since = new_batch[-1][0] + 1 
+                time.sleep(exchange.rateLimit / 1000) 
+        except Exception as e:
+            print(f"⚠️ Exchange Fetch Error: {e}")
+
+        if all_new_candles:
+            new_df = pd.DataFrame(all_new_candles, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
+            new_df['timestamp'] = pd.to_datetime(new_df['ts'], unit='ms', utc=True)
+            new_df.set_index('timestamp', inplace=True)
+            new_df.drop(columns=['ts'], inplace=True) # Clean up the extra timestamp column
+            
+            # 5. Merge, Deduplicate, and Save
+            df = pd.concat([df, new_df]).sort_index()
+            df = df[~df.index.duplicated(keep='first')]
+            
+            # 🟢 Check if this function exists in your main4.py! 
+            # If not, comment it out to avoid a NameError
+            try:
+                save_to_local_db(df, symbol, timeframe)
+            except NameError:
+                print("⚠️ save_to_local_db not defined. Data not cached.")
+
+    # 6. Return exact slice user requested
+    # Ensure start/end are UTC-aware to match the index
+    target_start = pd.to_datetime(start_str, utc=True)
+    target_end = pd.to_datetime(end_str, utc=True)
+    
+    return df.loc[target_start:target_end]
+
 
 def calculate_strategy_signal(df, code, params):
     close, high, low, vol = df['close'], df['high'], df['low'], df['volume']
@@ -398,8 +472,8 @@ async def execute_backtest_logic(data: BacktestRequest):
             rename_map = {'timestamp': 'time', 'date': 'time', 'volume': 'vol'}
             df.rename(columns=rename_map, inplace=True)
             df['time'] = pd.to_datetime(df['time'])
-            start_dt = pd.to_datetime(data.start_date).replace(tzinfo=None)
-            end_dt = pd.to_datetime(data.end_date).replace(tzinfo=None)
+            start_dt = pd.to_datetime(data.startDate).replace(tzinfo=None)
+            end_dt = pd.to_datetime(data.endDate).replace(tzinfo=None)
             if df['time'].dt.tz is not None:
                 df['time'] = df['time'].dt.tz_localize(None)
             df = df[(df['time'] >= start_dt) & (df['time'] <= end_dt)]
@@ -408,7 +482,7 @@ async def execute_backtest_logic(data: BacktestRequest):
         if df is None or df.empty:
             logger.info("⚠️ CSV not found or empty. Falling back to CCXT.")
             async with ccxt.coinbase() as exchange:
-                since = exchange.parse8601(data.start_date)
+                since = exchange.parse8601(data.startDate)
                 ohlcv = await exchange.fetch_ohlcv(data.symbol.replace('-', '/'), data.timeframe, since=since, limit=1000)
                 df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
                 df['time'] = pd.to_datetime(df['time'], unit='ms')
@@ -416,7 +490,7 @@ async def execute_backtest_logic(data: BacktestRequest):
         if df.empty:
             return {"status": "error", "message": "No data found for backtest range"}
 
-        balance, position, trades, curve = data.initial_capital, None, [], []
+        balance, position, trades, curve = data.initialBalance, None, [], []
         sim_config = {
             "strategies": [{"code": data.trend_strategy, "params": data.params}],
             "comboConfig": {"combinationRule": "OR"},
@@ -1207,8 +1281,18 @@ async def close_position(data: BotClosePositionRequest):
 
 @app.post('/api/backtest/run')
 async def run_backtest(request: BacktestRequest):
+    
     try:
-        config = request.dict()
+        df = ensure_full_data(
+            request.symbol, 
+            request.timeframe, 
+            request.startDate, 
+            request.endDate
+        )
+
+        config_data = request.dict()
+
+        
         p_dict = config.get('params', {})
         def fix_pct(val, default):
             if val is None: return default
@@ -1223,7 +1307,7 @@ async def run_backtest(request: BacktestRequest):
         config['params']['trailing_stop'] = ts
         
         logger.info(f"🛡️ Atomic Risk Corrected: TP={tp}, SL={sl}, TS={ts}")
-        bot = Backtester(config)
+        bot = Backtester(config_data)
         result = bot.run()
         
         if 'candleData' not in result or not result['candleData']:
@@ -1244,9 +1328,19 @@ async def run_backtest(request: BacktestRequest):
 
 @app.post('/api/backtest/combo')
 async def run_combo_backtest(req: ComboRequest):
+    
     try:
         logger.info(f"🔥 COMBO Request: {len(req.strategies)} strategies on {req.symbol}")
-        df = load_data_robust(req.symbol, req.timeframe)
+        
+        df = ensure_full_data(
+            request.symbol, 
+            request.timeframe, 
+            request.startDate, 
+            request.endDate
+        )
+
+        config_data = request.dict()
+        
         if df is None: raise HTTPException(status_code=404, detail=f"Data file not found for {req.symbol}")
         try:
             df = df.loc[req.startDate:req.endDate]

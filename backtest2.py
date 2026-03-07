@@ -152,12 +152,12 @@ class Backtester:
             
         return df.dropna()
 
-    def run(self):
+    async def run(self):
         try:
-            df = self.load_data()
+            df = await self.load_data()
             df = self.calculate_indicators(df)
             
-            if len(df) < 10:
+            if df is None or len(df) < 10:
                 return {"status": "failed", "error": "Not enough data", "metrics": {"roi": -100}}
 
             ml_model = None

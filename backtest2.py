@@ -110,9 +110,8 @@ class Backtester:
         p = config.get('params', {})
         self.params = p
         
-        self.tp_pct = p.get('take_profit', 0.06)
-        self.sl_pct = p.get('stop_loss', 0.03)
-        self.ts_pct = p.get('trailing_stop', 0.0)
+        self.risk_pct = float(config.get('risk_percentage', 1.0)) / 100.0 
+        if self.risk_pct > 1.0: self.risk_pct = self.risk_pct / 100.0
         
         self.ml_limit_long = float(config.get('mlThresholdLong', 0.80))
         self.ml_limit_short = float(config.get('mlThresholdShort', 0.90))
@@ -247,6 +246,7 @@ class Backtester:
             if position == 'long':
                 pnl = (row['close'] - entry_price) / entry_price
                 if pnl >= self.tp_pct or pnl <= -self.sl_pct or signal == -1:
+                    trade_outcome = pnl * self.risk_pct
                     balance *= (1 + pnl - 0.0006) # Apply Fee
                     trades.append({
                         "type": "exit", # UI recognizes 'exit'
@@ -261,6 +261,7 @@ class Backtester:
             elif position == 'short':
                 pnl = (entry_price - row['close']) / entry_price
                 if pnl >= self.tp_pct or pnl <= -self.sl_pct or signal == 1:
+                    trade_outcome = pnl * self.risk_pct
                     balance *= (1 + pnl - 0.0006)
                     trades.append({
                         "type": "exit", 

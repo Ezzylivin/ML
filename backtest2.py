@@ -102,7 +102,7 @@ class Backtester:
             self.strategies = [{"code": config.get('code'), "params": config.get('params', {})}]
 
         # 🟢 Risk Parameters (Synced with fix_pct)
-        params = config.get('params', {})
+        self.params = config.get('params', {})
         self.tp_pct = params.get('take_profit', 0.06)
         self.sl_pct = params.get('stop_loss', 0.03)
         self.ts_pct = params.get('trailing_stop', 0.0)

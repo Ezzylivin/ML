@@ -102,7 +102,9 @@ class Backtester:
             self.strategies = [{"code": config.get('code'), "params": config.get('params', {})}]
 
         # 🟢 Risk Parameters (Synced with fix_pct)
-        self.params = config.get('params', {})
+        p = config.get('params', {})
+        self.params = p
+        
         self.tp_pct = params.get('take_profit', 0.06)
         self.sl_pct = params.get('stop_loss', 0.03)
         self.ts_pct = params.get('trailing_stop', 0.0)
@@ -358,32 +360,30 @@ class Backtester:
                 row = df.iloc[i]
                 df_slice = df.iloc[:i+1]
                 current_time = str(row.name)
+
+                is_short_trend = row['close'] < row.get('sma_200', row['close'])
+                active_limit = self.ml_limit_short if is_short_trend else self.ml_limit_long
                 
                 # 1. Regime Detection
                 regime = "TREND"
-                if ml_model:
-                    buy_prob = ml_model.predict_direction(df_slice)
-                    # Use confidence interval
-                    if abs(buy_prob - 0.5) * 2 < self.ml_conf_threshold:
-                        regime = "RANGE"
+                gate_passed = True
+                conf_score = 1.0
                 
-                # 2. Strategy Signal
-                signal = 0 
-                if regime == "TREND":
-                    if row['close'] > row['sma_50'] and row['rsi'] > 50: signal = 1
-                    elif row['close'] < row['sma_50'] and row['rsi'] < 50: signal = -1
-                else:
-                    try:
-                        # Use fuzzy lookup for BBL/BBU here too just in case
-                        bbl = next((row[c] for c in row.index if c.startswith("BBL")), 0)
-                        bbu = next((row[c] for c in row.index if c.startswith("BBU")), 999999)
-                        
-                        if row['close'] <= bbl: signal = 1
-                        elif row['close'] >= bbu: signal = -1
-                    except: pass
+                if ml_model:
+                    conf_score = ml_model.predict_direction(df_slice)
+                    # Determine trend (Below 200EMA = Short Trend)
+                    is_short_trend = row['close'] < row.get('sma_200', row['close'])
+                    # Pick the right threshold from your config
+                    limit = self.ml_limit_short if is_short_trend else self.ml_limit_long
+                    
+                    if conf_score < limit:
+                        gate_passed = False
 
+                # 2. GET STRATEGY VOTES (Uses your 10 strategies)
+                signal = self.get_signal(row, self.strategies)
+                
                 # 3. Execution
-                if position is None:
+                if position is None and gate_passed:
                     if signal == 1 and self.params.get('trade_direction') != 'SHORT':
                         position = 'long'
                         entry_price = row['close']
@@ -403,7 +403,7 @@ class Backtester:
                     position = None
                     trades.append({'type': 'close_short', 'price': row['close'], 'time': str(row.name), 'balance': balance})
 
-                    equity_curve.append({"time": current_time, "balance": round(balance, 2)})
+                equity_curve.append({"time": current_time, "balance": round(balance, 2)})
 
             # 🟢 STEP 3: PREPARE FINAL STRUCTURE FOR NODE.JS
             # We must include 'candleData' and 'metrics' as top-level keys

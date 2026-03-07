@@ -92,10 +92,15 @@ class Backtester:
         # Convert for internal logic
         self.start_date = pd.to_datetime(self.start_str).tz_localize(None) if self.start_str else None
         self.end_date = pd.to_datetime(self.end_str).tz_localize(None) if self.end_str else None
+
+        self.params = config.get('params', {})
         
         self.initial_balance = float(config.get('initialBalance', 1000))
         self.model_name = config.get('mlModel')
         self.combination_rule = config.get('combinationRule', 'OR').upper()
+
+        if 'trade_direction' not in self.params:
+            self.params['trade_direction'] = 'BOTH'
         
         self.strategies = config.get('strategies', [])
         if not self.strategies and config.get('code'):
@@ -112,6 +117,8 @@ class Backtester:
         self.ml_limit_long = float(config.get('mlThresholdLong', 0.80))
         self.ml_limit_short = float(config.get('mlThresholdShort', 0.90))
         self.model_name = config.get('mlModel', 'stacking')
+
+    
 
 
     def get_signal(self, row, strategies):
@@ -236,44 +243,47 @@ class Backtester:
                         gate_passed = False
 
 
-                if position == 'long':
-                    pnl = (row['close'] - entry_price) / entry_price
-                    if pnl >= self.tp_pct or pnl <= -self.sl_pct or signal == -1:
-                        balance *= (1 + pnl - 0.0006)
-                        trades.append({"type": "exit", "side": "long", "price": row['close'], "time": current_time, "pnl": round(pnl*100, 2)})
-                        position = None
-                
-                elif position == 'short':
-                    pnl = (entry_price - row['close']) / entry_price
-                    if pnl >= self.tp_pct or pnl <= -self.sl_pct or signal == 1:
-                        balance *= (1 + pnl - 0.0006)
-                        trades.append({"type": "exit", "side": "short", "price": row['close'], "time": current_time, "pnl": round(pnl*100, 2)})
-                        position = None
+               # 🟢 1. CHECK EXITS FIRST (Allows same-candle flipping)
+            if position == 'long':
+                pnl = (row['close'] - entry_price) / entry_price
+                if pnl >= self.tp_pct or pnl <= -self.sl_pct or signal == -1:
+                    balance *= (1 + pnl - 0.0006) # Apply Fee
+                    trades.append({
+                        "type": "exit", # UI recognizes 'exit'
+                        "side": "long", 
+                        "price": row['close'], 
+                        "time": current_time, 
+                        "pnl": round(pnl*100, 2),
+                        "balance": round(balance, 2)
+                    })
+                    position = None 
 
-                
+            elif position == 'short':
+                pnl = (entry_price - row['close']) / entry_price
+                if pnl >= self.tp_pct or pnl <= -self.sl_pct or signal == 1:
+                    balance *= (1 + pnl - 0.0006)
+                    trades.append({
+                        "type": "exit", 
+                        "side": "short", 
+                        "price": row['close'], 
+                        "time": current_time, 
+                        "pnl": round(pnl*100, 2),
+                        "balance": round(balance, 2)
+                    })
+                    position = None 
 
-                if position is None and gate_passed:
-                    if signal == 1:
-                        position = 'long'; entry_price = row['close']
-                        trades.append({"type": "buy", "price": entry_price, "time": current_time})
-                    elif signal == -1:
-                        position = 'short'; entry_price = row['close']
-                        trades.append({"type": "sell", "price": entry_price, "time": current_time})
-                
-                elif position == 'long':
-                    pnl = (row['close'] - entry_price) / entry_price
-                    if pnl >= self.tp_pct or pnl <= -self.sl_pct or signal == -1:
-                        balance *= (1 - 0.0006)
-                        trades.append({"type": "exit", "side": "long", "price": row['close'], "time": current_time, "pnl": round(pnl*100, 2)})
-                        position = None
-                
-                elif position == 'short':
-                    pnl = (entry_price - row['close']) / entry_price
-                    if pnl >= self.tp_pct or pnl <= -self.sl_pct or signal == 1:
-                        balance *= (1 - 0.0006)
-                        trades.append({"type": "exit", "side": "short", "price": row['close'], "time": current_time, "pnl": round(pnl*100, 2)})
-                        position = None
-
+            # 🟢 2. CHECK ENTRIES SECOND (Position is now None if we just exited)
+            if position is None and gate_passed:
+                if signal == 1:
+                    position = 'long'
+                    entry_price = row['close']
+                    balance *= (1 - 0.0006)
+                    trades.append({"type": "buy", "price": entry_price, "time": current_time})
+                elif signal == -1:
+                    position = 'short'
+                    entry_price = row['close']
+                    balance *= (1 - 0.0006)
+                    trades.append({"type": "sell", "price": entry_price, "time": current_time})
                 equity_curve.append({"time": current_time, "balance": round(balance, 2)})
 
             chart_df = df.reset_index().rename(columns={'index': 'time', 'datetime': 'time'})

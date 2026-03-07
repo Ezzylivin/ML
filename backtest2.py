@@ -105,9 +105,9 @@ class Backtester:
         p = config.get('params', {})
         self.params = p
         
-        self.tp_pct = params.get('take_profit', 0.06)
-        self.sl_pct = params.get('stop_loss', 0.03)
-        self.ts_pct = params.get('trailing_stop', 0.0)
+        self.tp_pct = p.get('take_profit', 0.06)
+        self.sl_pct = p.get('stop_loss', 0.03)
+        self.ts_pct = p.get('trailing_stop', 0.0)
         
         self.ml_limit_long = float(config.get('mlThresholdLong', 0.80))
         self.ml_limit_short = float(config.get('mlThresholdShort', 0.90))

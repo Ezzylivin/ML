@@ -225,75 +225,67 @@ def load_data_robust(symbol, timeframe):
     return None
 
 
-def ensure_full_data(symbol, timeframe, start_str, end_str):
+async def ensure_full_data(symbol, timeframe, start_str, end_str):
     """
-    Checks local DB for data gaps and fetches from Binance/Exchange if necessary.
+    Checks local DB for data gaps and fetches from Coinbase (Async).
     """
-    # 1. Convert strings to UTC timestamps
     start_ts = int(pd.to_datetime(start_str).timestamp() * 1000)
     end_ts = int(pd.to_datetime(end_str).timestamp() * 1000)
 
-    # 2. Try to load from your local Database first
     df = load_data_robust(symbol, timeframe)
+    if df is None: df = pd.DataFrame()
 
-    # 🟢 SAFETY FIX: Handle 'None' return from load_data_robust
-    if df is None:
-        df = pd.DataFrame()
-
-    # 3. Detect if data starts too late or ends too early
     needs_fetch = False
     if df.empty:
         needs_fetch = True
         current_since = start_ts
     else:
-        # Check if local data starts after our target start
         local_start = int(df.index.min().timestamp() * 1000)
-        if local_start > start_ts + 3600000: # 1 hour buffer
+        if local_start > start_ts + 3600000:
             needs_fetch = True
             current_since = start_ts
         else:
             current_since = int(df.index.max().timestamp() * 1000)
 
-    # 4. Fetch missing chunks from Exchange
     if needs_fetch or current_since < end_ts:
-        print(f"📡 Data Gap Detected. Fetching {symbol} from {start_str}...")
-        exchange = ccxt.binance() # Binance is standard for OHLCV
+        print(f"📡 US-DATA GAP: Fetching {symbol} from Coinbase...")
         
+        # 🟢 Use Async Coinbase
+        exchange = ccxt.coinbase({'enableRateLimit': True}) 
         all_new_candles = []
+        fetch_symbol = symbol.replace("-", "/") 
+
         try:
             while current_since < end_ts:
-                # fetch_ohlcv returns [timestamp, open, high, low, close, volume]
-                new_batch = exchange.fetch_ohlcv(symbol.replace("-", "/"), timeframe, since=current_since, limit=1000)
+                # 🟢 MUST AWAIT THIS CALL
+                new_batch = await exchange.fetch_ohlcv(fetch_symbol, timeframe, since=current_since, limit=300)
                 if not new_batch: break
                 
                 all_new_candles.extend(new_batch)
                 current_since = new_batch[-1][0] + 1 
-                time.sleep(exchange.rateLimit / 1000) 
+                # No need for time.sleep() with enableRateLimit in async
+            
+            # 🔴 CRITICAL: Close the async session
+            await exchange.close()
         except Exception as e:
-            print(f"⚠️ Exchange Fetch Error: {e}")
+            print(f"⚠️ Coinbase Fetch Error: {e}")
+            await exchange.close()
 
         if all_new_candles:
             new_df = pd.DataFrame(all_new_candles, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
             new_df['timestamp'] = pd.to_datetime(new_df['ts'], unit='ms', utc=True)
             new_df.set_index('timestamp', inplace=True)
-            new_df.drop(columns=['ts'], inplace=True) # Clean up the extra timestamp column
+            new_df.drop(columns=['ts'], inplace=True)
             
-            # 5. Merge, Deduplicate, and Save
             df = pd.concat([df, new_df]).sort_index()
             df = df[~df.index.duplicated(keep='first')]
             
-            # 🟢 Check if this function exists in your main4.py! 
-            # If not, comment it out to avoid a NameError
             try:
                 save_to_local_db(df, symbol, timeframe)
-            except NameError:
-                print("⚠️ save_to_local_db not defined. Data not cached.")
+            except: pass
 
-    # 6. Return exact slice user requested
-    # Ensure start/end are UTC-aware to match the index
     target_start = pd.to_datetime(start_str, utc=True)
     target_end = pd.to_datetime(end_str, utc=True)
-    
     return df.loc[target_start:target_end]
 
 
@@ -1283,14 +1275,15 @@ async def close_position(data: BotClosePositionRequest):
 async def run_backtest(request: BacktestRequest):
     
     try:
-        df = ensure_full_data(
-            request.symbol, 
-            request.timeframe, 
-            request.startDate, 
-            request.endDate
-        )
+        config = request.dict()
 
-        config_data = request.dict()
+        
+        df = await ensure_full_data(
+            config['symbol'], 
+            config['timeframe'], 
+            config['startDate'], 
+            config['endDate']
+        )
 
         
         p_dict = config.get('params', {})
@@ -1307,8 +1300,42 @@ async def run_backtest(request: BacktestRequest):
         config['params']['trailing_stop'] = ts
         
         logger.info(f"🛡️ Atomic Risk Corrected: TP={tp}, SL={sl}, TS={ts}")
-        bot = Backtester(config_data)
+        bot = Backtester(config)
         result = bot.run()
+
+        # 🟢 STEP 1: Ensure candleData is present
+        if not result.get('candleData'):
+            # Use the 'df' we already fetched with ensure_full_data earlier!
+            # No need to call load_data_robust again.
+            chart_df = df.reset_index()
+            # Ensure column names match what the frontend chart expects
+            chart_df = chart_df.rename(columns={'timestamp': 'time'}) 
+            chart_df['time'] = chart_df['time'].astype(str)
+            result['candleData'] = chart_df[['time', 'open', 'high', 'low', 'close']].to_dict('records')
+
+        # 🟢 STEP 2: Force the "Correct" structure for Node.js Middleware
+        # Node.js is looking for these EXACT keys.
+        final_response = {
+            "status": "success",
+            "metrics": result.get('metrics', {
+                "final_balance": result.get('final_balance', config['initialBalance']),
+                "total_trades": len(result.get('trades', []))
+            }),
+            "candleData": result.get('candleData', []),
+            "trades": result.get('trades', []),
+            "equityCurve": result.get('equity_curve', result.get('equityCurve', [])),
+            "initialBalance": config.get('initialBalance', 1000)
+        }
+
+        return JSONResponse(content=final_response)
+
+    except Exception as e:
+        logger.error(f"Atomic API Error: {e}")
+        # Return a structured error so Node.js doesn't crash on the catch block either
+        return JSONResponse(
+            status_code=500,
+            content={"status": "failed", "message": str(e)}
+        )
         
         if 'candleData' not in result or not result['candleData']:
             df = load_data_robust(config['symbol'], config['timeframe'])
@@ -1331,15 +1358,16 @@ async def run_combo_backtest(req: ComboRequest):
     
     try:
         logger.info(f"🔥 COMBO Request: {len(req.strategies)} strategies on {req.symbol}")
+
+        config = request.dict()
         
-        df = ensure_full_data(
-            request.symbol, 
-            request.timeframe, 
-            request.startDate, 
-            request.endDate
+        df = await ensure_full_data(
+            config['symbol'], 
+            config['timeframe'], 
+            config['startDate'], 
+            config['endDate']
         )
 
-        config_data = request.dict()
         
         if df is None: raise HTTPException(status_code=404, detail=f"Data file not found for {req.symbol}")
         try:

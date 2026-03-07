@@ -175,6 +175,7 @@ class Backtester:
             for i in range(len(df)):
                 row = df.iloc[i]
                 df_slice = df.iloc[:i+1]
+                current_time = str(row.name)
                 
                 # 1. Regime Detection
                 regime = "TREND"

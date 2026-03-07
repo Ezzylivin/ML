@@ -1301,7 +1301,7 @@ async def run_backtest(request: BacktestRequest):
         
         logger.info(f"🛡️ Atomic Risk Corrected: TP={tp}, SL={sl}, TS={ts}")
         bot = Backtester(config)
-        result = bot.run()
+        result = await bot.run()
 
         # 🟢 STEP 1: Ensure candleData is present
         if not result.get('candleData'):

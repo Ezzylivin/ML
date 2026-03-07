@@ -235,6 +235,21 @@ class Backtester:
                     if conf_score < limit:
                         gate_passed = False
 
+
+                if position == 'long':
+                    pnl = (row['close'] - entry_price) / entry_price
+                    if pnl >= self.tp_pct or pnl <= -self.sl_pct or signal == -1:
+                        balance *= (1 + pnl - 0.0006)
+                        trades.append({"type": "exit", "side": "long", "price": row['close'], "time": current_time, "pnl": round(pnl*100, 2)})
+                        position = None
+                
+                elif position == 'short':
+                    pnl = (entry_price - row['close']) / entry_price
+                    if pnl >= self.tp_pct or pnl <= -self.sl_pct or signal == 1:
+                        balance *= (1 + pnl - 0.0006)
+                        trades.append({"type": "exit", "side": "short", "price": row['close'], "time": current_time, "pnl": round(pnl*100, 2)})
+                        position = None
+
                 
 
                 if position is None and gate_passed:
@@ -248,15 +263,15 @@ class Backtester:
                 elif position == 'long':
                     pnl = (row['close'] - entry_price) / entry_price
                     if pnl >= self.tp_pct or pnl <= -self.sl_pct or signal == -1:
-                        balance *= (1 + pnl)
-                        trades.append({"type": "exit", "price": row['close'], "time": current_time, "pnl": round(pnl*100, 2)})
+                        balance *= (1 - 0.0006)
+                        trades.append({"type": "exit", "side": "long", "price": row['close'], "time": current_time, "pnl": round(pnl*100, 2)})
                         position = None
                 
                 elif position == 'short':
                     pnl = (entry_price - row['close']) / entry_price
                     if pnl >= self.tp_pct or pnl <= -self.sl_pct or signal == 1:
-                        balance *= (1 + pnl)
-                        trades.append({"type": "exit", "price": row['close'], "time": current_time, "pnl": round(pnl*100, 2)})
+                        balance *= (1 - 0.0006)
+                        trades.append({"type": "exit", "side": "short", "price": row['close'], "time": current_time, "pnl": round(pnl*100, 2)})
                         position = None
 
                 equity_curve.append({"time": current_time, "balance": round(balance, 2)})

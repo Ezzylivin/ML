@@ -431,9 +431,12 @@ class Backtester:
             return {
                 "status": "success",
                 "metrics": {
-                    "final_balance": round(balance, 2),
+                    "finalBalance": round(balance, 2),
                     "roi": round(roi, 2),
-                    "total_trades": len(trades) // 2
+                    "totalTrades": len(trades) // 2,
+                    "total_trades": len(trades),
+                    "netProfit": round(balance - self.initial_balance, 2),
+                    "net_profit": round(balance - self.initial_balance, 2)
                 },
                 "candleData": candle_data,
                 "trades": trades,

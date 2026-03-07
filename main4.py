@@ -1359,13 +1359,13 @@ async def run_combo_backtest(req: ComboRequest):
     try:
         logger.info(f"🔥 COMBO Request: {len(req.strategies)} strategies on {req.symbol}")
 
-        config = request.dict()
+        config = req.dict()
         
         df = await ensure_full_data(
-            config['symbol'], 
-            config['timeframe'], 
-            config['startDate'], 
-            config['endDate']
+            req.symbol, 
+            req.timeframe, 
+            req.startDate, 
+            req.endDate
         )
 
         
@@ -1374,6 +1374,8 @@ async def run_combo_backtest(req: ComboRequest):
             df = df.loc[req.startDate:req.endDate]
             if df.empty: raise Exception("No data in date range")
         except: pass
+
+        logger.info(f"🔥 COMBO Request: {len(req.strategies)} strategies on {req.symbol}")
 
         signals_list = []
         for strat in req.strategies:
@@ -1489,21 +1491,25 @@ async def run_combo_backtest(req: ComboRequest):
 
         roi = ((balance - req.initialBalance) / req.initialBalance) * 100
         chart_df = df.reset_index()[['timestamp', 'open', 'high', 'low', 'close']].copy()
-        chart_df['timestamp'] = chart_df['timestamp'].astype(str)
-        candle_data = chart_df.to_dict('records')
+        chart_df.rename(columns={'timestamp': 'time'}, inplace=True)
+        chart_df['time'] = chart_df['time'].astype(str)
 
         return {
-            "status": "completed",
-            "metrics": {"final_balance": balance, "roi": roi, "total_trades": len(trades_log)},
-            "equity_curve": equity_curve,
+            "status": "success",
+            "metrics": {
+                "finalBalance": round(balance, 2), 
+                "roi": round(((balance - req.initialBalance) / req.initialBalance) * 100, 2), 
+                "totalTrades": len(trades_log)
+            },
+            "equityCurve": equity_curve,
             "trades": trades_log,
-            "candleData": candle_data,
+            "candleData": chart_df.to_dict('records'),
             "initialBalance": req.initialBalance
         }
 
     except Exception as e:
         logger.error(f"Combo API Error: {e}")
-        return JSONResponse(content={"status": "failed", "error": str(e)}, status_code=500)
+        return JSONResponse(status_code=500, content={"status": "failed", "error": str(e)})
 
 
 

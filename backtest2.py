@@ -59,6 +59,13 @@ class RawModelAdapter:
                 
                 # 🕵️‍♂️ THIS IS THE CRITICAL LOG: Check your terminal for this!
                 logger.info(f"🤖 AI RAW PROBS: {probs}")
+
+                conf = float(probs[-1])
+    
+                # 🎯 THE SQUEEZE: If the model is 100% sure, it's probably lying.
+                # We penalize absolute certainty to force the gate to work.
+                if conf > 0.99: conf = 0.85 
+                return conf
                 
                 if len(probs) == 3:
                     return float(probs[2]) # Probability of UP

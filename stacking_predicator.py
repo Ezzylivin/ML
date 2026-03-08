@@ -31,15 +31,24 @@ class StackingPredictor:
     def predict_direction(self, state_df: pd.DataFrame) -> float:
         results = {}
         for e_type in self.expert_types:
-            expert = ModelFactory.load_model(e_type, symbol=self.symbol)
-            if expert is None:
+            # Pass all 3 args now: name, symbol, timeframe
+            raw_model = ModelFactory.load_model(e_type, self.symbol, "1h")
+            
+            if raw_model is None:
                 results[e_type] = 0.5
                 continue
                 
             try:
-                # 🎯 Ensure individual experts return probabilities
-                results[e_type] = expert.predict_direction(state_df)
+                # 🎯 THE FIX: Raw models use predict_proba, not predict_direction
+                if hasattr(raw_model, "predict_proba"):
+                    # Get probability of 'Up' (Class 1)
+                    score = float(raw_model.predict_proba(state_df)[0][1])
+                else:
+                    score = float(raw_model.predict(state_df)[0])
+                
+                results[e_type] = score
             except Exception as e:
+                print(f"⚠️ {e_type} Error: {e}")
                 results[e_type] = 0.5
 
         # --- ⚖️ REFINED CONFLUENCE LOGIC ---

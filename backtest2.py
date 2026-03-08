@@ -12,80 +12,44 @@ class RawModelAdapter:
     def __init__(self, model_payload):
         if isinstance(model_payload, dict):
             self.model = model_payload.get('model')
-            self.feature_names = model_payload.get('feature_names', [])
+            # 🎯 CRITICAL: This must match the 8 features the model was trained on
+            self.feature_names = model_payload.get('feature_names', 
+                ['sma_50', 'sma_200', 'st_trend', 'rsi', 'atr', 'adx', 'BBL_20_2.0_2.0', 'BBU_20_2.0_2.0'])
             self.scaler = model_payload.get('scaler', None)
         else:
             self.model = model_payload
             self.feature_names = []
             self.scaler = None
 
-    def calculate_indicators(self, df):
-        if len(df) < 20: return df 
-        
-        # 1. Basic Indicators
-        df['sma_50'] = ta.sma(df['close'], length=50)
-        df['sma_200'] = ta.sma(df['close'], length=200)
-        df['rsi'] = ta.rsi(df['close'], length=14)
-        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-        
-        # 2. ADX (Required by your model)
-        adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
-        if adx_df is not None:
-            # The model wants the 'ADX_14' column
-            df['adx'] = adx_df['ADX_14']
+    def predict_direction(self, df_history):
+        try:
+            # 1. Grab the latest row for prediction
+            last_row = df_history.iloc[[-1]].copy()
             
-        # 3. Bollinger Bands (Match the model's naming convention)
-        bb = ta.bbands(df['close'], length=20, std=2)
-        if bb is not None:
-            # Renaming to match the exact strings in your error: BBL_20_2.0_2.0
-            df['BBL_20_2.0_2.0'] = bb['BBL_20_2.0']
-            df['BBU_20_2.0_2.0'] = bb['BBU_20_2.0']
-
-        # 4. Supertrend -> st_trend (Required by your model)
-        st = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3)
-        if st is not None:
-            # Renaming the direction column (SUPERTd) to 'st_trend'
-            df['st_trend'] = st['SUPERTd_10_3.0']
-
-        # 🎯 KEEP ALL DATA: Fill missing early values with 0
-        return df.fillna(0) 
-                
+            # 2. Filter to EXACT features expected by the model
+            # This prevents the "training data did not have these fields" error
+            if self.feature_names:
                 X = last_row[self.feature_names]
             else:
-                # 🎯 FALLBACK: If feature_names are missing, drop non-numeric columns and hope for the best
                 X = last_row.select_dtypes(include=[np.number])
 
-            # 2. Scale
+            # 3. Scale
             if self.scaler and not X.empty:
                 X = self.scaler.transform(X)
 
-            # 3. Predict with Probability Extraction
+            # 4. Extract Probability (Nuance)
             if hasattr(self.model, "predict_proba"):
                 probs = self.model.predict_proba(X)[0]
+                conf = float(probs[-1]) # Probability of UP
                 
-                # 🕵️‍♂️ THIS IS THE CRITICAL LOG: Check your terminal for this!
-                logger.info(f"🤖 AI RAW PROBS: {probs}")
-
-                conf = float(probs[-1])
-    
-                # 🎯 THE SQUEEZE: If the model is 100% sure, it's probably lying.
-                # We penalize absolute certainty to force the gate to work.
+                # 🎯 THE SQUEEZE: Make the gate actually work even if overfitted
                 if conf > 0.99: conf = 0.85 
                 return conf
-                
-                if len(probs) == 3:
-                    return float(probs[2]) # Probability of UP
-                return float(probs[1])     # Probability of UP (Binary)
             
-            # 🎯 If model only gives 0 or 1, return it as 0.0 or 1.0
             return float(self.model.predict(X)[0])
                 
         except Exception as e:
             logger.error(f"❌ AI Prediction Crash: {e}")
-            return 0.5
-                
-        except Exception as e:
-            logger.error(f"Prediction Error: {e}")
             return 0.5
 
 class Backtester:
@@ -93,109 +57,140 @@ class Backtester:
         self.config = config 
         self.symbol = config.get('symbol')
         self.timeframe = config.get('timeframe')
-        
         self.start_str = config.get('startDate')
         self.end_str = config.get('endDate')
-        
-        self.start_date = pd.to_datetime(self.start_str).tz_localize(None) if self.start_str else None
-        self.end_date = pd.to_datetime(self.end_str).tz_localize(None) if self.end_str else None
-
         self.params = config.get('params', {})
         self.initial_balance = float(config.get('initialBalance', 1000))
         self.combination_rule = config.get('combinationRule', 'OR').upper()
 
-        # 🟢 FIX: Extract these so self.tp_pct, etc. exist for the run loop
         p = self.params
         self.tp_pct = float(p.get('take_profit', 0.13))
         self.sl_pct = float(p.get('stop_loss', 0.086))
         self.ts_pct = float(p.get('trailing_stop', 0.086))
-
-        if 'trade_direction' not in self.params:
-            self.params['trade_direction'] = 'BOTH'
         
         self.strategies = config.get('strategies', [])
-        if not self.strategies and config.get('code'):
-            self.strategies = [{"code": config.get('code'), "params": self.params}]
-
-        # Risk Multiplier logic
         raw_risk = config.get('risk_percentage', 1.0)
         self.risk_mult = float(raw_risk) / 100.0
-        if self.risk_mult > 1.0: 
-            self.risk_mult = 1.0
         
-        # AI Gate Parameters
         self.ml_limit_long = float(config.get('mlThresholdLong', 0.80))
-        self.ml_limit_short = float(config.get('mlThresholdShort', 0.90))
+        self.ml_limit_short = float(config.get('mlThresholdShort', 0.80))
         self.model_name = config.get('mlModel', 'stacking')
 
-    
+    def calculate_indicators(self, df):
+        if len(df) < 50: return df 
+        
+        # Core Indicators
+        df['sma_50'] = ta.sma(df['close'], length=50)
+        df['sma_200'] = ta.sma(df['close'], length=200)
+        df['rsi'] = ta.rsi(df['close'], length=14)
+        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        df['ema_9'] = ta.ema(df['close'], length=9)
+        df['ema_21'] = ta.ema(df['close'], length=21)
+        df['ema_20'] = ta.ema(df['close'], length=20)
+        
+        # ADX (Naming for AI parity)
+        adx = ta.adx(df['high'], df['low'], df['close'], length=14)
+        if adx is not None: df['adx'] = adx['ADX_14']
+            
+        # Bollinger (Naming for AI parity)
+        bb = ta.bbands(df['close'], length=20, std=2)
+        if bb is not None:
+            df['BBL_20_2.0_2.0'] = bb['BBL_20_2.0']
+            df['BBU_20_2.0_2.0'] = bb['BBU_20_2.0']
+
+        # Supertrend (Naming for AI parity)
+        st = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3)
+        if st is not None: df['st_trend'] = st['SUPERTd_10_3.0']
+
+        # Stochastic & MACD
+        stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3)
+        if stoch is not None: df = pd.concat([df, stoch], axis=1)
+        macd = ta.macd(df['close'])
+        if macd is not None: df = pd.concat([df, macd], axis=1)
+
+        # Price Action
+        df['pa_high'] = df['high'].rolling(window=20).max()
+        df['pa_low'] = df['low'].rolling(window=20).min()
+        df['vol_ma'] = ta.sma(df['volume'], length=20)
+
+        return df.fillna(0)
 
 
     def get_signal(self, row, strategies):
         """ Calculates the combined 'Vote' of all active strategies """
         votes = 0
+        
         for strat in strategies:
             code = strat.get('code')
             p = strat.get('params', {})
             
-            # 1. RSI Threshold
-            if code == "rsi_threshold":
+            # 1. Stochastic
+            if code == "stoch":
+                k_val = row.get('STOCHk_14_3_3', 50)
+                if k_val < 20: votes += 1
+                elif k_val > 80: votes -= 1
+            
+            # 2. Bollinger Fade
+            elif code in ["bb_fade", "bollinger_bands"]:
+                # Matches the model naming convention we set in calculate_indicators
+                if row['close'] < row.get('BBL_20_2.0_2.0', 0): votes += 1
+                elif row['close'] > row.get('BBU_20_2.0_2.0', 999999): votes -= 1
+
+            # 3. RSI Threshold
+            elif code == "rsi_threshold":
                 rsi = row.get('rsi', 50)
                 if rsi < p.get('oversold', 30): votes += 1
                 elif rsi > p.get('overbought', 70): votes -= 1
-            
-            # 2. Bollinger Fade
-            elif code == "bb_fade" or code == "bollinger_bands":
-                if row['close'] < row.get('BBL_20_2.0', 0): votes += 1
-                elif row['close'] > row.get('BBU_20_2.0', 999999): votes -= 1
 
-            # 3. SMA Crossover
+            # 4. SMA Crossover
             elif code == "sma_crossover":
-                if row.get('sma_50', 0) > row.get('sma_200', 0): votes += 1
-                elif row.get('sma_50', 0) < row.get('sma_200', 0): votes -= 1
-
-            # 4. MACD Crossover
-            elif code == "macd_crossover":
-                if row.get('MACD_12_26_9', 0) > row.get('MACDs_12_26_9', 0): votes += 1
-                else: votes -= 1
+                if row.get('sma_50', 0) > row.get('sma_200', 0) and row.get('sma_200', 0) > 0:
+                    votes += 1
+                elif row.get('sma_50', 0) < row.get('sma_200', 0) and row.get('sma_200', 0) > 0:
+                    votes -= 1
 
             # 5. Supertrend
             elif code == "supertrend":
-                if row.get('SUPERTd_7_3.0', 0) == 1: votes += 1
+                # SUPERTd indicates direction: 1 for Up, -1 for Down
+                if row.get('st_trend', 0) == 1: votes += 1
+                elif row.get('st_trend', 0) == -1: votes -= 1
+
+            # 6. MACD Crossover
+            elif code == "macd_crossover":
+                # MACD_12_26_9 > MACDs_12_26_9 (Signal line)
+                if row.get('MACD_12_26_9', 0) > row.get('MACDs_12_26_9', 0): votes += 1
                 else: votes -= 1
 
-            # 6. ATR Breakout
+            # 7. ATR Breakout
             elif code == "atr_breakout":
-                target = row.get('ema_20', 0) + (row.get('atr', 0) * p.get('multiplier', 1.5))
-                if row['close'] > target: votes += 1
-                elif row['close'] < (row.get('ema_20', 0) - (row.get('atr', 0) * p.get('multiplier', 1.5))): votes -= 1
-
-            # 7. Stochastic
-            elif code == "stoch":
-                if row.get('STOCHk_14_3_3', 50) < 20: votes += 1
-                elif row.get('STOCHk_14_3_3', 50) > 80: votes -= 1
+                upper = row.get('ema_20', 0) + (row.get('atr', 0) * p.get('multiplier', 1.5))
+                lower = row.get('ema_20', 0) - (row.get('atr', 0) * p.get('multiplier', 1.5))
+                if row['close'] > upper: votes += 1
+                elif row['close'] < lower: votes -= 1
 
             # 8. EMA Cloud
             elif code == "ema_cloud":
                 if row.get('ema_9', 0) > row.get('ema_21', 0): votes += 1
                 else: votes -= 1
 
-            # 9. Price Action Breakout (20-period high/low)
+            # 9. Price Action Breakout
             elif code == "pa_breakout":
                 if row['close'] >= row.get('pa_high', 999999): votes += 1
                 elif row['close'] <= row.get('pa_low', 0): votes -= 1
 
-            # 10. Volume Profile (Volume Surge)
+            # 10. Volume Surge
             elif code == "vol_profile":
                 if row.get('volume', 0) > (row.get('vol_ma', 0) * p.get('threshold', 1.5)):
                     votes += (1 if row['close'] > row.get('sma_50', 0) else -1)
 
-        # Combination Logic
+        # --- APPLY COMBINATION RULE ---
         if self.combination_rule == "AND":
+            # Requires absolute consensus
             if votes >= len(strategies): return 1
             if votes <= -len(strategies): return -1
             return 0
-        else: # OR Logic
+        else: 
+            # OR Logic: Triggers if the net vote is positive/negative
             if votes > 0: return 1
             if votes < 0: return -1
             return 0
@@ -232,40 +227,6 @@ class Backtester:
 
     
 
-    def calculate_indicators(self, df):
-        if len(df) < 10: return df 
-        
-        # 1. Trend & Moving Averages
-        df['sma_50'] = ta.sma(df['close'], length=50)
-        df['sma_200'] = ta.sma(df['close'], length=200)
-        df['ema_9'] = ta.ema(df['close'], length=9)
-        df['ema_21'] = ta.ema(df['close'], length=21)
-        df['ema_20'] = ta.ema(df['close'], length=20)
-        
-        # 2. Oscillators
-        df['rsi'] = ta.rsi(df['close'], length=14)
-        stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3, smooth_k=3)
-        if stoch is not None: df = pd.concat([df, stoch], axis=1)
-        
-        macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
-        if macd is not None: df = pd.concat([df, macd], axis=1)
-        
-        # 3. Volatility & Channels
-        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-        bb = ta.bbands(df['close'], length=20, std=2)
-        if bb is not None: df = pd.concat([df, bb], axis=1)
-        
-        # 4. Trend Following
-        st = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3)
-        if st is not None: df = pd.concat([df, st], axis=1)
-        
-        # 5. Price Action & Volume
-        df['pa_high'] = df['high'].rolling(window=20).max()
-        df['pa_low'] = df['low'].rolling(window=20).min()
-        df['vol_ma'] = ta.sma(df['volume'], length=20)
-
-        # 🎯 KEEP ALL DATA: Fill missing early values with 0
-        return df.fillna(0)
 
     async def run(self):
         try:

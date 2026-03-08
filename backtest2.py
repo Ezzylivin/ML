@@ -248,7 +248,7 @@ class Backtester:
         if bb is not None:
             df = pd.concat([df, bb], axis=1)
             
-        return df.dropna(0)
+        return df.dropna()
 
     async def run(self):
         try:
@@ -335,9 +335,12 @@ class Backtester:
                 "status": "success",
                 "metrics": {
                     "finalBalance": round(balance, 2),
+                    "final_balance": round(balance, 2), # 🟢 Add for Frontend
                     "roi": round(((balance - self.initial_balance) / self.initial_balance) * 100, 2),
                     "totalTrades": len(trades),
-                    "netProfit": round(balance - self.initial_balance, 2)
+                    "total_trades": len(trades),         # 🟢 Fixes the 'undefined' error
+                    "netProfit": round(balance - self.initial_balance, 2),
+                    "net_profit": round(balance - self.initial_balance, 2)
                 },
                 "candleData": df.reset_index().rename(columns={'index': 'time'}).to_dict('records'),
                 "trades": trades,

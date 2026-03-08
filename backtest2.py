@@ -105,7 +105,7 @@ class Backtester:
             self.strategies = [{"code": config.get('code'), "params": self.params}]
 
         # Risk Multiplier logic
-        raw_risk = config.get('risk_percentage', 100) 
+        raw_risk = config.get('risk_percentage', 1.0)
         self.risk_mult = float(raw_risk) / 100.0
         if self.risk_mult > 1.0: 
             self.risk_mult = 1.0
@@ -189,6 +189,9 @@ class Backtester:
             
 
     async def load_data(self):
+        from datetime import timedelta
+    
+        fetch_start = (pd.to_datetime(self.start_str) - timedelta(days=10)).strftime('%Y-%m-%d')
         """
         Refreshes data from US-based exchanges if local file is missing or outdated.
         """
@@ -219,30 +222,37 @@ class Backtester:
     def calculate_indicators(self, df):
         if len(df) < 10: return df 
         
-        # --- MATCHING YOUR TRAINING LOGIC ---
+        # 1. Trend & Moving Averages
         df['sma_50'] = ta.sma(df['close'], length=50)
         df['sma_200'] = ta.sma(df['close'], length=200)
+        df['ema_9'] = ta.ema(df['close'], length=9)
+        df['ema_21'] = ta.ema(df['close'], length=21)
+        df['ema_20'] = ta.ema(df['close'], length=20)
         
-        st = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3)
-        if st is not None:
-            df['st_trend'] = st.iloc[:, 1]
-        else:
-            df['st_trend'] = 0
-
+        # 2. Oscillators
         df['rsi'] = ta.rsi(df['close'], length=14)
-        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3, smooth_k=3)
+        if stoch is not None: df = pd.concat([df, stoch], axis=1)
         
-        adx = ta.adx(df['high'], df['low'], df['close'], length=14)
-        if adx is not None:
-            df['adx'] = adx.iloc[:, 0]
-        else:
-            df['adx'] = 0
-            
+        macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
+        if macd is not None: df = pd.concat([df, macd], axis=1)
+        
+        # 3. Volatility & Channels
+        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
         bb = ta.bbands(df['close'], length=20, std=2)
-        if bb is not None:
-            df = pd.concat([df, bb], axis=1)
-            
-        return df.dropna()
+        if bb is not None: df = pd.concat([df, bb], axis=1)
+        
+        # 4. Trend Following
+        st = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3)
+        if st is not None: df = pd.concat([df, st], axis=1)
+        
+        # 5. Price Action & Volume
+        df['pa_high'] = df['high'].rolling(window=20).max()
+        df['pa_low'] = df['low'].rolling(window=20).min()
+        df['vol_ma'] = ta.sma(df['volume'], length=20)
+
+        # 🎯 KEEP ALL DATA: Fill missing early values with 0
+        return df.fillna(0)
 
     async def run(self):
         try:

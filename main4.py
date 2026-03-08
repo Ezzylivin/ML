@@ -1428,6 +1428,8 @@ async def run_combo_backtest(req: ComboRequest):
     try:
         # 1. Convert Pydantic model to a raw dictionary
         config = req.dict()
+
+        logger.info(f"UI THRESHOLD RECEIVED: {req.mlThresholdLong}")
         
         # 2. Import the Class from your file
         from app.backtest2 import Backtester

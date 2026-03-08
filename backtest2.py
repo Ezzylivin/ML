@@ -93,8 +93,13 @@ class Backtester:
         if adx is not None: df['adx'] = adx['ADX_14']
             
         # Bollinger (Naming for AI parity)
+        # Inside calculate_indicators in backtest2.py
         bb = ta.bbands(df['close'], length=20, std=2)
         if bb is not None:
+            # Standard names for Strategy Logic
+            df['BBL_20_2.0'] = bb['BBL_20_2.0']
+            df['BBU_20_2.0'] = bb['BBU_20_2.0']
+            # Extra naming for AI Model Parity
             df['BBL_20_2.0_2.0'] = bb['BBL_20_2.0']
             df['BBU_20_2.0_2.0'] = bb['BBU_20_2.0']
 
@@ -131,10 +136,10 @@ class Backtester:
                 elif k_val > 80: votes -= 1
             
             # 2. Bollinger Fade
-            elif code in ["bb_fade", "bollinger_bands"]:
-                # Matches the model naming convention we set in calculate_indicators
-                if row['close'] < row.get('BBL_20_2.0_2.0', 0): votes += 1
-                elif row['close'] > row.get('BBU_20_2.0_2.0', 999999): votes -= 1
+            if row['close'] < row.get('BBL_20_2.0_2.0', 0): 
+                votes += 1
+            elif row['close'] > row.get('BBU_20_2.0_2.0', 999999): 
+                votes -= 1
 
             # 3. RSI Threshold
             elif code == "rsi_threshold":

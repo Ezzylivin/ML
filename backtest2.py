@@ -68,7 +68,7 @@ class RawModelAdapter:
             # Predict
             if hasattr(self.model, "predict_proba"):
                 probs = self.model.predict_proba(X)[0]
-                print(f"DEBUG: AI Probabilities: {probs}")
+                logger.info(f"🤖 NEURAL GATE DEBUG | Probs: {probs} | Features: {self.feature_names}")
                 if len(probs) == 3:
                     return probs[2]
                 else:

@@ -23,56 +23,53 @@ class RawModelAdapter:
         try:
             last_row = df.iloc[[-1]].copy()
 
-            # 🟢 AUTO-FIX: Map Backtester columns to Model columns
-            # The model might want "BBL_20_2.0_2.0" but we have "BBL_20_2.0"
+            # 1. Prepare Features
             if self.feature_names:
-                # 1. Identify what we have
+                # Handle Fuzzy Matching for Bollinger Bands
                 available_cols = list(last_row.columns)
-                
-                # 2. Identify what is missing
                 missing = [f for f in self.feature_names if f not in available_cols]
                 
-                # 3. Try to fuzzy match the missing ones
                 if missing:
-                    # Find our BBL/BBU columns
                     our_bbl = next((c for c in available_cols if c.startswith("BBL")), None)
                     our_bbu = next((c for c in available_cols if c.startswith("BBU")), None)
-                    
-                    # Find model's BBL/BBU requirements
                     model_bbl = next((f for f in missing if f.startswith("BBL")), None)
                     model_bbu = next((f for f in missing if f.startswith("BBU")), None)
 
-                    # Rename if found
-                    if our_bbl and model_bbl:
-                        last_row.rename(columns={our_bbl: model_bbl}, inplace=True)
-                    if our_bbu and model_bbu:
-                        last_row.rename(columns={our_bbu: model_bbu}, inplace=True)
+                    if our_bbl and model_bbl: last_row.rename(columns={our_bbl: model_bbl}, inplace=True)
+                    if our_bbu and model_bbu: last_row.rename(columns={our_bbu: model_bbu}, inplace=True)
 
-                # 4. Check again
-                # If still missing, we really can't proceed
+                # Final check for missing features
                 final_missing = [f for f in self.feature_names if f not in last_row.columns]
                 if final_missing:
-                    # print(f"❌ Still missing: {final_missing}") # Debug line
+                    logger.warning(f"⚠️ AI Skipping: Missing features {final_missing}")
                     return 0.5 
                 
-            X = last_row[self.feature_names]
-        
+                X = last_row[self.feature_names]
+            else:
+                # 🎯 FALLBACK: If feature_names are missing, drop non-numeric columns and hope for the best
+                X = last_row.select_dtypes(include=[np.number])
 
-            # Scale
-            if self.scaler:
+            # 2. Scale
+            if self.scaler and not X.empty:
                 X = self.scaler.transform(X)
 
-            # Predict
+            # 3. Predict with Probability Extraction
             if hasattr(self.model, "predict_proba"):
                 probs = self.model.predict_proba(X)[0]
+                
+                # 🕵️‍♂️ THIS IS THE CRITICAL LOG: Check your terminal for this!
                 logger.info(f"🤖 AI RAW PROBS: {probs}")
+                
                 if len(probs) == 3:
-                    return float(probs[2])
-                elif len(probs) == 2:
-                    # Class 0: Down, Class 1: Up
-                    return float(probs[1])
-            else:
-                return float(self.model.predict(X)[0])
+                    return float(probs[2]) # Probability of UP
+                return float(probs[1])     # Probability of UP (Binary)
+            
+            # 🎯 If model only gives 0 or 1, return it as 0.0 or 1.0
+            return float(self.model.predict(X)[0])
+                
+        except Exception as e:
+            logger.error(f"❌ AI Prediction Crash: {e}")
+            return 0.5
                 
         except Exception as e:
             logger.error(f"Prediction Error: {e}")

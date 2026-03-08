@@ -223,7 +223,7 @@ class Backtester:
     
 
     def calculate_indicators(self, df):
-        if len(df) < 50: return df 
+        if len(df) < 10: return df 
         
         # --- MATCHING YOUR TRAINING LOGIC ---
         df['sma_50'] = ta.sma(df['close'], length=50)
@@ -248,7 +248,7 @@ class Backtester:
         if bb is not None:
             df = pd.concat([df, bb], axis=1)
             
-        return df.dropna()
+        return df.dropna(0)
 
     async def run(self):
         try:
@@ -271,7 +271,9 @@ class Backtester:
 
                 # 1. AI Neural Gate
                 gate_passed, conf_score = True, 1.0
-                is_short_trend = row['close'] < row.get('sma_200', row['close'])
+                is_short_trend = False
+                if 'sma_200' in row and row['sma_200'] > 0:
+                    is_short_trend = row['close'] < row['sma_200']
                 limit = self.ml_limit_short if is_short_trend else self.ml_limit_long
 
                 if ml_model:

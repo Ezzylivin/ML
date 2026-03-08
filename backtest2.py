@@ -82,41 +82,40 @@ class RawModelAdapter:
 
 class Backtester:
     def __init__(self, config: dict):
-        self.config = config # Keep original for reference
+        self.config = config 
         self.symbol = config.get('symbol')
         self.timeframe = config.get('timeframe')
         
-        # 🟢 Use the exact keys from your Pydantic model
         self.start_str = config.get('startDate')
         self.end_str = config.get('endDate')
         
-        # Convert for internal logic
         self.start_date = pd.to_datetime(self.start_str).tz_localize(None) if self.start_str else None
         self.end_date = pd.to_datetime(self.end_str).tz_localize(None) if self.end_str else None
 
         self.params = config.get('params', {})
-        
         self.initial_balance = float(config.get('initialBalance', 1000))
-        self.model_name = config.get('mlModel')
         self.combination_rule = config.get('combinationRule', 'OR').upper()
+
+        # 🟢 FIX: Extract these so self.tp_pct, etc. exist for the run loop
+        p = self.params
+        self.tp_pct = float(p.get('take_profit', 0.13))
+        self.sl_pct = float(p.get('stop_loss', 0.086))
+        self.ts_pct = float(p.get('trailing_stop', 0.086))
 
         if 'trade_direction' not in self.params:
             self.params['trade_direction'] = 'BOTH'
         
         self.strategies = config.get('strategies', [])
         if not self.strategies and config.get('code'):
-            self.strategies = [{"code": config.get('code'), "params": config.get('params', {})}]
+            self.strategies = [{"code": config.get('code'), "params": self.params}]
 
-        # 🟢 Risk Parameters (Synced with fix_pct)
-        p = config.get('params', {})
-        self.params = p
-        
-        raw_risk = config.get('risk_percentage', 100) # Default to 100 if missing
+        # Risk Multiplier logic
+        raw_risk = config.get('risk_percentage', 100) 
         self.risk_mult = float(raw_risk) / 100.0
-
         if self.risk_mult > 1.0: 
             self.risk_mult = 1.0
         
+        # AI Gate Parameters
         self.ml_limit_long = float(config.get('mlThresholdLong', 0.80))
         self.ml_limit_short = float(config.get('mlThresholdShort', 0.90))
         self.model_name = config.get('mlModel', 'stacking')

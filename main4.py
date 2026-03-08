@@ -156,6 +156,8 @@ class ComboRequest(BaseModel):
     take_profit: Optional[float] = 0.06
     stop_loss: Optional[float] = 0.03
     trailing_stop: Optional[float] = 0.02
+    mlThresholdLong: Optional[float] = 0.50
+    mlThresholdShort: Optional[float] = 0.50
     mlMode: Optional[str] = None 
     advanced_filters: Optional[Dict] = {}
     params: Optional[Dict[str, Any]] = {}
@@ -1273,239 +1275,56 @@ async def close_position(data: BotClosePositionRequest):
 
 @app.post('/api/backtest/run')
 async def run_backtest(request: BacktestRequest):
-    
     try:
         config = request.dict()
 
-        
-        df = await ensure_full_data(
-            config['symbol'], 
-            config['timeframe'], 
-            config['startDate'], 
-            config['endDate']
-        )
-
-        
+        # 1. Standardize percentages (matches your engine logic)
         p_dict = config.get('params', {})
         def fix_pct(val, default):
             if val is None: return default
             return val / 100 if val > 1.0 else val
 
-        tp = fix_pct(p_dict.get('take_profit'), 0.06)
-        sl = fix_pct(p_dict.get('stop_loss'), 0.03)
-        ts = fix_pct(p_dict.get('trailing_stop'), 0.02)
+        config['params']['take_profit'] = fix_pct(p_dict.get('take_profit'), 0.13)
+        config['params']['stop_loss'] = fix_pct(p_dict.get('stop_loss'), 0.086)
+        config['params']['trailing_stop'] = fix_pct(p_dict.get('trailing_stop'), 0.086)
         
-        config['params']['take_profit'] = tp
-        config['params']['stop_loss'] = sl
-        config['params']['trailing_stop'] = ts
-        
-        logger.info(f"🛡️ Atomic Risk Corrected: TP={tp}, SL={sl}, TS={ts}")
+        logger.info(f"🛡️ Atomic Request: {config.get('code')} on {config['symbol']}")
+
+        # 2. Call the Unified Engine (backtest2.py)
+        # This automatically handles ML Vetoes, Intra-candle exits, and Ledger AI scores
+        from app.backtest2 import Backtester
         bot = Backtester(config)
         result = await bot.run()
 
-        # 🟢 STEP 1: Ensure candleData is present
-        if not result.get('candleData'):
-            # Use the 'df' we already fetched with ensure_full_data earlier!
-            # No need to call load_data_robust again.
-            chart_df = df.reset_index()
-            # Ensure column names match what the frontend chart expects
-            chart_df = chart_df.rename(columns={'timestamp': 'time'}) 
-            chart_df['time'] = chart_df['time'].astype(str)
-            result['candleData'] = chart_df[['time', 'open', 'high', 'low', 'close']].to_dict('records')
-
-        # 🟢 STEP 2: Force the "Correct" structure for Node.js Middleware
-        # Node.js is looking for these EXACT keys.
-        final_response = {
-            "status": "success",
-            "metrics": result.get('metrics', {
-                "final_balance": result.get('final_balance', config['initialBalance']),
-                "total_trades": len(result.get('trades', []))
-            }),
-            "candleData": result.get('candleData', []),
-            "trades": result.get('trades', []),
-            "equityCurve": result.get('equity_curve', result.get('equityCurve', [])),
-            "initialBalance": config.get('initialBalance', 1000)
-        }
-
-        return JSONResponse(content=final_response)
+        # 3. Return EVERYTHING 
+        # Don't manually build 'final_response'—just return the result dictionary
+        # This ensures 'vetoed_signals' and 'ai_score' are included.
+        return result
 
     except Exception as e:
-        logger.error(f"Atomic API Error: {e}")
-        # Return a structured error so Node.js doesn't crash on the catch block either
+        logger.error(f"❌ Atomic API Error: {e}")
+        import traceback
+        traceback.print_exc()
         return JSONResponse(
             status_code=500,
-            content={"status": "failed", "message": str(e)}
+            content={"status": "failed", "error": str(e)}
         )
         
-        if 'candleData' not in result or not result['candleData']:
-            df = load_data_robust(config['symbol'], config['timeframe'])
-            if df is not None:
-                try:
-                    df = df.loc[config['startDate']:config['endDate']]
-                except: pass
-                chart_df = df.reset_index()[['timestamp', 'open', 'high', 'low', 'close']].copy()
-                chart_df['timestamp'] = chart_df['timestamp'].astype(str)
-                result['candleData'] = chart_df.to_dict('records')
-                result['initialBalance'] = config['initialBalance']
-        
-        return JSONResponse(content=result)
-    except Exception as e:
-        logger.error(f"Atomic API Error: {e}")
-        return JSONResponse(content={"status": "failed", "error": str(e)}, status_code=500)
-
 @app.post('/api/backtest/combo')
 async def run_combo_backtest(req: ComboRequest):
-    
     try:
-        logger.info(f"🔥 COMBO Request: {len(req.strategies)} strategies on {req.symbol}")
-
+        # 1. Convert the incoming request to a dictionary
         config = req.dict()
         
-        df = await ensure_full_data(
-            req.symbol, 
-            req.timeframe, 
-            req.startDate, 
-            req.endDate
-        )
-
+        # 2. Initialize your specialized Engine
+        from app.backtest2 import Backtester
+        tester = Backtester(config)
         
-        if df is None: raise HTTPException(status_code=404, detail=f"Data file not found for {req.symbol}")
-        try:
-            df = df.loc[req.startDate:req.endDate]
-            if df.empty: raise Exception("No data in date range")
-        except: pass
-
-        logger.info(f"🔥 COMBO Request: {len(req.strategies)} strategies on {req.symbol}")
-
-        signals_list = []
-        for strat in req.strategies:
-            sig_series = calculate_strategy_signal(df, strat.code, strat.params)
-            signals_list.append(sig_series)
+        # 3. Run the engine (This uses the AI, Vetoes, and TSL logic)
+        result = await tester.run()
         
-        if not signals_list: return {"status": "error", "message": "No strategies executed"}
-
-        sig_df = pd.concat(signals_list, axis=1).fillna(0)
-        vote_sum = sig_df.sum(axis=1)
-        final_signal = pd.Series(0, index=df.index)
-        
-        if req.combinationRule == "AND": 
-            n = len(req.strategies)
-            final_signal[vote_sum == n] = 1
-            final_signal[vote_sum == -n] = -1
-        else: 
-            final_signal[vote_sum > 0] = 1
-            final_signal[vote_sum < 0] = -1
-
-        balance = req.initialBalance
-        position = 0
-        entry_price = 0.0
-        best_price = 0.0
-        equity_curve = []
-        trades_log = []
-        prices = df['close'].values
-        highs = df['high'].values
-        lows = df['low'].values
-        times = df.index
-        sigs = final_signal.values
-        comm = 0.0006 
-        
-        p_dict = req.params or {}
-        raw_tp = p_dict.get('take_profit', req.take_profit)
-        raw_sl = p_dict.get('stop_loss', req.stop_loss)
-        raw_ts = p_dict.get('trailing_stop', req.trailing_stop)
-        
-        raw_tp = raw_tp if raw_tp is not None else 0.06
-        raw_sl = raw_sl if raw_sl is not None else 0.03
-        raw_ts = raw_ts if raw_ts is not None else 0.0
-        
-        tp_pct = raw_tp / 100 if raw_tp > 1.0 else raw_tp
-        sl_pct = raw_sl / 100 if raw_sl > 1.0 else raw_sl
-        ts_pct = raw_ts / 100 if raw_ts > 1.0 else raw_ts
-
-        logger.info(f"🛡️ Combo Risk Loaded: TP={tp_pct}, SL={sl_pct}, TS={ts_pct}")
-        
-        for i in range(1, len(prices)):
-            price = prices[i]
-            high = highs[i]
-            low = lows[i]
-            date = str(times[i])
-            signal = sigs[i-1] 
-            
-            if position == 1: # LONG
-                if high > best_price: best_price = high
-                stop_price = entry_price * (1 - sl_pct)
-                take_price = entry_price * (1 + tp_pct)
-                trail_price = best_price * (1 - ts_pct) if ts_pct > 0 else 0
-                exit_reason = None
-                exit_p = price
-                
-                if low <= stop_price: exit_reason = "SL"; exit_p = stop_price
-                elif ts_pct > 0 and low <= trail_price: exit_reason = "Trail"; exit_p = trail_price
-                elif high >= take_price: exit_reason = "TP"; exit_p = take_price
-                
-                if exit_reason:
-                    pnl_pct = (exit_p - entry_price) / entry_price
-                    balance *= (1 + pnl_pct - comm)
-                    trades_log.append({"type": "close_long", "price": exit_p, "time": date, "balance": balance, "reason": exit_reason})
-                    position = 0
-
-            elif position == -1: # SHORT
-                if low < best_price: best_price = low
-                stop_price = entry_price * (1 + sl_pct)
-                take_price = entry_price * (1 - tp_pct)
-                trail_price = best_price * (1 + ts_pct) if ts_pct > 0 else 9999999
-                exit_reason = None
-                exit_p = price
-                
-                if high >= stop_price: exit_reason = "SL"; exit_p = stop_price
-                elif ts_pct > 0 and high >= trail_price: exit_reason = "Trail"; exit_p = trail_price
-                elif low <= take_price: exit_reason = "TP"; exit_p = take_price
-                    
-                if exit_reason:
-                    pnl_pct = (entry_price - exit_p) / entry_price
-                    balance *= (1 + pnl_pct - comm)
-                    trades_log.append({"type": "close_short", "price": exit_p, "time": date, "balance": balance, "reason": exit_reason})
-                    position = 0
-            
-            if position == 0:
-                if signal == 1:
-                    position = 1; entry_price = price; best_price = price; balance *= (1 - comm)
-                    trades_log.append({"type": "buy", "price": price, "time": date})
-                elif signal == -1:
-                    position = -1; entry_price = price; best_price = price; balance *= (1 - comm)
-                    trades_log.append({"type": "sell", "price": price, "time": date})
-            
-            elif position == 1 and signal == -1:
-                pnl_pct = (price - entry_price) / entry_price
-                balance *= (1 + pnl_pct - comm)
-                trades_log.append({"type": "flip_to_short", "price": price, "time": date, "balance": balance, "reason": "Signal Flip"})
-                position = -1; entry_price = price; best_price = price; balance *= (1 - comm)
-                
-            elif position == -1 and signal == 1:
-                pnl_pct = (entry_price - price) / entry_price
-                balance *= (1 + pnl_pct - comm)
-                trades_log.append({"type": "flip_to_long", "price": price, "time": date, "balance": balance, "reason": "Signal Flip"})
-                position = 1; entry_price = price; best_price = price; balance *= (1 - comm)
-
-            equity_curve.append({"time": date, "balance": balance})
-
-        roi = ((balance - req.initialBalance) / req.initialBalance) * 100
-        chart_df = df.reset_index()[['timestamp', 'open', 'high', 'low', 'close']].copy()
-        chart_df.rename(columns={'timestamp': 'time'}, inplace=True)
-        chart_df['time'] = chart_df['time'].astype(str)
-
-        return {
-            "status": "success",
-            "metrics": {
-                "finalBalance": round(balance, 2), 
-                "roi": round(((balance - req.initialBalance) / req.initialBalance) * 100, 2), 
-                "totalTrades": len(trades_log)
-            },
-            "equityCurve": equity_curve,
-            "trades": trades_log,
-            "candleData": chart_df.to_dict('records'),
-            "initialBalance": req.initialBalance
-        }
+        # 4. Return the complete result (including vetoed_signals)
+        return result
 
     except Exception as e:
         logger.error(f"Combo API Error: {e}")

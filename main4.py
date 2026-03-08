@@ -156,6 +156,7 @@ class ComboRequest(BaseModel):
     take_profit: Optional[float] = 0.06
     stop_loss: Optional[float] = 0.03
     trailing_stop: Optional[float] = 0.02
+    mlModel: Optional[str] = None
     mlThresholdLong: Optional[float] = 0.50
     mlThresholdShort: Optional[float] = 0.50
     mlMode: Optional[str] = None

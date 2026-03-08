@@ -158,9 +158,11 @@ class ComboRequest(BaseModel):
     trailing_stop: Optional[float] = 0.02
     mlThresholdLong: Optional[float] = 0.50
     mlThresholdShort: Optional[float] = 0.50
-    mlMode: Optional[str] = None 
+    mlMode: Optional[str] = None
     advanced_filters: Optional[Dict] = {}
     params: Optional[Dict[str, Any]] = {}
+
+ComboRequest.model_rebuild()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1313,19 +1315,143 @@ async def run_backtest(request: BacktestRequest):
 @app.post('/api/backtest/combo')
 async def run_combo_backtest(req: ComboRequest):
     try:
-        # 1. Convert the incoming request to a dictionary
-        config = req.dict()
-        
-        # 2. Initialize your specialized Engine
-        from app.backtest2 import Backtester
-        tester = Backtester(config)
-        
-        # 3. Run the engine (This uses the AI, Vetoes, and TSL logic)
-        result = await tester.run()
-        
-        # 4. Return the complete result (including vetoed_signals)
-        return result
+        logger.info(f"🚀 Unified AI Combo: {req.symbol} | {len(req.strategies)} Strats")
 
+        # 1. Fetch and Prepare Data
+        df = await ensure_full_data(req.symbol, req.timeframe, req.startDate, req.endDate)
+        if df is None or df.empty: 
+            raise HTTPException(status_code=400, detail="Data gap detected.")
+
+        # 2. Pre-calculate All Indicators (Required for the 10-Strategy Pool)
+        df['sma_50'] = ta.sma(df['close'], 50)
+        df['sma_200'] = ta.sma(df['close'], 200)
+        df['rsi'] = ta.rsi(df['close'], 14)
+        df['atr'] = ta.atr(df['high'], df['low'], df['close'], 14)
+        df = pd.concat([df, ta.bbands(df['close'], 20, 2), ta.macd(df['close']), ta.stoch(df['high'], df['low'], df['close'])], axis=1)
+        df = df.dropna()
+
+        # 3. Load ML Model
+        ml_model = None
+        if req.mlModel and req.mlModel != "off":
+            payload = ModelFactory.load_model(req.mlModel, req.symbol, req.timeframe)
+            if payload:
+                ml_model = RawModelAdapter(payload)
+
+        # 4. Initialization
+        balance = float(req.initialBalance)
+        risk_mult = float(req.risk_percentage) / 100.0
+        position, entry_price, tp_price, tsl_price = None, 0, 0, 0
+        
+        # Risk params from UI
+        p_dict = req.params or {}
+        tp_pct = float(p_dict.get('take_profit', 0.13))
+        sl_pct = float(p_dict.get('stop_loss', 0.086))
+        ts_pct = float(p_dict.get('trailing_stop', 0.086))
+
+        trades, equity_curve, vetoed_logs = [], [], []
+
+        # 5. The Unified Execution Loop
+        for i in range(len(df)):
+            row = df.iloc[i]
+            current_time = str(row.name)
+            
+            # Calculate strategy votes (Hybrid Ensemble)
+            votes = 0
+            for strat in req.strategies:
+                # RSI Logic
+                if strat.code == "rsi_threshold":
+                    val = row.get('rsi', 50)
+                    if val < strat.params.get('oversold', 30): votes += 1
+                    elif val > strat.params.get('overbought', 70): votes -= 1
+                # Stoch Logic
+                elif strat.code == "stoch":
+                    val = row.get('STOCHk_14_3_3', 50)
+                    if val < 20: votes += 1
+                    elif val > 80: votes -= 1
+            
+            # Final Signal Decision
+            signal = 0
+            if req.combinationRule == "AND":
+                if votes >= len(req.strategies): signal = 1
+                elif votes <= -len(req.strategies): signal = -1
+            else: # OR
+                if votes > 0: signal = 1
+                elif votes < 0: signal = -1
+
+            # AI Neural Gate Check
+            gate_passed, conf_score = True, 1.0
+            is_short_trend = row['close'] < row.get('sma_200', row['close'])
+            limit = req.mlThresholdShort if is_short_trend else req.mlThresholdLong
+            
+            if ml_model:
+                conf_score = ml_model.predict_direction(df.iloc[:i+1])
+                gate_passed = conf_score >= limit
+
+            # Record Vetoes
+            if signal != 0 and not gate_passed and position is None:
+                vetoed_logs.append({
+                    "time": current_time, "signal": "Long" if signal == 1 else "Short",
+                    "conf_score": round(conf_score, 4), "limit": round(limit, 4), "price": row['close']
+                })
+
+            # Exit Logic (Anytime Wicks)
+            if position:
+                exit_p, exit_r = None, None
+                if position == 'long':
+                    if row['high'] >= tp_price: exit_p, exit_r = tp_price, "Take Profit"
+                    elif row['low'] <= tsl_price: exit_p, exit_r = tsl_price, "Trailing Stop"
+                    elif signal == -1: exit_p, exit_r = row['close'], "Signal Flip"
+                else: # short
+                    if row['low'] <= tp_price: exit_p, exit_r = tp_price, "Take Profit"
+                    elif row['high'] >= tsl_price: exit_p, exit_r = tsl_price, "Trailing Stop"
+                    elif signal == 1: exit_p, exit_r = row['close'], "Signal Flip"
+
+                if exit_p:
+                    pnl = (exit_p - entry_price)/entry_price if position == 'long' else (entry_price - exit_p)/entry_price
+                    balance *= (1 + (pnl * risk_mult) - 0.0016)
+                    trades.append({
+                        "type": "exit", "reason": exit_r, "price": round(exit_p, 2), "time": current_time,
+                        "pnl": round(pnl * 100, 2), "balance": round(balance, 2)
+                    })
+                    position = None
+                    continue
+
+                # Update Trailing Stop
+                if position == 'long':
+                    new_tsl = row['high'] * (1 - ts_pct)
+                    if new_tsl > tsl_price: tsl_price = new_tsl
+                else:
+                    new_tsl = row['low'] * (1 + ts_pct)
+                    if new_tsl < tsl_price: tsl_price = new_tsl
+
+            # Entry Logic
+            if position is None and gate_passed and signal != 0:
+                position = 'long' if signal == 1 else 'short'
+                entry_price = row['close']
+                tp_price = entry_price * (1 + tp_pct) if position == 'long' else entry_price * (1 - tp_pct)
+                tsl_price = entry_price * (1 - ts_pct) if position == 'long' else entry_price * (1 + ts_pct)
+                balance *= (1 - 0.0006)
+                trades.append({
+                    "type": "buy" if position == 'long' else "sell", "price": entry_price, 
+                    "time": current_time, "ai_score": round(conf_score, 4), "gate_limit": round(limit, 4)
+                })
+
+            equity_curve.append({"time": current_time, "balance": round(balance, 2)})
+
+        return {
+            "status": "success",
+            "metrics": {
+                "finalBalance": round(balance, 2),
+                "roi": round(((balance - req.initialBalance) / req.initialBalance) * 100, 2),
+                "totalTrades": len(trades),
+                "netProfit": round(balance - req.initialBalance, 2)
+            },
+            "candleData": df.reset_index().rename(columns={'index': 'time'}).to_dict('records'),
+            "trades": trades,
+            "equityCurve": equity_curve,
+            "vetoed_signals": vetoed_logs,
+            "initialBalance": req.initialBalance
+        }
     except Exception as e:
         logger.error(f"Combo API Error: {e}")
         return JSONResponse(status_code=500, content={"status": "failed", "error": str(e)})

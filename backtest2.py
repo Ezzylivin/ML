@@ -19,30 +19,36 @@ class RawModelAdapter:
             self.feature_names = []
             self.scaler = None
 
-    def predict_direction(self, df):
-        try:
-            last_row = df.iloc[[-1]].copy()
+    def calculate_indicators(self, df):
+        if len(df) < 20: return df 
+        
+        # 1. Basic Indicators
+        df['sma_50'] = ta.sma(df['close'], length=50)
+        df['sma_200'] = ta.sma(df['close'], length=200)
+        df['rsi'] = ta.rsi(df['close'], length=14)
+        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        
+        # 2. ADX (Required by your model)
+        adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
+        if adx_df is not None:
+            # The model wants the 'ADX_14' column
+            df['adx'] = adx_df['ADX_14']
+            
+        # 3. Bollinger Bands (Match the model's naming convention)
+        bb = ta.bbands(df['close'], length=20, std=2)
+        if bb is not None:
+            # Renaming to match the exact strings in your error: BBL_20_2.0_2.0
+            df['BBL_20_2.0_2.0'] = bb['BBL_20_2.0']
+            df['BBU_20_2.0_2.0'] = bb['BBU_20_2.0']
 
-            # 1. Prepare Features
-            if self.feature_names:
-                # Handle Fuzzy Matching for Bollinger Bands
-                available_cols = list(last_row.columns)
-                missing = [f for f in self.feature_names if f not in available_cols]
-                
-                if missing:
-                    our_bbl = next((c for c in available_cols if c.startswith("BBL")), None)
-                    our_bbu = next((c for c in available_cols if c.startswith("BBU")), None)
-                    model_bbl = next((f for f in missing if f.startswith("BBL")), None)
-                    model_bbu = next((f for f in missing if f.startswith("BBU")), None)
+        # 4. Supertrend -> st_trend (Required by your model)
+        st = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3)
+        if st is not None:
+            # Renaming the direction column (SUPERTd) to 'st_trend'
+            df['st_trend'] = st['SUPERTd_10_3.0']
 
-                    if our_bbl and model_bbl: last_row.rename(columns={our_bbl: model_bbl}, inplace=True)
-                    if our_bbu and model_bbu: last_row.rename(columns={our_bbu: model_bbu}, inplace=True)
-
-                # Final check for missing features
-                final_missing = [f for f in self.feature_names if f not in last_row.columns]
-                if final_missing:
-                    logger.warning(f"⚠️ AI Skipping: Missing features {final_missing}")
-                    return 0.5 
+        # 🎯 KEEP ALL DATA: Fill missing early values with 0
+        return df.fillna(0) 
                 
                 X = last_row[self.feature_names]
             else:

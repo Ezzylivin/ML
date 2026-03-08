@@ -25,7 +25,6 @@ import aiohttp
 
 # 🟢 SOCKET HELPERS (Must be async/await)
 from app.services.socket_emitter import emit_log, emit_status
-from app.backtest2 import Backtester 
 from app.config2 import MODEL_DIR
 
 MODEL_DIR = "models"
@@ -1427,19 +1426,22 @@ async def run_backtest(request: BacktestRequest):
 @app.post('/api/backtest/combo')
 async def run_combo_backtest(req: ComboRequest):
     try:
-        # 1. Convert the validated request to a dictionary
-        config = req.model_dump() # Use model_dump() for Pydantic v2
+        # 1. Convert Pydantic model to a raw dictionary
+        config = req.dict()
         
-        # 2. Initialize the engine FROM the file
+        # 2. Import the Class from your file
+        from app.backtest2 import Backtester
+        
+        # 3. Initialize and Run
         tester = Backtester(config)
-        
-        # 3. Run the engine (This is now linked to app/backtest2.py)
         result = await tester.run()
         
+        # 4. Return the result EXACTLY as the file produced it
         return result
     except Exception as e:
-        logger.error(f"❌ Engine Link Failure: {e}")
+        logger.error(f"Link Error: {e}")
         return {"status": "failed", "error": str(e)}
+
 
 @app.get("/api/bot/status")
 async def get_status(userId: str):

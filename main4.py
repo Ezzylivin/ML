@@ -140,7 +140,7 @@ class BacktestRequest(BaseModel):
     mlModel: str = "stacking"
     trend_strategy: Optional[str] = "atr_breakout"
     range_strategy: Optional[str] = "bollinger_reversal"
-    ml_confidence_threshold: Optional[float] = 0.10
+    ml_confidence_threshold: float
     trade_direction: Optional[str] = "BOTH"
     params: Optional[Dict[str, Any]] = {}
     
@@ -160,8 +160,8 @@ class ComboRequest(BaseModel):
     stop_loss: Optional[float] = 0.03
     trailing_stop: Optional[float] = 0.02
     mlModel: Optional[str] = None
-    mlThresholdLong: Optional[float] = 0.50
-    mlThresholdShort: Optional[float] = 0.50
+    mlThresholdLong: float  # Remove the = 0.50 to force it to be required
+    mlThresholdShort: float
     mlMode: Optional[str] = None
     advanced_filters: Optional[Dict] = {}
     params: Optional[Dict[str, Any]] = {}

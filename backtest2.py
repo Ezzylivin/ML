@@ -55,11 +55,8 @@ class RawModelAdapter:
                     # print(f"❌ Still missing: {final_missing}") # Debug line
                     return 0.5 
                 
-                X = last_row[self.feature_names]
-            else:
-                # Fallback for legacy models
-                cols_to_exclude = ['datetime', 'timestamp', 'time', 'date', 'target']
-                X = last_row.drop(columns=[c for c in cols_to_exclude if c in last_row.columns], errors='ignore')
+            X = last_row[self.feature_names]
+        
 
             # Scale
             if self.scaler:
@@ -68,11 +65,12 @@ class RawModelAdapter:
             # Predict
             if hasattr(self.model, "predict_proba"):
                 probs = self.model.predict_proba(X)[0]
-                logger.info(f"🤖 NEURAL GATE DEBUG | Probs: {probs} | Features: {self.feature_names}")
+                logger.info(f"🤖 AI RAW PROBS: {probs}")
                 if len(probs) == 3:
-                    return probs[2]
-                else:
-                    return probs[1]
+                    return float(probs[2])
+                elif len(probs) == 2:
+                    # Class 0: Down, Class 1: Up
+                    return float(probs[1])
             else:
                 return float(self.model.predict(X)[0])
                 
@@ -341,7 +339,7 @@ class Backtester:
                     "netProfit": round(balance - self.initial_balance, 2),
                     "net_profit": round(balance - self.initial_balance, 2)
                 },
-                "candleData": df.reset_index().rename(columns={'index': 'time'}).to_dict('records'),
+                "candleData": df.reset_index().rename(columns={'timestamp': 'time', 'index': 'time'}).to_dict('records'),
                 "trades": trades,
                 "equityCurve": equity_curve,
                 "vetoed_signals": vetoed_logs,

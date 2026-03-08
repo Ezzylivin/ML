@@ -191,135 +191,6 @@ class Backtester:
             if votes > 0: return 1
             if votes < 0: return -1
             return 0
-
-    async def run(self):
-        try:
-            df = await self.load_data()
-            
-            # --- PRE-CALCULATE ALL INDICATORS FOR ALL 10 STRATEGIES ---
-            df['sma_50'] = ta.sma(df['close'], 50)
-            df['sma_200'] = ta.sma(df['close'], 200)
-            df['ema_9'] = ta.ema(df['close'], 9)
-            df['ema_20'] = ta.ema(df['close'], 20)
-            df['ema_21'] = ta.ema(df['close'], 21)
-            df['rsi'] = ta.rsi(df['close'], 14)
-            df['atr'] = ta.atr(df['high'], df['low'], df['close'], 14)
-            
-            # Complex Indicators
-            df = pd.concat([df, ta.bbands(df['close'], 20, 2)], axis=1)
-            df = pd.concat([df, ta.macd(df['close'])], axis=1)
-            df = pd.concat([df, ta.stoch(df['high'], df['low'], df['close'])], axis=1)
-            df = pd.concat([df, ta.supertrend(df['high'], df['low'], df['close'], 7, 3)], axis=1)
-            
-            # Price Action & Volume
-            df['pa_high'] = df['high'].rolling(20).max()
-            df['pa_low'] = df['low'].rolling(20).min()
-            df['vol_ma'] = ta.sma(df['volume'], 20)
-            
-            df = df.dropna()
-
-            ml_model = None
-            if self.model_name and self.model_name != "off":
-                from app.predictors.model_factory import ModelFactory
-                payload = ModelFactory.load_model(self.model_name, self.symbol, self.timeframe)
-                if payload:
-                    from app.backtest2 import RawModelAdapter
-                    ml_model = RawModelAdapter(payload)
-
-            balance, position, entry_price = self.initial_balance, None, 0
-            equity_curve, trades = [], []
-            vetoed_logs = []
-
-            for i in range(len(df)):
-                row = df.iloc[i]
-                current_time = str(row.name)
-                signal = self.get_signal(row, self.strategies)
-
-                gate_passed = True
-                conf_score = 1.0
-                if ml_model:
-                    conf_score = ml_model.predict_direction(df_slice)
-                    # Use 200EMA to determine which gate to use
-                    is_short_trend = row['close'] < row['sma_200']
-                    limit = self.ml_limit_short if is_short_trend else self.ml_limit_long
-                    if conf_score < limit:
-                        gate_passed = False
-
-                if signal != 0 and not gate_passed and position is None:
-                    vetoed_logs.append({
-                        "time": str(row.name),
-                        "signal": "Long" if signal == 1 else "Short",
-                        "conf_score": round(conf_score, 4),
-                        "limit": round(limit, 4),
-                        "price": row['close']
-                    })
-
-
-               # 🟢 1. CHECK EXITS FIRST (Allows same-candle flipping)
-            if position == 'long':
-                pnl = (row['close'] - entry_price) / entry_price
-                if pnl >= self.tp_pct or pnl <= -self.sl_pct or signal == -1:
-                    effective_pnl = pnl * self.risk_mult
-                    balance *= (1 + effective_pnl - 0.0006)
-                    
-                    trades.append({
-                        "type": "exit", # UI recognizes 'exit'
-                        "side": "long", 
-                        "price": row['close'], 
-                        "time": current_time, 
-                        "pnl": round(pnl*100, 2),
-                        "balance": round(balance, 2)
-                    })
-                    position = None 
-
-            elif position == 'short':
-                pnl = (entry_price - row['close']) / entry_price
-                if pnl >= self.tp_pct or pnl <= -self.sl_pct or signal == 1:
-                    effective_pnl = pnl * self.risk_mult
-                    balance *= (1 + effective_pnl - 0.0006)
-                    
-                    trades.append({
-                        "type": "exit", 
-                        "side": "short", 
-                        "price": row['close'], 
-                        "time": current_time, 
-                        "pnl": round(pnl*100, 2),
-                        "balance": round(balance, 2)
-                    })
-                    position = None 
-
-            # 🟢 2. CHECK ENTRIES SECOND (Position is now None if we just exited)
-            if position is None and gate_passed:
-                if signal == 1:
-                    position = 'long'
-                    entry_price = row['close']
-                    balance *= (1 - 0.0006)
-                    trades.append({"type": "buy", "price": entry_price, "time": current_time})
-                elif signal == -1:
-                    position = 'short'
-                    entry_price = row['close']
-                    balance *= (1 - 0.0006)
-                    trades.append({"type": "sell", "price": entry_price, "time": current_time})
-                equity_curve.append({"time": current_time, "balance": round(balance, 2)})
-
-            chart_df = df.reset_index().rename(columns={'index': 'time', 'datetime': 'time'})
-            chart_df['time'] = chart_df['time'].astype(str)
-            
-            return {
-                "status": "success",
-                "metrics": {
-                    "finalBalance": round(balance, 2),
-                    "roi": round(((balance - self.initial_balance) / self.initial_balance) * 100, 2),
-                    "totalTrades": len(trades)
-                },
-                "candleData": chart_df[['time', 'open', 'high', 'low', 'close']].to_dict('records'),
-                "equityCurve": equity_curve,
-                "vetoed_signals": vetoed_logs,
-                "trades": trades
-            }
-        except Exception as e:
-            logger.error(f"Universal Engine Error: {e}")
-            return {"status": "failed", "error": str(e)}
             
 
     async def load_data(self):
@@ -383,96 +254,95 @@ class Backtester:
             df = await self.load_data()
             df = self.calculate_indicators(df)
             
-            if df is None or len(df) < 10:
-                return {"status": "failed", "error": "Not enough data", "metrics": {"roi": -100}}
-
             ml_model = None
             if self.model_name and self.model_name != "off":
                 payload = ModelFactory.load_model(self.model_name, self.symbol, self.timeframe)
-                if payload:
-                    ml_model = RawModelAdapter(payload)
+                if payload: ml_model = RawModelAdapter(payload)
 
-            balance = self.initial_balance
-            position = None
-            entry_price = 0
-            trades = []
-            equity_curve = []
+            balance, position, entry_price = self.initial_balance, None, 0
+            tp_price, tsl_price = 0, 0
+            equity_curve, trades, vetoed_logs = [], [], []
 
             for i in range(len(df)):
                 row = df.iloc[i]
-                df_slice = df.iloc[:i+1]
                 current_time = str(row.name)
-
-                is_short_trend = row['close'] < row.get('sma_200', row['close'])
-                active_limit = self.ml_limit_short if is_short_trend else self.ml_limit_long
-                
-                # 1. Regime Detection
-                regime = "TREND"
-                gate_passed = True
-                conf_score = 1.0
-                
-                if ml_model:
-                    conf_score = ml_model.predict_direction(df_slice)
-                    # Determine trend (Below 200EMA = Short Trend)
-                    is_short_trend = row['close'] < row.get('sma_200', row['close'])
-                    # Pick the right threshold from your config
-                    limit = self.ml_limit_short if is_short_trend else self.ml_limit_long
-                    
-                    if conf_score < limit:
-                        gate_passed = False
-
-                # 2. GET STRATEGY VOTES (Uses your 10 strategies)
                 signal = self.get_signal(row, self.strategies)
-                
-                # 3. Execution
-                if position is None and gate_passed:
-                    if signal == 1 and self.params.get('trade_direction') != 'SHORT':
-                        position = 'long'
-                        entry_price = row['close']
-                        trades.append({'type': 'buy', 'price': entry_price, 'time': str(row.name)})
-                    elif signal == -1 and self.params.get('trade_direction') != 'LONG':
-                        position = 'short'
-                        entry_price = row['close']
-                        trades.append({'type': 'sell', 'price': entry_price, 'time': str(row.name)})
-                
-                elif position == 'long' and signal == -1:
-                    balance *= (1 + (row['close'] - entry_price)/entry_price)
-                    position = None
-                    trades.append({'type': 'close_long', 'price': row['close'], 'time': str(row.name), 'balance': balance})
 
-                elif position == 'short' and signal == 1:
-                    balance *= (1 + (entry_price - row['close'])/entry_price)
-                    position = None
-                    trades.append({'type': 'close_short', 'price': row['close'], 'time': str(row.name), 'balance': balance})
+                # 1. AI Neural Gate
+                gate_passed, conf_score = True, 1.0
+                is_short_trend = row['close'] < row.get('sma_200', row['close'])
+                limit = self.ml_limit_short if is_short_trend else self.ml_limit_long
+
+                if ml_model:
+                    conf_score = ml_model.predict_direction(df.iloc[:i+1])
+                    gate_passed = conf_score >= limit
+
+                # Log Vetoes
+                if signal != 0 and not gate_passed and position is None:
+                    vetoed_logs.append({
+                        "time": current_time, "signal": "Long" if signal == 1 else "Short",
+                        "conf_score": round(conf_score, 4), "limit": round(limit, 4), "price": row['close']
+                    })
+
+                # 2. Exit Logic (Intra-candle wicks)
+                if position:
+                    exit_p, exit_r = None, None
+                    if position == 'long':
+                        if row['high'] >= tp_price: exit_p, exit_r = tp_price, "Take Profit"
+                        elif row['low'] <= tsl_price: exit_p, exit_r = tsl_price, "Trailing Stop"
+                        elif signal == -1: exit_p, exit_r = row['close'], "Signal Flip"
+                    else:
+                        if row['low'] <= tp_price: exit_p, exit_r = tp_price, "Take Profit"
+                        elif row['high'] >= tsl_price: exit_p, exit_r = tsl_price, "Trailing Stop"
+                        elif signal == 1: exit_p, exit_r = row['close'], "Signal Flip"
+
+                    if exit_p:
+                        pnl_v = (exit_p - entry_price)/entry_price if position == 'long' else (entry_price - exit_p)/entry_price
+                        balance *= (1 + (pnl_v * self.risk_mult) - 0.0016)
+                        trades.append({
+                            "type": "exit", "reason": exit_r, "price": round(exit_p, 2), "time": current_time,
+                            "pnl": round(pnl_v * 100, 2), "balance": round(balance, 2)
+                        })
+                        position = None
+                        continue
+
+                    # Update TSL
+                    if position == 'long':
+                        new_tsl = row['high'] * (1 - self.ts_pct)
+                        if new_tsl > tsl_price: tsl_price = new_tsl
+                    else:
+                        new_tsl = row['low'] * (1 + self.ts_pct)
+                        if new_tsl < tsl_price: tsl_price = new_tsl
+
+                # 3. Entry Logic
+                if position is None and gate_passed and signal != 0:
+                    position = 'long' if signal == 1 else 'short'
+                    entry_price = row['close']
+                    tp_price = entry_price * (1 + self.tp_pct) if position == 'long' else entry_price * (1 - self.tp_pct)
+                    tsl_price = entry_price * (1 - self.ts_pct) if position == 'long' else entry_price * (1 + self.ts_pct)
+                    balance *= (1 - 0.0006)
+                    trades.append({
+                        "type": "buy" if position == 'long' else "sell", "price": entry_price, 
+                        "time": current_time, "ai_score": round(conf_score, 4), "gate_limit": round(limit, 4)
+                    })
 
                 equity_curve.append({"time": current_time, "balance": round(balance, 2)})
 
-            # 🟢 STEP 3: PREPARE FINAL STRUCTURE FOR NODE.JS
-            # We must include 'candleData' and 'metrics' as top-level keys
-            chart_df = df.reset_index().rename(columns={'index': 'time', 'datetime': 'time', 'timestamp': 'time'})
-            chart_df['time'] = chart_df['time'].astype(str)
-            candle_data = chart_df[['time', 'open', 'high', 'low', 'close']].to_dict('records')
-
-            roi = ((balance - self.initial_balance) / self.initial_balance) * 100
-            
             return {
                 "status": "success",
                 "metrics": {
                     "finalBalance": round(balance, 2),
-                    "roi": round(roi, 2),
-                    "totalTrades": len(trades) // 2,
-                    "total_trades": len(trades),
-                    "netProfit": round(balance - self.initial_balance, 2),
-                    "net_profit": round(balance - self.initial_balance, 2)
+                    "roi": round(((balance - self.initial_balance) / self.initial_balance) * 100, 2),
+                    "totalTrades": len(trades),
+                    "netProfit": round(balance - self.initial_balance, 2)
                 },
-                "candleData": candle_data,
+                "candleData": df.reset_index().rename(columns={'index': 'time'}).to_dict('records'),
                 "trades": trades,
                 "equityCurve": equity_curve,
+                "vetoed_signals": vetoed_logs,
                 "initialBalance": self.initial_balance
             }
         except Exception as e:
             logger.error(f"Backtest Error: {e}")
-            import traceback
-            traceback.print_exc()
-            return {"status": "failed", "error": str(e), "metrics": {"roi": -100}}
+            return {"status": "failed", "error": str(e)}
 (venv) root@intelligent-mendel:~/Project/ML# 

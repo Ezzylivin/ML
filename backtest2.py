@@ -218,7 +218,7 @@ class Backtester:
             df = await ensure_full_data(
                 self.symbol, 
                 self.timeframe, 
-                self.start_str, 
+                fetch_start, 
                 self.end_str
             )
             
@@ -240,6 +240,12 @@ class Backtester:
         try:
             df = await self.load_data()
             df = self.calculate_indicators(df)
+
+            user_start = pd.to_datetime(self.start_str).replace(tzinfo=None)
+            df = df[df.index >= user_start]
+            
+            if df.empty:
+                return {"status": "failed", "error": "No data found for the selected date range."}
             
             ml_model = None
             if self.model_name and self.model_name != "off":

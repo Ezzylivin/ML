@@ -25,42 +25,42 @@ class RawModelAdapter:
             self.model = model_payload.get('model')
             # 🎯 CRITICAL: This must match the 8 features the model was trained on
             self.feature_names = model_payload.get('feature_names', self.default_features)
-            self.scaler = model_payload.get('scaler', None)
+            self.is_meta = model_payload.get('is_meta_model', False)
         else:
             self.model = model_payload
-            self.feature_names = []
-            self.scaler = None
+            self.feature_names = self.default_features
+            self.is_meta = False
 
-    def predict_direction(self, df_history):
+    def predict_direction(self, df_history, council_probs=None):
+        """
+        Smart Predictor:
+        - If Meta-Model: Uses council_probs (XGB_score, RF_score, etc)
+        - If Transformer: Uses 50-row sequence
+        - If Expert: Uses last row
+        """
         try:
-            # 1. Grab the latest row for prediction
-            last_row = df_history.iloc[[-1]].copy()
+            # 1. JUDGE LOGIC (Stacking)
+            if self.is_meta and council_probs is not None:
+                X = np.array([council_probs])
+                return float(self.model.predict_proba(X)[0][-1])
 
-            for col in self.feature_names:
-                if col not in last_row.columns:
-                    last_row[col] = 0.0
+            # 2. TRANSFORMER LOGIC (.keras)
+            if hasattr(self.model, "input_shape") and not self.is_meta:
+                if len(df_history) < 50: return 0.5
+                X_seq = df_history[self.feature_names].tail(50).values
+                X_seq = np.expand_dims(X_seq, axis=0) # Shape (1, 50, 25)
+                return float(self.model.predict(X_seq, verbose=0)[0][0])
 
-
-            X = last_row[self.feature_names]
-
-            if self.scaler and not X.empty:
-                X = self.scaler.transform(X)
-            
-            
-
-            # 4. Extract Probability (Nuance)
+            # 3. EXPERT LOGIC (XGB/RF)
+            last_row = df_history[self.feature_names].iloc[[-1]]
             if hasattr(self.model, "predict_proba"):
-                probs = self.model.predict_proba(X)[0]
-                conf = float(probs[-1]) # Probability of UP
-                
-                # 🎯 THE SQUEEZE: Make the gate actually work even if overfitted
-                if conf > 0.99: conf = 0.75 
-                return conf
+                conf = float(self.model.predict_proba(last_row)[0][-1])
+                return 0.75 if conf > 0.99 else conf # Squeeze
             
-            return float(self.model.predict(X)[0])
-                
+            return float(self.model.predict(last_row)[0])
+
         except Exception as e:
-            logger.error(f"❌ AI Prediction Crash: {e}")
+            logger.error(f"❌ Adapter Prediction Error: {e}")
             return 0.5
 
 class Backtester:

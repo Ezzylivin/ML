@@ -1284,144 +1284,34 @@ async def run_backtest(request: BacktestRequest):
     try:
         logger.info(f"🚀 Unified Atomic AI Run: {request.code} on {request.symbol}")
 
-        # 1. Fetch and Prepare Data
-        df = await ensure_full_data(request.symbol, request.timeframe, request.startDate, request.endDate)
-        if df is None or df.empty: 
-            raise HTTPException(status_code=400, detail="Data gap detected.")
+        # 1. Convert the Request to a Dictionary
+        config = request.dict()
 
-        # 2. Pre-calculate Indicators for the specific strategy
-        df['sma_50'] = ta.sma(df['close'], 50)
-        df['sma_200'] = ta.sma(df['close'], 200)
-        df['rsi'] = ta.rsi(df['close'], 14)
-        df['atr'] = ta.atr(df['high'], df['low'], df['close'], 14)
-        # Add Bollinger and Stoch as defaults for safety
-        df = pd.concat([df, ta.bbands(df['close'], 20, 2), ta.stoch(df['high'], df['low'], df['close'])], axis=1)
-        df = df.dropna()
-
-        # 3. Load ML Model
-        ml_model = None
-        if request.mlModel and request.mlModel != "off":
-            payload = ModelFactory.load_model(request.mlModel, request.symbol, request.timeframe)
-            if payload:
-                ml_model = RawModelAdapter(payload)
-
-        # 4. Initialization
-        balance = float(request.initialBalance)
-        risk_mult = float(request.risk_percentage) / 100.0
-        position, entry_price, tp_price, tsl_price = None, 0, 0, 0
+        # 2. Standardize keys to match what Backtester expects
+        # Atomic sends 'riskPercentage', but Combo expects 'risk_percentage'
+        config['risk_percentage'] = config.get('riskPercentage', 1.0)
         
-        # Risk params from UI
-        p_dict = request.params or {}
-        tp_pct = float(p_dict.get('take_profit', 0.13))
-        sl_pct = float(p_dict.get('stop_loss', 0.086))
-        ts_pct = float(p_dict.get('trailing_stop', 0.086))
+        # Ensure 'strategies' exists so it acts like a 'Single Combo'
+        config['strategies'] = [{
+            "code": request.code, 
+            "params": request.params
+        }]
 
-        trades, equity_curve, vetoed_logs = [], [], []
+        # 3. Import and Delegate to the Main Engine
+        from app.backtest2 import Backtester
+        tester = Backtester(config)
+        result = await tester.run()
 
-        # 5. The Execution Loop (Identical to Combo Logic)
-        for i in range(len(df)):
-            row = df.iloc[i]
-            current_time = str(row.name)
-            
-            # Atomic Signal Logic (Single strategy)
-            # We wrap the single strategy in a list to use the same vote logic
-            strategies_wrapper = [{"code": request.code, "params": request.params}]
-            
-            # --- Inline Signal Calculation ---
-            votes = 0
-            if request.code == "rsi_threshold":
-                val = row.get('rsi', 50)
-                if val < p_dict.get('oversold', 30): votes += 1
-                elif val > p_dict.get('overbought', 70): votes -= 1
-            elif request.code == "stoch":
-                val = row.get('STOCHk_14_3_3', 50)
-                if val < 20: votes += 1
-                elif val > 80: votes -= 1
-            elif request.code in ["bb_fade", "bollinger_bands"]:
-                bbl = row.get('BBL_20_2.0') or 0
-                bbu = row.get('BBU_20_2.0') or 999999
-                if row['close'] < bbl: votes += 1
-                elif row['close'] > bbu: votes -= 1
-            
-            signal = 1 if votes > 0 else -1 if votes < 0 else 0
+        # 4. Return the result
+        return result
 
-            # AI Neural Gate Check
-            gate_passed, conf_score = True, 1.0
-            is_short_trend = row['close'] < row.get('sma_200', row['close'])
-            limit = request.mlThresholdShort if is_short_trend else request.mlThresholdLong
-            
-            if ml_model:
-                conf_score = ml_model.predict_direction(df.iloc[:i+1])
-                gate_passed = conf_score >= limit
-
-            # Record Vetoes
-            if signal != 0 and not gate_passed and position is None:
-                vetoed_logs.append({
-                    "time": current_time, "signal": "Long" if signal == 1 else "Short",
-                    "conf_score": round(conf_score, 4), "limit": round(limit, 4), "price": row['close']
-                })
-
-            # Exit Logic (Anytime Wicks)
-            if position:
-                exit_p, exit_r = None, None
-                if position == 'long':
-                    if row['high'] >= tp_price: exit_p, exit_r = tp_price, "Take Profit"
-                    elif row['low'] <= tsl_price: exit_p, exit_r = tsl_price, "Trailing Stop"
-                    elif signal == -1: exit_p, exit_r = row['close'], "Signal Flip"
-                else: # short
-                    if row['low'] <= tp_price: exit_p, exit_r = tp_price, "Take Profit"
-                    elif row['high'] >= tsl_price: exit_p, exit_r = tsl_price, "Trailing Stop"
-                    elif signal == 1: exit_p, exit_r = row['close'], "Signal Flip"
-
-                if exit_p:
-                    pnl = (exit_p - entry_price)/entry_price if position == 'long' else (entry_price - exit_p)/entry_price
-                    balance *= (1 + (pnl * risk_mult) - 0.0016)
-                    trades.append({
-                        "type": "exit", "reason": exit_r, "price": round(exit_p, 2), "time": current_time,
-                        "pnl": round(pnl * 100, 2), "balance": round(balance, 2)
-                    })
-                    position = None
-                    continue
-
-                # Update Trailing Stop
-                if position == 'long':
-                    new_tsl = row['high'] * (1 - ts_pct)
-                    if new_tsl > tsl_price: tsl_price = new_tsl
-                else:
-                    new_tsl = row['low'] * (1 + ts_pct)
-                    if new_tsl < tsl_price: tsl_price = new_tsl
-
-            # Entry Logic
-            if position is None and gate_passed and signal != 0:
-                position = 'long' if signal == 1 else 'short'
-                entry_price = row['close']
-                tp_price = entry_price * (1 + tp_pct) if position == 'long' else entry_price * (1 - tp_pct)
-                tsl_price = entry_price * (1 - ts_pct) if position == 'long' else entry_price * (1 + ts_pct)
-                balance *= (1 - 0.0006)
-                trades.append({
-                    "type": "buy" if position == 'long' else "sell", "price": entry_price, 
-                    "time": current_time, "ai_score": round(conf_score, 4), "gate_limit": round(limit, 4)
-                })
-
-            equity_curve.append({"time": current_time, "balance": round(balance, 2)})
-
-        return {
-            "status": "success",
-            "metrics": {
-                "finalBalance": round(balance, 2),
-                "roi": round(((balance - request.initialBalance) / request.initialBalance) * 100, 2),
-                "totalTrades": len(trades),
-                "netProfit": round(balance - request.initialBalance, 2)
-            },
-            "candleData": df.reset_index().rename(columns={'index': 'time'}).to_dict('records'),
-            "trades": trades,
-            "equityCurve": equity_curve,
-            "vetoed_signals": vetoed_logs,
-            "initialBalance": request.initialBalance
-        }
     except Exception as e:
         logger.error(f"Atomic API Error: {e}")
-        return JSONResponse(status_code=500, content={"status": "failed", "error": str(e)})
+        return JSONResponse(
+            status_code=500, 
+            content={"status": "failed", "error": str(e)}
+        )
+        
         
 @app.post('/api/backtest/combo')
 async def run_combo_backtest(req: ComboRequest):

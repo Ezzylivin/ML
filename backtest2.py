@@ -10,11 +10,21 @@ logger = logging.getLogger("BacktestEngine")
 
 class RawModelAdapter:
     def __init__(self, model_payload):
+
+        self.default_features = [
+            'open', 'high', 'low', 'close', 'volume',
+            'sma_50', 'sma_200', 'ema_9', 'ema_21', 'ema_20',
+            'rsi', 'atr', 'adx', 'st_trend', 
+            'BBL_20_2.0_2.0', 'BBU_20_2.0_2.0', 
+            'STOCHk_14_3_3', 'MACD_12_26_9', 'MACDs_12_26_9',
+            'pa_high', 'pa_low', 'vol_ma', 
+            'adx_logic', 'atr_logic', 'sma_logic'
+        ]
+        
         if isinstance(model_payload, dict):
             self.model = model_payload.get('model')
             # 🎯 CRITICAL: This must match the 8 features the model was trained on
-            self.feature_names = model_payload.get('feature_names', 
-                ['sma_50', 'sma_200', 'st_trend', 'rsi', 'atr', 'adx', 'BBL_20_2.0_2.0', 'BBU_20_2.0_2.0'])
+            self.feature_names = model_payload.get('feature_names', self.default_features)
             self.scaler = model_payload.get('scaler', None)
         else:
             self.model = model_payload
@@ -25,17 +35,18 @@ class RawModelAdapter:
         try:
             # 1. Grab the latest row for prediction
             last_row = df_history.iloc[[-1]].copy()
-            
-            # 2. Filter to EXACT features expected by the model
-            # This prevents the "training data did not have these fields" error
-            if self.feature_names:
-                X = last_row[self.feature_names]
-            else:
-                X = last_row.select_dtypes(include=[np.number])
 
-            # 3. Scale
+            for col in self.feature_names:
+                if col not in last_row.columns:
+                    last_row[col] = 0.0
+
+
+            X = last_row[self.feature_names]
+
             if self.scaler and not X.empty:
                 X = self.scaler.transform(X)
+            
+            
 
             # 4. Extract Probability (Nuance)
             if hasattr(self.model, "predict_proba"):
@@ -90,42 +101,38 @@ class Backtester:
         
         # 2. ADX
         adx = ta.adx(df['high'], df['low'], df['close'], length=14)
-        if adx is not None: df['adx'] = adx.iloc[:, 0] # Use position for safety
+        if adx is not None: df['adx'] = adx.iloc[:, 0]
             
-        # 3. Bollinger (🎯 POSITION-BASED FIX)
-        # We use std=2.0 to be explicit, but iloc makes us immune to naming bugs
+        # 3. Bollinger (Position-based)
         bb = ta.bbands(df['close'], length=20, std=2.0)
         if bb is not None:
-            # Column 0 = Lower, Column 1 = Mid, Column 2 = Upper
-            l_band = bb.iloc[:, 0]
-            u_band = bb.iloc[:, 2]
-
-            # FORCE assign every name the engine or the AI has ever asked for
-            df['BBL_20_2.0'] = l_band
-            df['BBU_20_2.0'] = u_band
-            df['BBL_20_2.0_2.0'] = l_band
-            df['BBU_20_2.0_2.0'] = u_band
+            df['BBL_20_2.0_2.0'] = bb.iloc[:, 0]
+            df['BBU_20_2.0_2.0'] = bb.iloc[:, 2]
+            df['BBL_20_2.0'] = bb.iloc[:, 0]
+            df['BBU_20_2.0'] = bb.iloc[:, 2]
 
         # 4. Supertrend
         st = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3.0)
-        if st is not None:
-            # Column 1 is usually the direction (1/-1)
-            df['st_trend'] = st.iloc[:, 1]
+        df['st_trend'] = st.iloc[:, 1] if st is not None else 0
 
         # 5. Stochastic & MACD
         stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3)
-        if stoch is not None:
-            df['STOCHk_14_3_3'] = stoch.iloc[:, 0]
+        if stoch is not None: df['STOCHk_14_3_3'] = stoch.iloc[:, 0]
         
         macd = ta.macd(df['close'])
         if macd is not None:
             df['MACD_12_26_9'] = macd.iloc[:, 0]
             df['MACDs_12_26_9'] = macd.iloc[:, 2]
 
-        # 6. Price Action
+        # 6. Price Action & Volume
         df['pa_high'] = df['high'].rolling(window=20).max()
         df['pa_low'] = df['low'].rolling(window=20).min()
         df['vol_ma'] = ta.sma(df['volume'], length=20)
+
+        # 🎯 7. LOGIC FEATURES (New - required for 25-feature model)
+        df['adx_logic'] = np.where(df['adx'] > 25, 1, 0)
+        df['atr_logic'] = (df['atr'] / df['close']) * 1000
+        df['sma_logic'] = np.where(df['close'] > df['sma_200'], 1, -1)
 
         return df.fillna(0)
 

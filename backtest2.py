@@ -43,7 +43,7 @@ class RawModelAdapter:
                 conf = float(probs[-1]) # Probability of UP
                 
                 # 🎯 THE SQUEEZE: Make the gate actually work even if overfitted
-                if conf > 0.99: conf = 0.85 
+                if conf > 0.99: conf = 0.75 
                 return conf
             
             return float(self.model.predict(X)[0])
@@ -138,8 +138,8 @@ class Backtester:
             # 2. Bollinger Fade
             elif code in ["bb_fade", "bollinger_bands"]:
                 # Using the safer name we aliased in calculate_indicators
-                lower = row.get('BBL_20_2.0_2.0', 0)
-                upper = row.get('BBU_20_2.0_2.0', 999999)
+                lower = row.get('BBL_20_2.0_2.0', row.get('BBL_20_2.0', 0))
+                upper = row.get('BBU_20_2.0_2.0', row.get('BBU_20_2.0', 999999))
                 if row['close'] < lower: votes += 1
                 elif row['close'] > upper: votes -= 1
 
@@ -157,10 +157,11 @@ class Backtester:
                     votes -= 1
 
             # 5. Supertrend
-            elif code == "supertrend":
-                # SUPERTd indicates direction: 1 for Up, -1 for Down
-                if row.get('st_trend', 0) == 1: votes += 1
-                elif row.get('st_trend', 0) == -1: votes -= 1
+           elif code == "supertrend":
+                # Check both common variants
+                st_val = row.get('st_trend', row.get('SUPERTd_10_3.0', 0))
+                if st_val == 1: votes += 1
+                elif st_val == -1: votes -= 1
 
             # 6. MACD Crossover
             elif code == "macd_crossover":

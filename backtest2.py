@@ -88,7 +88,7 @@ class Backtester:
         self.model_name = config.get('mlModel', 'stacking')
 
     def calculate_indicators(self, df):
-        if len(df) < 50: return df 
+        if len(df) < 200: return df 
         
         # 1. Standard Indicators
         df['sma_50'] = ta.sma(df['close'], length=50)
@@ -134,7 +134,7 @@ class Backtester:
         df['atr_logic'] = (df['atr'] / df['close']) * 1000
         df['sma_logic'] = np.where(df['close'] > df['sma_200'], 1, -1)
 
-        return df.fillna(0)
+        return df.dropna()
 
 
     def get_signal(self, row, strategies):

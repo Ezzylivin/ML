@@ -297,66 +297,6 @@ async def ensure_full_data(symbol, timeframe, start_str, end_str):
     return df.loc[target_start:target_end]
 
 
-def calculate_strategy_signal(df, code, params):
-    close, high, low, vol = df['close'], df['high'], df['low'], df['volume']
-    signal = pd.Series(0, index=df.index)
-    try:
-        if code == "rsi_threshold":
-            length = int(params.get('rsi_length', 14))
-            rsi = ta.rsi(close, length=length)
-            signal[rsi < params.get('oversold', 30)] = 1
-            signal[rsi > params.get('overbought', 70)] = -1
-        elif code == "sma_crossover":
-            fast = ta.sma(close, length=int(params.get('fast_sma', 50)))
-            slow = ta.sma(close, length=int(params.get('slow_sma', 200)))
-            signal[fast > slow] = 1
-            signal[fast < slow] = -1
-        elif code == "bollinger_bands" or code == "bb_fade":
-            bb = ta.bbands(close, length=int(params.get('bb_period', 20)), std=float(params.get('bb_std', 2.0)))
-            if bb is not None:
-                signal[close < bb.iloc[:, 0]] = 1
-                signal[close > bb.iloc[:, 2]] = -1
-        elif code == "atr_breakout":
-            atr = ta.atr(high, low, close, length=int(params.get('atr_length', 14)))
-            sma = ta.sma(close, length=20)
-            signal[close > (sma + atr * float(params.get('multiplier', 1.5)))] = 1
-            signal[close < (sma - atr * float(params.get('multiplier', 1.5)))] = -1
-        elif code == "macd_crossover":
-            macd = ta.macd(close, fast=int(params.get('fast', 12)), slow=int(params.get('slow', 26)), signal=int(params.get('signal', 9)))
-            if macd is not None:
-                signal[macd.iloc[:, 0] > macd.iloc[:, 2]] = 1
-                signal[macd.iloc[:, 0] < macd.iloc[:, 2]] = -1
-        elif code == "stoch":
-            stoch = ta.stoch(high, low, close, k=int(params.get('k_period', 14)))
-            if stoch is not None:
-                k, d = stoch.iloc[:, 0], stoch.iloc[:, 1]
-                signal[(k > d) & (k < 30)] = 1
-                signal[(k < d) & (k > 70)] = -1
-        elif code == "supertrend":
-            st = ta.supertrend(high, low, close, length=int(params.get('st_atr', 10)), multiplier=float(params.get('st_factor', 3.0)))
-            if st is not None:
-                signal[st.iloc[:, 1] == 1] = 1
-                signal[st.iloc[:, 1] == -1] = -1
-        elif code == "ema_cloud":
-            fast_ema = ta.ema(close, length=int(params.get('fast_ema', 9)))
-            slow_ema = ta.ema(close, length=int(params.get('slow_ema', 21)))
-            signal[fast_ema > slow_ema] = 1
-            signal[fast_ema < slow_ema] = -1
-        elif code == "pa_breakout":
-            lb = int(params.get('lookback', 20))
-            highest = high.rolling(lb).max().shift(1)
-            lowest = low.rolling(lb).min().shift(1)
-            signal[close > highest] = 1
-            signal[close < lowest] = -1
-        elif code == "vol_profile":
-            vol_ma = ta.sma(vol, length=int(params.get('vol_ma', 20)))
-            vol_spike = vol > (vol_ma * float(params.get('threshold', 1.5)))
-            price_up = close > close.shift(1)
-            signal[vol_spike & price_up] = 1
-            signal[vol_spike & ~price_up] = -1
-    except Exception as e:
-        logger.error(f"Strategy Error ({code}): {e}")
-    return signal.fillna(0)
 
 # ==========================================
 # 🧠 1. NEURAL PREDICTOR
@@ -1282,35 +1222,25 @@ async def close_position(data: BotClosePositionRequest):
 @app.post('/api/backtest/run')
 async def run_backtest(request: BacktestRequest):
     try:
-        logger.info(f"🚀 Unified Atomic AI Run: {request.code} on {request.symbol}")
-
-        # 1. Convert the Request to a Dictionary
+        # 1. Standardize UI request keys for the Backtester class
         config = request.dict()
-
-        # 2. Standardize keys to match what Backtester expects
-        # Atomic sends 'riskPercentage', but Combo expects 'risk_percentage'
         config['risk_percentage'] = config.get('riskPercentage', 1.0)
+        config['mlThresholdLong'] = config.get('ml_confidence_threshold', 0.8)
+        config['mlThresholdShort'] = config.get('ml_confidence_threshold', 0.8)
         
-        # Ensure 'strategies' exists so it acts like a 'Single Combo'
-        config['strategies'] = [{
-            "code": request.code, 
-            "params": request.params
-        }]
+        # 2. Wrap the single code into the list format the Backtester expects
+        config['strategies'] = [{"code": request.code, "params": request.params}]
 
-        # 3. Import and Delegate to the Main Engine
+        # 3. Import and use the SINGLE SOURCE of truth
         from app.backtest2 import Backtester
         tester = Backtester(config)
-        result = await tester.run()
-
-        # 4. Return the result
-        return result
+        
+        # This one call handles data loading, indicators, AI, and trading
+        return await tester.run()
 
     except Exception as e:
-        logger.error(f"Atomic API Error: {e}")
-        return JSONResponse(
-            status_code=500, 
-            content={"status": "failed", "error": str(e)}
-        )
+        logger.error(f"❌ Simplified Atomic Run Error: {e}")
+        return JSONResponse(status_code=500, content={"status": "failed", "error": str(e)})
         
         
 @app.post('/api/backtest/combo')

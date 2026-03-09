@@ -1,72 +1,47 @@
-import os
-import joblib
 import numpy as np
 import pandas as pd
+import logging
 from .model_factory import ModelFactory
-from app.config2 import MODEL_STORAGE_DIR
 
-class StackingPredictor:
-    def __init__(self, bot_id="backtest_generic", symbol=None):
-        """
-        Initializes the Stacking Council.
-        Synchronized for 10-feature input parity.
-        """
-        self.bot_id = bot_id
-        self.symbol = symbol or "BTC-USD"
-        
-        # 🟢 Experts must match ModelFactory mapping keys exactly
-        self.expert_types = ['XGBoost', 'RandomForest', 'Transformer']
-        
-        # Load the Meta-Model (The Judge) if it exists
-        meta_path = os.path.join(MODEL_STORAGE_DIR, f"MetaModel_{self.symbol}.joblib")
-        self.judge = None
-        
-        if os.path.exists(meta_path):
-            try:
-                self.judge = joblib.load(meta_path)
-                print(f"⚖️ JUDGE ONLINE for {self.symbol}. Features expected: {self.judge.n_features_in_}")
-            except Exception as e:
-                print(f"❌ MetaModel Load Failed: {e}")
+logger = logging.getLogger("Council")
 
-    def predict_direction(self, state_df: pd.DataFrame) -> float:
-        results = {}
+class CouncilPredictor:
+    def __init__(self, symbol="BTC-USD", timeframe="1h"):
+        self.symbol = symbol
+        self.timeframe = timeframe
+        self.expert_types = ['xgboost', 'randomforest', 'transformer']
+
+    def predict_direction(self, df_history: pd.DataFrame) -> dict:
+        """
+        Gathers the 'Internal Debate' and returns the Judge's decision.
+        """
+        opinions = {}
+        
+        # 1. Gather Expert Opinions
         for e_type in self.expert_types:
-            # Pass all 3 args now: name, symbol, timeframe
-            raw_model = ModelFactory.load_model(e_type, self.symbol, "1h")
-            
-            if raw_model is None:
-                results[e_type] = 0.5
-                continue
-                
-            try:
-                # 🎯 THE FIX: Raw models use predict_proba, not predict_direction
-                if hasattr(raw_model, "predict_proba"):
-                    # Get probability of 'Up' (Class 1)
-                    score = float(raw_model.predict_proba(state_df)[0][1])
-                else:
-                    score = float(raw_model.predict(state_df)[0])
-                
-                results[e_type] = score
-            except Exception as e:
-                print(f"⚠️ {e_type} Error: {e}")
-                results[e_type] = 0.5
+            expert = ModelFactory.load_model(e_type, self.symbol, self.timeframe)
+            if expert:
+                # RawModelAdapter handles the 25-feature slicing and .keras vs .joblib
+                opinions[e_type] = expert.predict_direction(df_history)
+            else:
+                opinions[e_type] = 0.5 # Neutral fallback
 
-        # --- ⚖️ REFINED CONFLUENCE LOGIC ---
-        if self.judge and len(results) == 3:
-            try:
-                X_meta = np.array([
-                    results['XGBoost'], 
-                    results['RandomForest'], 
-                    results['Transformer']
-                ]).reshape(1, -1)
-                
-                # Check if judge actually supports probabilities
-                if hasattr(self.judge, "predict_proba"):
-                    return float(self.judge.predict_proba(X_meta)[0][1])
-                else:
-                    # 🎯 FIXED: If judge is 'hard', use a weighted average instead of rounding
-                    return np.average([results['XGBoost'], results['RandomForest'], results['Transformer']], weights=[0.4, 0.4, 0.2])
-            except Exception as e:
-                return np.mean(list(results.values()))
+        # 2. Consult the Stacking Judge
+        judge = ModelFactory.load_model("stacking", self.symbol, self.timeframe)
         
-        return np.mean(list(results.values()))
+        if judge:
+            expert_vector = [opinions['xgboost'], opinions['randomforest'], opinions['transformer']]
+            # RawModelAdapter handles the Meta-Logic automatically
+            final_score = judge.predict_direction(df_history, council_probs=expert_vector)
+        else:
+            # Simple fallback if the Judge isn't trained yet
+            final_score = np.mean(list(opinions.values()))
+
+        # 3. Log the Consensus (for your Live Monitor)
+        debate = " | ".join([f"{k.upper()}: {v:.2f}" for k, v in opinions.items()])
+        print(f"[{self.symbol}] {debate} ⚖️ JUDGE: {final_score:.2f}")
+
+        return {
+            "score": final_score,
+            "opinions": opinions
+        }

@@ -233,7 +233,7 @@ def load_data_robust(symbol, timeframe):
     return None
 
 
-async def ensure_full_data(symbol, timeframe, start_str, end_str):
+async def ensure_full_data(symbol, timeframe, start_str, end_str,*args, **kwargs):
     """
     Checks local DB for data gaps and fetches from Coinbase (Async).
     """
@@ -294,7 +294,7 @@ async def ensure_full_data(symbol, timeframe, start_str, end_str):
 
     target_start = pd.to_datetime(start_str, utc=True)
     target_end = pd.to_datetime(end_str, utc=True)
-    return df.loc[target_start:target_end]
+    return df
 
 
 

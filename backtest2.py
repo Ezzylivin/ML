@@ -79,7 +79,7 @@ class Backtester:
     def calculate_indicators(self, df):
         if len(df) < 50: return df 
         
-        # Core Indicators
+        # 1. Standard Indicators
         df['sma_50'] = ta.sma(df['close'], length=50)
         df['sma_200'] = ta.sma(df['close'], length=200)
         df['rsi'] = ta.rsi(df['close'], length=14)
@@ -88,32 +88,41 @@ class Backtester:
         df['ema_21'] = ta.ema(df['close'], length=21)
         df['ema_20'] = ta.ema(df['close'], length=20)
         
-        # ADX (Naming for AI parity)
+        # 2. ADX
         adx = ta.adx(df['high'], df['low'], df['close'], length=14)
-        if adx is not None: df['adx'] = adx['ADX_14']
+        if adx is not None: df['adx'] = adx.iloc[:, 0] # Use position for safety
             
-        # Bollinger (Naming for AI parity)
-        # Inside calculate_indicators in backtest2.py
-        bb = ta.bbands(df['close'], length=20, std=2)
+        # 3. Bollinger (🎯 POSITION-BASED FIX)
+        # We use std=2.0 to be explicit, but iloc makes us immune to naming bugs
+        bb = ta.bbands(df['close'], length=20, std=2.0)
         if bb is not None:
-            # Standard names for Strategy Logic
-            df['BBL_20_2.0'] = bb['BBL_20_2.0']
-            df['BBU_20_2.0'] = bb['BBU_20_2.0']
-            # Extra naming for AI Model Parity
-            df['BBL_20_2.0_2.0'] = bb['BBL_20_2.0']
-            df['BBU_20_2.0_2.0'] = bb['BBU_20_2.0']
+            # Column 0 = Lower, Column 1 = Mid, Column 2 = Upper
+            l_band = bb.iloc[:, 0]
+            u_band = bb.iloc[:, 2]
 
-        # Supertrend (Naming for AI parity)
-        st = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3)
-        if st is not None: df['st_trend'] = st['SUPERTd_10_3.0']
+            # FORCE assign every name the engine or the AI has ever asked for
+            df['BBL_20_2.0'] = l_band
+            df['BBU_20_2.0'] = u_band
+            df['BBL_20_2.0_2.0'] = l_band
+            df['BBU_20_2.0_2.0'] = u_band
 
-        # Stochastic & MACD
+        # 4. Supertrend
+        st = ta.supertrend(df['high'], df['low'], df['close'], length=10, multiplier=3.0)
+        if st is not None:
+            # Column 1 is usually the direction (1/-1)
+            df['st_trend'] = st.iloc[:, 1]
+
+        # 5. Stochastic & MACD
         stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3)
-        if stoch is not None: df = pd.concat([df, stoch], axis=1)
+        if stoch is not None:
+            df['STOCHk_14_3_3'] = stoch.iloc[:, 0]
+        
         macd = ta.macd(df['close'])
-        if macd is not None: df = pd.concat([df, macd], axis=1)
+        if macd is not None:
+            df['MACD_12_26_9'] = macd.iloc[:, 0]
+            df['MACDs_12_26_9'] = macd.iloc[:, 2]
 
-        # Price Action
+        # 6. Price Action
         df['pa_high'] = df['high'].rolling(window=20).max()
         df['pa_low'] = df['low'].rolling(window=20).min()
         df['vol_ma'] = ta.sma(df['volume'], length=20)

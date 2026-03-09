@@ -136,10 +136,12 @@ class Backtester:
                 elif k_val > 80: votes -= 1
             
             # 2. Bollinger Fade
-            if row['close'] < row.get('BBL_20_2.0_2.0', 0): 
-                votes += 1
-            elif row['close'] > row.get('BBU_20_2.0_2.0', 999999): 
-                votes -= 1
+            elif code in ["bb_fade", "bollinger_bands"]:
+                # Using the safer name we aliased in calculate_indicators
+                lower = row.get('BBL_20_2.0_2.0', 0)
+                upper = row.get('BBU_20_2.0_2.0', 999999)
+                if row['close'] < lower: votes += 1
+                elif row['close'] > upper: votes -= 1
 
             # 3. RSI Threshold
             elif code == "rsi_threshold":

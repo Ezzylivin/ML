@@ -157,7 +157,7 @@ class Backtester:
                     votes -= 1
 
             # 5. Supertrend
-           elif code == "supertrend":
+            elif code == "supertrend":
                 # Check both common variants
                 st_val = row.get('st_trend', row.get('SUPERTd_10_3.0', 0))
                 if st_val == 1: votes += 1

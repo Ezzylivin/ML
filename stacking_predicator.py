@@ -54,7 +54,7 @@ class StackingPredictor:
         debate_log = " | ".join([f"{k.upper()}: {v:.2f}" for k, v in opinions.items()])
         sentiment = self._get_sentiment_label(final_score)
         
-        print(f"[{self.symbol}] {debate_log} ⚖️ JUDGE FINAL: {final_score:.2f} ({sentiment})")
+        #print(f"[{self.symbol}] {debate_log} ⚖️ JUDGE FINAL: {final_score:.2f} ({sentiment})")
 
         return final_score
 

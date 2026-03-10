@@ -22,10 +22,12 @@ from contextlib import asynccontextmanager
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 import aiohttp
+from app.verify.engineer_and_train import apply_mega_features
 
 # 🟢 SOCKET HELPERS (Must be async/await)
 from app.services.socket_emitter import emit_log, emit_status
 from app.config2 import MODEL_DIR
+from app.predictors.stacking_predictor import StackingPredictor
 
 MODEL_DIR = "models"
 RESULTS_DIR = "results"
@@ -377,29 +379,24 @@ class DiagnosticLayer:
         except Exception: return "🔍 Scanning Market Conditions..."
 
 class NeuralPredictor:
-    _model_cache = {}
     @staticmethod
-    def get_prediction(model_id: str, df: pd.DataFrame) -> float:
+    def get_prediction(model_id: str, df: pd.DataFrame, symbol: str = "BTC-USD") -> float:
+        """
+        Swaps the old placeholder logic for the Full Council Stacking Judge.
+        """
         try:
-            recent = df.tail(20)
-            if len(recent) < 10: return 0.5
-            momentum = (recent['close'].iloc[-1] - recent['close'].iloc[0]) / recent['close'].iloc[0]
-            if model_id not in NeuralPredictor._model_cache:
-                model_path = f"./models/{model_id}_model.pkl"
-                if os.path.exists(model_path):
-                    logger.info(f"🧠 Loading Neural Model into Cache: {model_id}")
-                    NeuralPredictor._model_cache[model_id] = joblib.load(model_path)
-                else:
-                    NeuralPredictor._model_cache[model_id] = None
-            cached_model = NeuralPredictor._model_cache.get(model_id)
-            if cached_model:
-                prediction = cached_model.predict_proba([[momentum]])[0][1]
-                return float(prediction)
-            base = 1.0 / (1.0 + np.exp(-momentum * 100))
-            return float(min(0.99, max(0.01, base)))
+            # 1. Initialize the Stacking Predictor (The Council)
+            # Standardized for our 25-feature logic
+            council = StackingPredictor(symbol=symbol, timeframe="1h")
+            
+            # 2. Get the Final Probability from the Stacking Judge
+            # This internal call will also PRINT the debate to your terminal console
+            prediction = council.predict_direction(df)
+            
+            return float(prediction)
         except Exception as e:
-            logger.error(f"🧠 Neural Predictor Error: {e}")
-            return 0.5
+            logger.error(f"🧠 Council Predictor Error: {e}")
+            return 0.5 # Neutral fallback
 
 async def execute_backtest_logic(data: BacktestRequest):
     try:
@@ -470,53 +467,16 @@ async def execute_backtest_logic(data: BacktestRequest):
 # Packet Data
 # ==========================================
 async def process_data_packet(df: pd.DataFrame, strategies: list) -> list:
-    df.columns = [c.lower() for c in df.columns]
-    if 'vol' in df.columns: df.rename(columns={'vol': 'volume'}, inplace=True)
+    # 🎯 V25 UPGRADE: One call to rule them all
+    df, feats = apply_mega_features(df)
     
-    for strat in strategies:
-        code = strat.get('code')
-        p = strat.get('params', {})
-        try:
-            if code in ['bb_fade', 'bollinger_bands']:
-                bb = ta.bbands(df['close'], length=int(p.get('bb_period', 20)), std=float(p.get('bb_std', 2.0)))
-                df['bb_lower'], df['bb_upper'] = bb.iloc[:, 0], bb.iloc[:, 2]
-            elif code == 'ema_cloud':
-                df['ema_fast'] = ta.ema(df['close'], length=int(p.get('fast_ema', 9)))
-                df['ema_slow'] = ta.ema(df['close'], length=int(p.get('slow_ema', 21)))
-            elif code == 'sma_crossover':
-                df['sma_fast'] = ta.sma(df['close'], length=int(p.get('fast_sma', 50)))
-                df['sma_slow'] = ta.sma(df['close'], length=int(p.get('slow_sma', 200)))
-            elif code == 'supertrend':
-                st = ta.supertrend(df['high'], df['low'], df['close'], length=int(p.get('st_atr', 10)), multiplier=float(p.get('st_factor', 3.0)))
-                df['supertrend'] = st.iloc[:, 0]
-            elif code == 'rsi_threshold':
-                df['rsi'] = ta.rsi(df['close'], length=int(p.get('rsi_length', 14)))
-            elif code == 'macd_crossover':
-                macd = ta.macd(df['close'], fast=int(p.get('fast', 12)), slow=int(p.get('slow', 26)), signal=int(p.get('signal', 9)))
-                df['macd'], df['macd_signal'] = macd.iloc[:, 0], macd.iloc[:, 2]
-            elif code == 'stoch':
-                stoch = ta.stoch(df['high'], df['low'], df['close'], k=int(p.get('k_period', 14)))
-                df['stoch_k'], df['stoch_d'] = stoch.iloc[:, 0], stoch.iloc[:, 1]
-            elif code == 'atr_breakout':
-                atr = ta.atr(df['high'], df['low'], df['close'], length=int(p.get('atr_length', 14)))
-                ema20 = ta.ema(df['close'], 20)
-                df['atr_upper'] = ema20 + (atr * float(p.get('multiplier', 1.5)))
-                df['atr_lower'] = ema20 - (atr * float(p.get('multiplier', 1.5)))
-            elif code == 'pa_breakout':
-                lb = int(p.get('lookback', 20))
-                df['pa_high'] = df['high'].rolling(lb).max()
-                df['pa_low'] = df['low'].rolling(lb).min()
-            elif code == 'vol_profile':
-                if 'volume' in df.columns:
-                    df['vol_ma'] = ta.sma(df['volume'], length=int(p.get('vol_ma', 20)))
-        except Exception: continue
-
+    
     keys = ['bb_lower', 'bb_upper', 'ema_fast', 'ema_slow', 'sma_fast', 'sma_slow', 
             'supertrend', 'rsi', 'macd', 'macd_signal', 'stoch_k', 'stoch_d', 
             'atr_upper', 'atr_lower', 'pa_high', 'pa_low', 'vol_ma']
 
     candles_to_send = []
-    for _, row in df.tail(100).iterrows():
+    for _, row in df.tail(100).iterrows()::
         ts = int(row['time']) if 'time' in row else int(row.name.timestamp())
         c_obj = {"time": ts, "open": row['open'], "high": row['high'], "low": row['low'], "close": row['close']}
         for k in keys:
@@ -529,7 +489,7 @@ async def process_data_packet(df: pd.DataFrame, strategies: list) -> list:
 # ==========================================
 class StrategyBrain:
    @staticmethod
-   def calculate_signals(df: pd.DataFrame, config: Dict[str, Any], l_thresh: float, s_thresh: float):
+   def calculate_signals(df: pd.DataFrame, config: Dict[str, Any], l_thresh: float, s_thresh: float, symbol="BTC-USD"):
        active_thoughts, votes = [], 0
         # 🟢 ADD THIS: Create a dictionary to store raw values for the logs
        signals_map = {} 
@@ -623,7 +583,7 @@ class StrategyBrain:
        # 🚀 3. DYNAMIC DUAL-GATE LOGIC (ML Filtering)
        is_short = current_price < ema200
        ui_limit = float(config.get('mlThresholdShort', 0.90)) if is_short else float(config.get('mlThresholdLong', 0.80))
-       conf = NeuralPredictor.get_prediction(config.get('mlModel', 'stacking'), df)
+       conf = NeuralPredictor.get_prediction(config.get('mlModel', 'stacking'), df, symbol=symbol)
        gate_passed = conf >= ui_limit
 
        logic_desc = f"📊 LOGIC: {'SHORT' if is_short else 'LONG'} GATE {'PASSED' if gate_passed else 'VETOED'} ({int(conf*100)}% vs {int(ui_limit*100)}% UI Limit) {'🟢' if gate_passed else '🔴'}"
@@ -694,403 +654,153 @@ async def live_neural_heartbeat(user_id: str):
             config = bot.get('config', {})
             params = config.get('params', {})
             strategies = config.get('strategies', [])
-            upnl = 0
-            current_equity = bot['balance']
-            markers = []
-            candles_to_send = []
-            tsl_pct = float(config['params'].get('trailing_stop', 0.01))
             symbol = config['symbol'].replace('-', '/')
-            max_p = int(config.get('maxPyramiding', 1))
-
-            ui_tp = float(params.get('take_profit', 0.10))
-            ui_sl = float(params.get('stop_loss', 0.05))
-            ui_tsl = float(params.get('trailing_stop', 0.01))
+            ticker_symbol = config['symbol'] # e.g. BTC-USD
             
             try:
-                # 🟢 2. DATA FETCHING
+                # 🟢 2. DATA FETCHING (Coinbase Pulse)
                 ohlcv_raw = await fetch_live_candles_ccxt(config['symbol'], config.get('timeframe', '1h'), 350)
                 if not ohlcv_raw:
                     logger.warning(f"⚠️ Market feed unstable for {config['symbol']}")
                     await emit_log(user_id, "⚠️ Market Data Feed Unstable - Retrying...")
                     await asyncio.sleep(10); continue
 
-                # 🟢 3. ZERO-DRIFT PATCH & TICKER
-                raw_candle_ts = ohlcv_raw[-1]['time']
                 ticker = await global_exchange.watch_ticker(symbol)
                 current_price = float(ticker['last'])
                 
-                # Force alignment to 'Now' (Integer Seconds)
-                clean_ts = int(datetime.now(timezone.utc).timestamp())
+                # Zero-Drift Patch
                 ohlcv_raw[-1]['close'] = current_price
-                ohlcv_raw[-1]['time'] = clean_ts 
+                ohlcv_raw[-1]['time'] = int(datetime.now(timezone.utc).timestamp())
                 
-                local_now_ms = datetime.now(timezone.utc).timestamp() * 1000
-                real_lag = round((local_now_ms - ticker['timestamp']) / 1000, 2)
-                logger.info(f"⚡ WS PULSE: ${current_price} | Lag: {real_lag}s")
-                
-                # PNL Calculation
+                # 🟢 3. V25 MASTER FEATURE ENGINEERING (Replaces manual indicator loops)
+                # This ensures the AI sees all 25 features exactly as it was trained
+                df_raw = pd.DataFrame(ohlcv_raw)
+                from app.verify.engineer_and_train import apply_mega_features
+                df, _ = apply_mega_features(df_raw)
+
+                # 🟢 4. COUNCIL SIGNAL PROCESSING
+                # We pass the ticker_symbol so the NeuralPredictor loads the correct BTC/ETH models
+                sig, thoughts, nums, score, signals_map = StrategyBrain.calculate_signals(
+                    df, config, 0.5, 0.5, symbol=ticker_symbol
+                )
+
+                # Determine Sentiment for logs
+                sentiment = "STRONG BUY" if score > 0.85 else "BUY" if score > 0.70 else "NEUTRAL"
+                if score < 0.20: sentiment = "STRONG SELL"
+                elif score < 0.35: sentiment = "SELL"
+
+                # 🟢 5. PYRAMIDING-AWARE HUD CONSTRUCTION
                 upnl = sum([(current_price - p['entry']) * p['size'] if p['type'] == 'long' else (p['entry'] - current_price) * p['size'] for p in bot['positions']])
                 current_equity = bot['balance'] + upnl
 
-                # 🟢 4. INDICATOR CALCULATION
-                df = pd.DataFrame(ohlcv_raw)
-                if 'vol' in df.columns: df.rename(columns={'vol': 'volume'}, inplace=True)
-                for strat in strategies:
-                    code, p = strat.get('code'), strat.get('params', {})
-                    try:
-                        if code == 'bb_fade':
-                            bb = ta.bbands(df['close'], length=int(p.get('bb_period', 20)), std=float(p.get('bb_std', 2.0)))
-                            df['bb_lower'], df['bb_upper'] = bb.iloc[:, 0], bb.iloc[:, 2]
-                        elif code == 'ema_cloud':
-                            df['ema_fast'] = ta.ema(df['close'], length=int(p.get('fast_ema', 9)))
-                            df['ema_slow'] = ta.ema(df['close'], length=int(p.get('slow_ema', 21)))
-                        elif code == 'sma_crossover':
-                            df['sma_fast'] = ta.sma(df['close'], length=int(p.get('fast_sma', 50)))
-                            df['sma_slow'] = ta.sma(df['close'], length=int(p.get('slow_sma', 200)))
-                        elif code == 'supertrend':
-                            st = ta.supertrend(df['high'], df['low'], df['close'], length=int(p.get('st_atr', 10)), multiplier=float(p.get('st_factor', 3.0)))
-                            df['supertrend'] = st.iloc[:, 0]
-                        elif code == 'pa_breakout':
-                            lb = int(p.get('lookback', 20))
-                            df['pa_high'], df['pa_low'] = df['high'].rolling(lb).max(), df['low'].rolling(lb).min()
-                        elif code == 'atr_breakout':
-                            atr = ta.atr(df['high'], df['low'], df['close'], length=int(p.get('atr_length', 14)))
-                            ema20 = ta.ema(df['close'], 20)
-                            df['atr_upper'], df['atr_lower'] = ema20 + (atr * float(p.get('multiplier', 1.5))), ema20 - (atr * float(p.get('multiplier', 1.5)))
-                        elif code == 'rsi_threshold':
-                            df['rsi'] = ta.rsi(df['close'], length=int(p.get('rsi_length', 14)))
-                        elif code == 'stoch':
-                            stoch = ta.stoch(df['high'], df['low'], df['close'], k=int(p.get('k_period', 14)))
-                            df['stoch_k'], df['stoch_d'] = stoch.iloc[:, 0], stoch.iloc[:, 1]
-                        elif code == 'macd_crossover':
-                            macd = ta.macd(df['close'], fast=int(p.get('fast', 12)), slow=int(p.get('slow', 26)), signal=int(p.get('signal', 9)))
-                            df['macd'], df['macd_signal'] = macd.iloc[:, 0], macd.iloc[:, 2]
-                        elif code == 'vol_profile':
-                            df['vol_ma'] = ta.sma(df['volume'], length=int(p.get('vol_ma', 20)))
-                    except Exception: continue
+                # A. Build Active Trade Summary (Exits/TSL)
+                active_summary = ""
+                buffer_bar = "[----------]" # Default
+                if bot['positions']:
+                    p = bot['positions'][-1] # Focus on the latest leg
+                    dist_to_stop = abs(current_price - p['tsl'])
+                    stop_pct = round((dist_to_stop / current_price) * 100, 2)
+                    buffer_bar = DiagnosticLayer.render_progress(stop_pct, 2.0, reverse=True)
+                    active_summary = f"⚡ ACTIVE: {len(bot['positions'])} POS (${upnl:,.2f}) | TSL {buffer_bar} {stop_pct}% | "
 
-                # 🟢 5. SIGNAL PROCESSING
-                sig, thoughts, nums, score, signals_map = StrategyBrain.calculate_signals(df, config, 0.5, 0.5)                
-                ui_limit = float(config.get('mlThresholdLong', 0.5)) if current_price > ta.ema(df['close'], 200).iloc[-1] else float(config.get('mlThresholdShort', 0.5))
+                # B. Build Hunting Summary (Entries/Council)
+                hunting_summary = ""
+                ui_limit = float(config.get('mlThresholdLong', 0.80)) if current_price > ta.ema(df['close'], 200).iloc[-1] else float(config.get('mlThresholdShort', 0.90))
                 waiting_msg = DiagnosticLayer.get_pending_conditions(df, config, score, ui_limit)
-                status_header = "🔍 SCANNING"
-
-                # Restoring clean_curve for the UI
-                clean_curve = [p for p in bot.get("equityCurve", []) if p and isinstance(p, dict) and 'time' in p]
-                total_raw_pnl = sum([(current_price - p['entry']) * p['size'] if p['type'] == 'long' else (p['entry'] - current_price) * p['size'] for p in bot['positions']])
-
-                # 🛡️ DYNAMIC THINKING OVERWRITE (Exit Logic for Active Trade)
-                is_in_trade = len(bot['positions']) > 0
-                tsl_pct = float(config['params'].get('trailing_stop', 0.01))
-                if is_in_trade:
-                    p = bot['positions'][0]
-                    side = p['type'].upper()
-                    target, entry, tsl = p['tp'], p['entry'], p.get('tsl', 0)
                 
-                    
-                    entry_time = datetime.fromisoformat(p['time'].replace('Z', '+00:00'))
-                    duration = datetime.now(timezone.utc) - entry_time
-                    days, seconds = duration.days, duration.seconds
-                    hours = seconds // 3600
-                    minutes = (seconds % 3600) // 60
-                    secs = seconds % 60
-                    
-                    time_str = f"{duration.seconds // 60}m {duration.seconds % 60}s"
-                    status_header = f"⚡ ACTIVE: {side} (Held: {time_str})"
-                    
-                    
-                    if hours > 0: time_str = f"{hours}h " + time_str
-                    if days > 0: time_str = f"{days}d " + time_str
-                    
-                    total_distance = abs(target - entry)
-                    current_progress = abs(current_price - entry)
-                    tp_pct = min(100, round((current_progress / total_distance) * 100, 1)) if total_distance > 0 else 0
-                    tp_bar = "┃" + "█" * int(tp_pct / 10) + "░" * (10 - int(tp_pct / 10)) + "┃"
-
-                    stop_dist = abs(current_price - tsl)
-                    stop_pct = round((stop_dist / current_price) * 100, 2)
-                    
-                    # Visual buffer bar (closer to 0% = Danger)
-                    buffer_filled = max(0, min(10, int(stop_pct * 5))) # Scale: 2% distance = full bar
-                    buffer_bar = "┃" + "█" * buffer_filled + "░" * (10 - buffer_filled) + "┃"
-
-
-
-
-                    total_raw_pnl = sum([(current_price - p['entry']) * p['size'] if p['type'] == 'long' else (p['entry'] - current_price) * p['size'] for p in bot['positions']])
-                    
-                    
-                    exit_details = []
-                    status_header = f"⚡ ACTIVE: {len(bot['positions'])} POS"
-                    for i, p in enumerate(bot['positions']):
-                        side_icon = "🟢" if p['type'] == 'long' else "🔴"
-                        # Distance to Trailing Stop
-                        dist_to_stop = abs(current_price - p['tsl'])
-                        stop_pct = (dist_to_stop / current_price) * 100
-                        buffer_bar = DiagnosticLayer.render_progress(stop_pct, 2.0, reverse=True) # 2% is 'Full Safety'
-                        
-                        exit_details.append(f"Leg{i+1} {side_icon}: TSL {buffer_bar}")
-
-                    
-                    waiting_msg = f"🛡️ EXIT MODE | Total: ${total_raw_pnl:,.2f} | " + " | ".join(exit_details)
-                    status_header = f"⚡ ACTIVE: {len(bot['positions'])} POS"
-                    nums['market']['mindset'] = f"🛡️ SAFETY: TSL Buffer {buffer_bar} {stop_pct}% to STOP"
-
-                    nums['market']['intent'] = (
-                        f"🛡️ EXIT LOGIC: {side} @ ${round(entry, 2)} | "
-                        f"TSL: ${round(tsl, 2)} | "
-                        f"Target: ${round(target, 2)} | "
-                        f"Progress: {tp_bar} {tp_pct}%"
-                    )
-                    combined_status = f"{status_header} | {nums['market']['intent']} | {nums['market']['mindset']} | {waiting_msg}"
-                    trade_happended = False
-
+                if len(bot['positions']) < int(config.get('maxPyramiding', 1)):
+                    hunting_summary = f"🏹 STALKING LEG {len(bot['positions'])+1}: {int(score*100)}% ({sentiment}) | {waiting_msg}"
                 else:
-                   
-                     status_header = "🔍 SCANNING"
-                     waiting_msg = DiagnosticLayer.get_pending_conditions(df, config, score, ui_limit)
-                     hybrid_mode = (
-                         config.get('hybridMode') or 
-                         config.get('comboConfig', {}).get('combinationRule') or 
-                         "AND"
-                     ).upper()
-                     
-                     
+                    hunting_summary = "✅ PYRAMID FULL: Managing Exits"
 
+                # C. Build Indicator Targets String
                 active_results = []     
                 for strat in strategies:
-                    max_name_len = max([len(s['code'].replace('_', ' ')) for s in strategies]) if strategies else 10
                     code = strat['code']
                     val = int(signals_map.get(code, 0) * 100)
-                    display_name = code.replace('_', ' ').upper().ljust(max_name_len)
-                    filled = max(0, min(10, val // 10))
-                    bar = "┃" + "█" * filled + "░" * (10 - filled) + "┃"
-                    active_results.append(f"{display_name}: {bar} {val}%")
-                
+                    bar = DiagnosticLayer.render_progress(val, 100)
+                    active_results.append(f"{code.upper()}: {bar}")
                 targets_str = " | ".join(active_results)
 
-                # 🟢 NEW: UNIFIED DUAL-MODE LOGIC
-                # This prevents the Scanning string from overwriting the Exit string
-                if len(bot['positions']) > 0:
-                    # We are in a trade: Use the exit logic we calculated earlier in the loop
-                    exit_section = nums['market']['intent'] 
-                    combined_status = f"{status_header} | {exit_section} | 🔍 TARGETS ({hybrid_mode}): {targets_str}"
-                else:
-                    # We are scanning: Just show logic gates and targets
-                    intent_section = nums['market']['intent']
-                    combined_status = f"{status_header} | {intent_section} | {nums['market']['logic']} | 🔍 TARGETS ({hybrid_mode}): {targets_str}"
+                combined_status = f"{active_summary}{hunting_summary} | 🔍 {targets_str}"
 
-                # 🟢 EMIT LOG (Every 15s)
+                # 🟢 6. EMIT LOGS & UI UPDATES
                 now_ts = datetime.now().timestamp()
                 if (now_ts - last_log >= 15):
                     await emit_log(user_id, combined_status)
-                    last_log = now_ts         
+                    last_log = now_ts
 
-
-                
-                    
-                clean_curve = [pt for pt in bot.get("equityCurve", []) if pt and isinstance(pt, dict) and 'time' in pt]
-                markers = [{"time": int(c['time']), "position": "belowBar", "color": "#10b981", "text": thoughts[0] if thoughts else ""} for c in ohlcv_raw[-1:] if thoughts]
-                    
-                current_pos_val = sum([pos['entry'] * pos['size'] for pos in bot['positions']])
-                exposure_pct = round((current_pos_val / bot['balance']) * 100, 1) if bot['balance'] > 0 else 0
-
-                now_ts = datetime.now().timestamp()
                 if (now_ts - last_ui_update >= 10):
-                    await emit_log(user_id, combined_status)
                     exposure_pct = round((sum([p['entry'] * p['size'] for p in bot['positions']]) / bot['balance']) * 100, 1) if bot['balance'] > 0 else 0
                     await emit_status(user_id, {
                         "status": "running", "currentBalance": round(current_equity, 2), "exposure": exposure_pct,
                         "activePositions": bot['positions'], "unrealizedPnl": round(upnl, 2),
-                        "tradeMarkers": bot['trade_history'], "candles": await process_data_packet(df, config.get('strategies', [])),
+                        "tradeMarkers": bot['trade_history'], "candles": await process_data_packet(df_raw, strategies),
                         "currentConfidence": int(score * 100), "signalsMap": signals_map
-                })
-                last_ui_update = now_ts
-                    
-                 
-                # 🟢 6. TRADE EXECUTION: Confidence Climb & 60m Stability Logic
+                    })
+                    # Append to UI Equity Curve
+                    bot["equityCurve"].append({"time": datetime.now().isoformat(), "balance": round(current_equity, 2), "confidence": int(score * 100)})
+                    if len(bot["equityCurve"]) > 300: bot["equityCurve"].pop(0)
+                    last_ui_update = now_ts
+
+                # 🟢 7. TRADE EXECUTION LOGIC (Pyramiding + Stability Gates)
                 max_p = min(5, int(config.get('maxPyramiding', 5)))
-                
-                # ⏳ --- STEP A: STABILITY TIME GATE ---
                 current_time = datetime.now(timezone.utc)
-                last_trade_str = bot.get('last_trade_time')
+                
+                # Stability Time Gate
                 time_gate_passed = True
-                minutes_remaining = 0
-
-                if last_trade_str:
-                    last_trade_dt = datetime.fromisoformat(last_trade_str)
-                    minutes_since_last = (current_time - last_trade_dt).total_seconds() / 60
-                    
-                    if minutes_since_last < 60:
+                if bot.get('last_trade_time'):
+                    last_trade_dt = datetime.fromisoformat(bot.get('last_trade_time'))
+                    if (current_time - last_trade_dt).total_seconds() / 60 < 60:
                         time_gate_passed = False
-                        minutes_remaining = int(60 - minutes_since_last)
 
-                # 💰 --- STEP B: RISK & SIZE CALCULATIONS ---
-                ui_total_risk = float(config.get('riskPercentage', 30.0))
-                leg_risk_pct = max(5.0, ui_total_risk / max_p)
-                risk_decimal = leg_risk_pct / 100
-                size = (bot['balance'] * risk_decimal) / current_price
-                
-                # 🧠 --- STEP C: CONFIDENCE CLIMB CHECK (+10% Rule) ---
+                # Confidence Climb Check (+10% Rule)
                 last_pos = bot['positions'][-1] if bot['positions'] else None
-                last_conf = last_pos.get('entry_conf', 0) if last_pos else 0
-                
-                # Requirement: Score must be 0.10 (10%) higher than the last leg
-                climb_satisfied = (score >= last_conf + 0.10) if last_pos else True
+                climb_satisfied = (score >= last_pos.get('entry_conf', 0) + 0.10) if last_pos else True
 
-                # 🚀 --- STEP D: EXECUTION DECISION ---
-                if len(bot['positions']) < max_p:
-                    # Directional checks
-                    can_long = (sig == 1) and (not last_pos or (last_pos['type'] == 'long' and climb_satisfied) or (last_pos['type'] == 'short'))
-                    can_short = (sig == -1) and (not last_pos or (last_pos['type'] == 'short' and climb_satisfied) or (last_pos['type'] == 'long'))
+                # Entry Execution
+                if len(bot['positions']) < max_p and time_gate_passed:
+                    if (sig == 1 and (not last_pos or climb_satisfied)) or (sig == -1 and (not last_pos or climb_satisfied)):
+                        trade_type = "long" if sig == 1 else "short"
+                        size = (bot['balance'] * (float(config.get('riskPercentage', 10.0)) / 100 / max_p)) / current_price
+                        
+                        bot['positions'].append({
+                            "symbol": symbol, "type": trade_type, "entry": current_price, "size": size,
+                            "time": current_time.isoformat(), "entry_conf": score,
+                            "tp": current_price * (1 + float(params.get('take_profit', 0.1))) if sig == 1 else current_price * (1 - float(params.get('take_profit', 0.1))),
+                            "sl": current_price * (1 - float(params.get('stop_loss', 0.05))) if sig == 1 else current_price * (1 + float(params.get('stop_loss', 0.05))),
+                            "tsl": current_price * (1 - float(params.get('stop_loss', 0.05))) if sig == 1 else current_price * (1 + float(params.get('stop_loss', 0.05)))
+                        })
+                        bot['last_trade_time'] = current_time.isoformat()
+                        await emit_log(user_id, f"🚀 ENTERED {trade_type.upper()} LEG {len(bot['positions'])} | Conf: {int(score*100)}%")
+                        DatabaseHandler.save_state(user_id, bot)
 
-                    if (can_long or can_short):
-                        # 🛡️ THE STABILITY LOCK: Check if we are still in the 60m window
-                        if not time_gate_passed:
-                            # Log every 15s to let you know we are stalking the next leg
-                            if (now_ts - last_log >= 15):
-                                await emit_log(user_id, f"⏳ STABILITY GATE: Signal is valid ({int(score*100)}%), but waiting {minutes_remaining}m to confirm trend stability.")
-                        else:
-                            # 🟢 EXECUTE THE TRADE
-                            trade_type = "long" if can_long else "short"
-                            bot['positions'].append({
-                                "symbol": symbol, 
-                                "type": trade_type, 
-                                "entry": current_price, 
-                                "size": size, 
-                                "time": current_time.isoformat(), 
-                                "tp": current_price * (1 + ui_tp) if can_long else current_price * (1 - ui_tp),
-                                "sl": current_price * (1 - ui_sl) if can_long else current_price * (1 + ui_sl), 
-                                "tsl": current_price * (1 - ui_sl) if can_long else current_price * (1 + ui_sl),
-                                "entry_conf": score 
-                            })
-
-                            # 🟢 UPDATE TIMESTAMPS FOR NEXT LEG
-                            bot['last_trade_time'] = current_time.isoformat()
-                            
-                            icon = "🚀" if can_long else "🔻"
-                            await emit_log(user_id, f"{icon} {trade_type.upper()} LEG {len(bot['positions'])} | Conf: {int(score*100)}% | Stability Window Reset (60m)")
-                            
-                            # Save state immediately after trade
-                            DatabaseHandler.save_state(user_id, bot)
-                
-
-                # 🟢 6. TRADE EXECUTION: Exit Monitoring (Individually per Leg)
-                # We iterate over a slice [:] to allow safe removal from the list
+                # 🟢 8. EXIT MONITORING (Individually per Leg)
+                tsl_pct = float(params.get('trailing_stop', 0.01))
                 for pos in bot['positions'][:]:
-                    closed, exit_reason, pnl = False, "", 0
-                    tsl_pct = float(config.get('params', {}).get('trailing_stop', 0.01))
-                    
-                    # A. LONG LEG MONITORING
+                    closed, pnl = False, 0
+                    # Trailing Stop Movement
                     if pos['type'] == 'long':
-                        # 📈 Trailing Stop Movement
-                        if tsl_pct > 0:
-                            # Calculate where the TSL should be based on CURRENT price
-                            potential_tsl = current_price * (1 - tsl_pct)
-                            # Only move it UP, never down
-                            if potential_tsl > pos['tsl']:
-                                pos['tsl'] = potential_tsl
-
-                        # 🛑 Check Exit Conditions
-                        if current_price >= pos['tp']:
-                            closed, exit_reason = True, "💰 TP HIT"
-                            pnl = (current_price - pos['entry']) * pos['size']
-                        elif current_price <= pos['tsl']:
-                            closed, exit_reason = True, "🛑 TSL HIT"
-                            pnl = (current_price - pos['entry']) * pos['size']
-
-                    # B. SHORT LEG MONITORING
-                    elif pos['type'] == 'short':
-                        # 📉 Trailing Stop Movement
-                        if tsl_pct > 0:
-                            # Calculate where the TSL should be based on CURRENT price
-                            potential_tsl = current_price * (1 + tsl_pct)
-                            # Only move it DOWN, never up
-                            if potential_tsl < pos['tsl']:
-                                pos['tsl'] = potential_tsl
-
-                        # 🛑 Check Exit Conditions
-                        if current_price <= pos['tp']:
-                            closed, exit_reason = True, "💰 TP HIT"
-                            pnl = (pos['entry'] - current_price) * pos['size']
-                        elif current_price >= pos['tsl']:
-                            closed, exit_reason = True, "🛑 TSL HIT"
-                            pnl = (pos['entry'] - current_price) * pos['size']
-
-                    # C. EXECUTE CLOSURE
+                        if current_price * (1 - tsl_pct) > pos['tsl']: pos['tsl'] = current_price * (1 - tsl_pct)
+                        if current_price >= pos['tp'] or current_price <= pos['tsl']:
+                            closed = True; pnl = (current_price - pos['entry']) * pos['size']
+                    else:
+                        if current_price * (1 + tsl_pct) < pos['tsl']: pos['tsl'] = current_price * (1 + tsl_pct)
+                        if current_price <= pos['tp'] or current_price >= pos['tsl']:
+                            closed = True; pnl = (pos['entry'] - current_price) * pos['size']
+                    
                     if closed:
                         bot['balance'] += pnl
                         bot['positions'].remove(pos)
-                        
-                        # Record in history
-                        exit_time = datetime.now(timezone.utc).isoformat()
-                        bot['trade_history'].append({
-                            "type": "exit", 
-                            "side": pos['type'],
-                            "price": current_price, 
-                            "pnl": round(pnl, 2), 
-                            "time": exit_time,
-                            "reason": exit_reason
-                        })
-                        
-                        await emit_log(user_id, f"{exit_reason}: {pos['type'].upper()} closed at ${current_price} | PnL: ${round(pnl, 2)}")
-                        trade_happened = True
+                        bot['trade_history'].append({"type": "exit", "side": pos['type'], "price": current_price, "pnl": round(pnl, 2), "time": datetime.now(timezone.utc).isoformat()})
+                        await emit_log(user_id, f"💰 CLOSED {pos['type'].upper()} | PnL: ${round(pnl, 2)}")
                         DatabaseHandler.save_state(user_id, bot)
 
-                # 🟢 Final Breath for the Loop
-                await asyncio.sleep(0.1)
-
-                # 🟢 8. PACKAGING DATA FOR UI
-                keys = ['bb_lower', 'bb_upper', 'ema_fast', 'ema_slow', 'sma_fast', 'sma_slow', 'supertrend', 'pa_high', 'pa_low', 'atr_upper', 'atr_lower', 'rsi', 'stoch_k', 'stoch_d', 'macd', 'macd_signal', 'vol_ma']
-                candles_to_send = []
-                for _, row in df.tail(100).iterrows():
-                    c_obj = {"time": int(row['time']), "open": row['open'], "high": row['high'], "low": row['low'], "close": row['close']}
-                    for k in keys:
-                        if k in row and not pd.isna(row[k]): c_obj[k] = float(row[k])
-                    candles_to_send.append(c_obj)
-
-                markers = [{"time": int(c['time']), "position": "belowBar", "color": "#10b981", "text": thoughts[0] if thoughts else ""} for c in ohlcv_raw[-1:] if thoughts]
-                
-                # Correct Exposure % Calculation
-                current_pos_val = sum([p['entry'] * p['size'] for p in bot['positions']])
-                exposure_pct = round((current_pos_val / bot['balance']) * 100, 1) if bot['balance'] > 0 else 0
-
-                # 🚀 CONSOLIDATED EMIT
-                await emit_status(user_id, {
-                    "status": "running", 
-                    "currentBalance": round(current_equity, 2), 
-                    "unrealizedPnl": round(upnl, 2),
-                    "activePositions": bot['positions'], 
-                    "tradeMarkers": bot['trade_history'] + markers,
-                    "equityCurve": clean_curve, 
-                    "startedAt": bot.get("startedAt"), 
-                    "candles": candles_to_send,
-                    "exposure": exposure_pct,
-                    "currentConfidence": int(score * 100)
-                })
-                
-                await asyncio.sleep(0.1) # Yield for network
-
-                # Housekeeping
-                # 🟢 1. UI HEARTBEAT (Execute every loop)
-                # This appends to the curve immediately so the UI charts draw lines instantly.
-                bot["equityCurve"].append({
-                    "time": datetime.now().isoformat(), 
-                    "balance": round(current_equity, 2), 
-                    "confidence": int(score * 100)
-                })
-                
-                # Keep the memory buffer lean (last 100-300 points)
-                if len(bot["equityCurve"]) > 300: 
-                    bot["equityCurve"].pop(0)
-                
-                # 🟢 2. DATABASE SYNC (Execute every 60s)
-                # We only write to the disk/database periodically to save performance.
+                # 🟢 9. HOUSEKEEPING
                 if datetime.now().timestamp() - last_log >= 60:
                     DatabaseHandler.save_state(user_id, bot)
-                    last_log = datetime.now().timestamp()
-
-                await asyncio.sleep(0.1)
+                
+                await asyncio.sleep(0.5)
 
             except Exception as e:
                 logger.error(f"❌ WS Stream Error: {e}"); await asyncio.sleep(5)

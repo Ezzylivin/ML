@@ -138,11 +138,18 @@ class BacktestRequest(BaseModel):
     endDate: str
     initialBalance: float = 1000.0
     riskPercentage: float = 1.0
-    code: str  # The strategy code (e.g., "stoch")
+    code: str  
     mlModel: str = "stacking"
+    # 🎯 FIX: Make this Optional so the API doesn't crash if it's missing
+    # We will map 'mlThresholdLong' to this inside the endpoint logic
+    ml_confidence_threshold: Optional[float] = 0.8 
+    
+    # 🎯 ADD: Support for the actual keys being sent by the frontend
+    mlThresholdLong: Optional[float] = 0.8
+    mlThresholdShort: Optional[float] = 0.8
+    
     trend_strategy: Optional[str] = "atr_breakout"
     range_strategy: Optional[str] = "bollinger_reversal"
-    ml_confidence_threshold: float
     trade_direction: Optional[str] = "BOTH"
     params: Optional[Dict[str, Any]] = {}
     
@@ -161,9 +168,11 @@ class ComboRequest(BaseModel):
     take_profit: Optional[float] = 0.06
     stop_loss: Optional[float] = 0.03
     trailing_stop: Optional[float] = 0.02
-    mlModel: Optional[str] = None
-    mlThresholdLong: float  # Remove the = 0.50 to force it to be required
-    mlThresholdShort: float
+    mlModel: Optional[str] = "stacking"
+    # 🎯 FIX: Use defaults here as well to prevent "Field Required" errors
+    # if the frontend user leaves a slider untouched.
+    mlThresholdLong: float = 0.8
+    mlThresholdShort: float = 0.8
     mlMode: Optional[str] = None
     advanced_filters: Optional[Dict] = {}
     params: Optional[Dict[str, Any]] = {}
@@ -933,10 +942,16 @@ async def close_position(data: BotClosePositionRequest):
 async def run_backtest(request: BacktestRequest):
     try:
         # 1. Standardize UI request keys for the Backtester class
+        # .dict() is used to manipulate the keys before passing to Backtester
         config = request.dict()
+        
+        # 🎯 KEY BRIDGING: Map all possible UI names to the Engine's expected names
+        # We look for 'mlThresholdLong' first (UI), then 'ml_confidence_threshold' (API default)
+        final_thresh = config.get('mlThresholdLong') or config.get('ml_confidence_threshold') or 0.8
+        
+        config['mlThresholdLong'] = final_thresh
+        config['mlThresholdShort'] = config.get('mlThresholdShort') or final_thresh
         config['risk_percentage'] = config.get('riskPercentage', 1.0)
-        config['mlThresholdLong'] = config.get('ml_confidence_threshold', 0.8)
-        config['mlThresholdShort'] = config.get('ml_confidence_threshold', 0.8)
         
         # 2. Wrap the single code into the list format the Backtester expects
         config['strategies'] = [{"code": request.code, "params": request.params}]
@@ -951,7 +966,7 @@ async def run_backtest(request: BacktestRequest):
     except Exception as e:
         logger.error(f"❌ Simplified Atomic Run Error: {e}")
         return JSONResponse(status_code=500, content={"status": "failed", "error": str(e)})
-        
+
         
 @app.post('/api/backtest/combo')
 async def run_combo_backtest(req: ComboRequest):
@@ -959,7 +974,12 @@ async def run_combo_backtest(req: ComboRequest):
         # 1. Convert Pydantic model to a raw dictionary
         config = req.dict()
 
-        logger.info(f"UI THRESHOLD RECEIVED: {req.mlThresholdLong}")
+        # 🎯 KEY BRIDGING: Ensure Combo also respects internal naming
+        config['mlThresholdLong'] = config.get('mlThresholdLong', 0.8)
+        config['mlThresholdShort'] = config.get('mlThresholdShort', 0.8)
+        config['risk_percentage'] = config.get('risk_percentage', 1.0)
+
+        logger.info(f"⚖️ COMBO RUN: {len(config.get('strategies', []))} Strategies | AI Limit: {config['mlThresholdLong']}")
         
         # 2. Import the Class from your file
         from app.backtest2 import Backtester
@@ -971,8 +991,8 @@ async def run_combo_backtest(req: ComboRequest):
         # 4. Return the result EXACTLY as the file produced it
         return result
     except Exception as e:
-        logger.error(f"Link Error: {e}")
-        return {"status": "failed", "error": str(e)}
+        logger.error(f"❌ Combo Link Error: {e}")
+        return JSONResponse(status_code=500, content={"status": "failed", "error": str(e)})
 
 
 @app.get("/api/bot/status")

@@ -10,7 +10,6 @@ logger = logging.getLogger("BacktestEngine")
 
 class RawModelAdapter:
     def __init__(self, model_payload):
-
         self.default_features = [
             'open', 'high', 'low', 'close', 'volume',
             'sma_50', 'sma_200', 'ema_9', 'ema_21', 'ema_20',
@@ -23,45 +22,43 @@ class RawModelAdapter:
         
         if isinstance(model_payload, dict):
             self.model = model_payload.get('model')
-            # 🎯 CRITICAL: This must match the 8 features the model was trained on
             self.feature_names = model_payload.get('feature_names', self.default_features)
-            self.is_meta = model_payload.get('is_meta_model', False)
+            # 🎯 SYNCED NAME: using 'is_meta_model' to match the predict function
+            self.is_meta_model = model_payload.get('is_meta_model', False)
         else:
             self.model = model_payload
             self.feature_names = self.default_features
-            self.is_meta = False
+            self.is_meta_model = False
 
     def predict_direction(self, df_history, council_probs=None):
-        """
-        Smart Predictor:
-        - If Meta-Model: Uses council_probs (XGB_score, RF_score, etc)
-        - If Transformer: Uses 50-row sequence
-        - If Expert: Uses last row
-        """
         try:
-            # 1. JUDGE LOGIC (Stacking)
-            if self.is_meta and council_probs is not None:
-                X = np.array([council_probs])
-                return float(self.model.predict_proba(X)[0][-1])
+            # 1. JUDGE LOGIC (Stacking/Meta-Model)
+            # Now self.is_meta_model will correctly evaluate to True
+            if self.is_meta_model and council_probs is not None:
+                X = np.array([council_probs]) 
+                return float(self.model.predict_proba(X)[0][1])
 
             # 2. TRANSFORMER LOGIC (.keras)
-            if hasattr(self.model, "input_shape") and not self.is_meta:
-                if len(df_history) < 50: return 0.5
+            if hasattr(self.model, "input_shape"):
+                if len(df_history) < 50: 
+                    return 0.5
                 X_seq = df_history[self.feature_names].tail(50).values
-                X_seq = np.expand_dims(X_seq, axis=0) # Shape (1, 50, 25)
-                return float(self.model.predict(X_seq, verbose=0)[0][0])
+                X_seq = np.expand_dims(X_seq, axis=0)
+                pred = self.model.predict(X_seq, verbose=0)[0]
+                return float(pred[1] if len(pred) > 1 else pred[0])
 
-            # 3. EXPERT LOGIC (XGB/RF)
+            # 3. EXPERT LOGIC (XGB/RF/LightGBM)
             last_row = df_history[self.feature_names].iloc[[-1]]
             if hasattr(self.model, "predict_proba"):
-                conf = float(self.model.predict_proba(last_row)[0][-1])
-                return 0.75 if conf > 0.99 else conf # Squeeze
+                conf = float(self.model.predict_proba(last_row)[0][1])
+                return min(0.99, max(0.01, conf))
             
             return float(self.model.predict(last_row)[0])
 
         except Exception as e:
             logger.error(f"❌ Adapter Prediction Error: {e}")
             return 0.5
+
 
 class Backtester:
     def __init__(self, config: dict):

@@ -476,7 +476,7 @@ async def process_data_packet(df: pd.DataFrame, strategies: list) -> list:
             'atr_upper', 'atr_lower', 'pa_high', 'pa_low', 'vol_ma']
 
     candles_to_send = []
-    for _, row in df.tail(100).iterrows()::
+    for _, row in df.tail(100).iterrows():
         ts = int(row['time']) if 'time' in row else int(row.name.timestamp())
         c_obj = {"time": ts, "open": row['open'], "high": row['high'], "low": row['low'], "close": row['close']}
         for k in keys:

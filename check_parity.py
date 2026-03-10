@@ -1,78 +1,70 @@
 import os
 import pandas as pd
 import numpy as np
-import pandas_ta as ta
 import joblib
-from app.config2 import MODEL_STORAGE_DIR, DATA_DIR
+from app.config2 import DATA_DIR
 from app.predictors.model_factory import ModelFactory
-
-
-def apply_v7_features(df):
-    """Parity Feature Engineering: Matches backtest and training exactly."""
-    df = df.copy()
-    df.columns = [c.lower() for c in df.columns]
-    
-    # Core 10 Features
-    df['rsi'] = ta.rsi(df['close'], length=14)
-    df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-    df['atr_logic'] = (df['atr'] / df['close']) * 1000
-    
-    adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
-    df['adx'] = adx_df['ADX_14']
-    df['adx_logic'] = np.where(df['adx'] > 25, 1, 0)
-    
-    df['sma_200'] = ta.sma(df['close'], length=200)
-    df['sma_logic'] = np.where(df['close'] > df['sma_200'], 1, -1)
-    
-    # List of 10 features in strict order
-    features = ['open', 'high', 'low', 'close', 'rsi', 'atr', 'adx', 'adx_logic', 'atr_logic', 'sma_logic']
-    return df.dropna(subset=features), features
+# 🎯 V25 UPGRADE: Use the master engineer instead of the old v7 function
+from app.verify.engineer_and_train import apply_mega_features
 
 def run_parity_audit(symbol="BTC-USD"):
-    print(f"\n⚖️⚖️⚖️ LOGIC PARITY AUDIT: {symbol} ⚖️⚖️⚖️")
+    print(f"\n" + "="*50)
+    print(f"🚀 NEO-V25 FULL COUNCIL PARITY AUDIT: {symbol}")
+    print("="*50)
     
-    # 1. Load and Prepare Data
+    # 1. Load and Prepare Data (Using 25 features)
     path = os.path.join(DATA_DIR, f"{symbol}-1h.csv")
-    df_raw = pd.read_csv(path)
-    df, features = apply_v7_features(df_raw)
-    
-    # Take a 60-row slice to test both 50-lookback and 1-row logic
-    test_slice = df.tail(60) 
-    print(f"📊 Testing with {len(test_slice)} rows and {len(features)} numeric features.")
+    if not os.path.exists(path):
+        print(f"❌ CSV Missing: {path}")
+        return
 
-    # 2. Load the Council via Factory
-    experts = ["XGBoost", "RandomForest", "Transformer"]
-    results = {}
+    df_raw = pd.read_csv(path)
+    # Apply the 25-feature logic used in training
+    df, features = apply_mega_features(df_raw)
+    
+    test_slice = df.tail(100) 
+    print(f"✅ Data Ready: {len(test_slice)} rows | {len(features)} features")
+
+    # 2. Gather Expert Scores
+    experts = ["xgboost", "randomforest", "transformer"]
+    council_scores = []
 
     for name in experts:
-        print(f"Attempting {name}...")
         model = ModelFactory.load_model(name, symbol=symbol)
         if model:
             try:
-                # This calls the 'bridge' we built in ModelFactory
+                # The adapter handles sequence vs row logic automatically
                 prob = model.predict_direction(test_slice)
-                results[name] = prob
-                print(f"   ✅ {name} Prediction: {prob:.4f}")
+                print(f"   [{name.ljust(12)}] 🟢 PASSED | Score: {prob:.4f}")
+                council_scores.append(prob)
             except Exception as e:
-                print(f"   ❌ {name} LOGIC FAILURE: {e}")
+                print(f"   [{name.ljust(12)}] ❌ LOGIC FAILURE: {e}")
+                council_scores.append(0.5)
         else:
-            print(f"   ❌ {name} FILE MISSING.")
+            print(f"   [{name.ljust(12)}] 🔴 FILE MISSING")
+            council_scores.append(0.5)
 
-    # 3. Check Stacking Judge (The MetaModel)
-    print("\n⚖️ Testing Stacking Judge...")
+    # 3. Check Stacking Judge (The Meta-Model)
+    print("\n⚖️ Testing Stacking Judge (The Meta-Pass)...")
     stacker = ModelFactory.load_model("stacking", symbol=symbol)
+    
     if stacker:
         try:
-            final_prob = stacker.predict_direction(test_slice)
-            print(f"   🎯 FINAL STACKED PROBABILITY: {final_prob:.4f}")
+            # 🎯 CRITICAL: We pass the scores from Step 2 into Step 3
+            # This triggers the 'is_meta_model' logic in the RawModelAdapter
+            final_prob = stacker.predict_direction(test_slice, council_probs=council_scores)
+            
+            status = "✨ PARITY PASSED" if final_prob != 0.5 else "⚠️ WARNING (Neutral)"
+            print(f"   [{'stacking'.ljust(12)}] {status} | Score: {final_prob:.4f}")
             
             if final_prob == 0.5:
-                print("   ⚠️ WARNING: Result is exactly 0.5. Check if MetaModel is failing.")
-            else:
-                print("   ✨ PARITY PASSED: Council is fully synchronized.")
+                print("\n   💡 Tip: If score is 0.5, ensure 'is_meta_model' is True in RawModelAdapter.")
         except Exception as e:
             print(f"   ❌ STACKING CRASH: {e}")
+    else:
+        print(f"   ❌ STACKING JUDGE FILE MISSING.")
 
 if __name__ == "__main__":
-    run_parity_audit("BTC-USD")
-(venv) root@intelligent-mendel:~/Project/ML# 
+    # Test all symbols in your council
+    for sym in ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "PEPE-USD"]:
+        run_parity_audit(sym)

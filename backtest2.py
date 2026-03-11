@@ -228,26 +228,35 @@ class Backtester:
                 return {"status": "failed", "error": "No data found for range."}
             
             # 2. 🚀 TURBO PRE-CALCULATION
+            # --- 🚀 TURBO BATCH PRE-CALCULATION ---
             if self.model_name and self.model_name != "off":
+                import time
+                batch_start_time = time.time()
+                
+                # Hire once
                 from app.predictors.stacking_predictor import StackingPredictor
                 ml_engine = StackingPredictor(symbol=self.symbol, timeframe=self.timeframe)
                 
-                # 🎯 THE FIX: Extract feature names and convert to NumPy Matrix ONCE
-                # This stops Pandas from re-indexing 9,267 times.
+                # Matrix once
                 feature_cols = ml_engine.experts['transformer'].feature_names
                 numpy_matrix = df_slice[feature_cols].values.astype('float32')
                 
-                logger.info(f"🏎️ TURBO: Batch-processing {len(df_slice) - 50} AI predictions...")
-                
                 ai_scores = []
-                # Start loop at index 50 to satisfy Transformer sequence requirements
+                total = len(df_slice) - 50
+                
+                logger.info(f"🚀 STARTING AI CRUNCH: {total} candles...")
+            
                 for i in range(50, len(df_slice)):
-                    # 🎯 THE FIX: Slice raw NumPy memory (near-instant)
-                    X_np_slice = numpy_matrix[i-49 : i+1] 
-                    
-                    # Pass the raw NumPy slice to the engine
-                    score = ml_engine.predict_direction(X_np_slice)
-                    ai_scores.append(score)
+                    # HEARTBEAT: Print every 1000 candles so we can see it's alive
+                    if (i - 50) % 1000 == 0:
+                        pct = round(((i - 50) / total) * 100)
+                        logger.info(f"📊 AI Progress: {pct}% ({i-50}/{total})")
+            
+                    # The math
+                    X_slice = numpy_matrix[i-49 : i+1] 
+                    ai_scores.append(ml_engine.predict_direction(X_slice))
+                
+                logger.info(f"✅ AI CRUNCH DONE in {time.time() - batch_start_time:.2f}s")
                 
                 df_final = df_slice.iloc[50:].copy()
                 df_final['ai_conf'] = ai_scores

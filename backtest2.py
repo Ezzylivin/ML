@@ -75,9 +75,9 @@ class RawModelAdapter:
                 
                 return float(self.model.predict(last_row)[0])
 
-    except Exception as e:
-        logger.error(f"❌ Adapter Prediction Error: {e}")
-        return 0.5
+            except Exception as e:
+                logger.error(f"❌ Adapter Prediction Error: {e}")
+                return 0.5
   
     def predict(self, df_history, council_probs=None):
         return self.predict_direction(df_history, council_probs=council_probs)

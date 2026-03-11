@@ -22,7 +22,7 @@ class StackingPredictor:
         self.judge = ModelFactory.load_model("stacking", self.symbol, self.timeframe)
         logger.info(f"⚖️ Council of Experts assembled for {symbol}")
 
-    def predict_direction(self, df_history: pd.DataFrame) -> float:
+    def predict_direction(self, df_history) -> float:
         opinions = {}
         
         # 1. Gather Individual Expert Testimony (From RAM, not Disk!)

@@ -39,39 +39,46 @@ class RawModelAdapter:
             except Exception as e:
                 logger.warning(f"⚠️ Could not pre-warm model: {e}")
 
-    def predict_direction(self, df_history, council_probs=None):
-        try:
-            # 1. JUDGE LOGIC (Stacking)
-            if self.is_meta_model and council_probs is not None:
-                X = np.array([council_probs]) 
-                return float(self.model.predict_proba(X)[0][1])
+    def predict_direction(self, input_data, council_probs=None):
+    try:
+        # 1. JUDGE LOGIC (Stacking)
+        if self.is_meta_model and council_probs is not None:
+            X = np.array([council_probs]) 
+            return float(self.model.predict_proba(X)[0][1])
 
-            # 2. TRANSFORMER LOGIC (.keras) - High Speed Signature Locking
-            if hasattr(self.model, "input_shape"):
-                if len(df_history) < 50:
-                    return 0.5
-                
-                # Fixed shape (Exactly 50 rows) prevents 'retracing'
-                X_raw = df_history[self.feature_names].tail(50).values.astype('float32')
-                X_tensor = tf.convert_to_tensor(X_raw)
-                X_tensor = tf.expand_dims(X_tensor, 0)
-                
-                # Calling model directly is faster than .predict() for loops
-                preds = self.model(X_tensor, training=False) 
-                return float(preds[0][1] if preds.shape[1] > 1 else preds[0][0])
+        # 🚀 THE TURBO FIX: Check if we are receiving a NumPy slice
+        is_numpy = isinstance(input_data, np.ndarray)
 
-            # 3. EXPERT LOGIC (XGB/RF)
-            last_row = df_history[self.feature_names].iloc[[-1]]
-            if hasattr(self.model, "predict_proba"):
-                conf = float(self.model.predict_proba(last_row)[0][1])
-                return min(0.99, max(0.01, conf))
+        # 2. TRANSFORMER LOGIC
+        if hasattr(self.model, "input_shape"):
+            if is_numpy:
+                X_raw = input_data.astype('float32') # Already sliced 50 rows!
+            else:
+                if len(input_data) < 50: return 0.5
+                X_raw = input_data[self.feature_names].tail(50).values.astype('float32')
             
-            return float(self.model.predict(last_row)[0])
+            X_tensor = tf.convert_to_tensor(X_raw)
+            X_tensor = tf.expand_dims(X_tensor, 0)
+            preds = self.model(X_tensor, training=False) 
+            return float(preds[0][1] if preds.shape[1] > 1 else preds[0][0])
 
-        except Exception as e:
-            logger.error(f"❌ Adapter Prediction Error: {e}")
-            return 0.5
+        # 3. EXPERT LOGIC (XGB/RF)
+        if is_numpy:
+            # Last row of the 50-row slice
+            last_row = input_data[-1:].astype('float32')
+        else:
+            last_row = input_data[self.feature_names].iloc[[-1]]
 
+        if hasattr(self.model, "predict_proba"):
+            conf = float(self.model.predict_proba(last_row)[0][1])
+            return min(0.99, max(0.01, conf))
+        
+        return float(self.model.predict(last_row)[0])
+
+    except Exception as e:
+        logger.error(f"❌ Adapter Prediction Error: {e}")
+        return 0.5
+  
     def predict(self, df_history, council_probs=None):
         return self.predict_direction(df_history, council_probs=council_probs)
 

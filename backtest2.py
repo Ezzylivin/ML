@@ -214,24 +214,32 @@ class Backtester:
             df_full = self.calculate_indicators(df_raw)
             user_start = pd.to_datetime(self.start_str).replace(tzinfo=None)
             
-            # Slice with padding for the AI window
+            # Slice with padding for the AI window (60 hours ensures 50-row lookback)
             df_slice = df_full[df_full.index >= (user_start - pd.Timedelta(hours=60))].copy()
             
             if df_slice.empty:
                 return {"status": "failed", "error": "No data found for range."}
             
-            # 2. 🚀 TURBO BATCH PRE-CALCULATION
-            from app.predictors.stacking_predictor import StackingPredictor
-            
+            # 2. 🚀 TURBO PRE-CALCULATION
             if self.model_name and self.model_name != "off":
                 from app.predictors.stacking_predictor import StackingPredictor
-                
                 ml_engine = StackingPredictor(symbol=self.symbol, timeframe=self.timeframe)
-                logger.info(f"🏎️ TURBO: Batch-processing {len(df_slice)} AI predictions...")
+                
+                # 🎯 THE FIX: Extract feature names and convert to NumPy Matrix ONCE
+                # This stops Pandas from re-indexing 9,267 times.
+                feature_cols = ml_engine.experts['transformer'].feature_names
+                numpy_matrix = df_slice[feature_cols].values.astype('float32')
+                
+                logger.info(f"🏎️ TURBO: Batch-processing {len(df_slice) - 50} AI predictions...")
                 
                 ai_scores = []
+                # Start loop at index 50 to satisfy Transformer sequence requirements
                 for i in range(50, len(df_slice)):
-                    score = ml_engine.predict_direction(df_slice.iloc[:i+1])
+                    # 🎯 THE FIX: Slice raw NumPy memory (near-instant)
+                    X_np_slice = numpy_matrix[i-49 : i+1] 
+                    
+                    # Pass the raw NumPy slice to the engine
+                    score = ml_engine.predict_direction(X_np_slice)
                     ai_scores.append(score)
                 
                 df_final = df_slice.iloc[50:].copy()
@@ -245,9 +253,13 @@ class Backtester:
             tp_price, tsl_price = 0, 0
             equity_curve, trades, vetoed_logs = [], [], []
 
-            for i in range(len(df_final)):
-                row = df_final.iloc[i]
-                current_time = str(row.name)
+            # 🎯 THE FIX: Convert DataFrame to a list of dicts for faster iteration
+            rows = df_final.to_dict('records')
+            timestamps = df_final.index.astype(str).tolist()
+
+            for i in range(len(rows)):
+                row = rows[i]
+                current_time = timestamps[i]
                 signal = self.get_signal(row, self.strategies)
 
                 conf_score = row['ai_conf']
@@ -255,7 +267,7 @@ class Backtester:
                 limit = self.ml_limit_short if is_short_trend else self.ml_limit_long
                 gate_passed = conf_score >= limit
 
-                # Veto logging
+                # Veto logging (sampled)
                 if signal != 0 and not gate_passed and position is None and i % 5 == 0:
                     vetoed_logs.append({
                         "time": current_time, "signal": "Long" if signal == 1 else "Short",
@@ -283,7 +295,7 @@ class Backtester:
                         })
                         position = None
                         continue
-
+                    
                     # Update TSL
                     if position == 'long':
                         new_tsl = row['high'] * (1 - self.ts_pct)

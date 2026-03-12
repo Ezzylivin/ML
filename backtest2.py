@@ -221,40 +221,53 @@ class Backtester:
             df_full = self.calculate_indicators(df_raw)
             user_start = pd.to_datetime(self.start_str).replace(tzinfo=None)
             
-            # Slice with padding for the AI window (60 hours ensures 50-row lookback)
             df_slice = df_full[df_full.index >= (user_start - pd.Timedelta(hours=60))].copy()
+            if df_slice.empty: return {"status": "failed", "error": "No data found."}
             
-            if df_slice.empty:
-                return {"status": "failed", "error": "No data found for range."}
-            
-            # 2. 🚀 TURBO PRE-CALCULATION
-            # --- 🚀 TURBO BATCH PRE-CALCULATION ---
+            # 2. 🚀 TURBO BATCH PRE-CALCULATION
             if self.model_name and self.model_name != "off":
                 import time
                 batch_start_time = time.time()
                 
-                # Hire once
                 from app.predictors.stacking_predictor import StackingPredictor
                 ml_engine = StackingPredictor(symbol=self.symbol, timeframe=self.timeframe)
                 
-                # Matrix once
+                # Extract feature names and convert to NumPy Matrix ONCE
                 feature_cols = ml_engine.experts['transformer'].feature_names
                 numpy_matrix = df_slice[feature_cols].values.astype('float32')
                 
-                ai_scores = []
-                total = len(df_slice) - 50
-                
-                logger.info(f"🚀 STARTING AI CRUNCH: {total} candles...")
-            
+                # --- 🎯 TRANSFORMER BATCH ACCELERATION ---
+                # We collect all 50-row windows into a single 3D block
+                transformer_input_batch = []
                 for i in range(50, len(df_slice)):
-                    # HEARTBEAT: Print every 1000 candles so we can see it's alive
-                    if (i - 50) % 1000 == 0:
-                        pct = round(((i - 50) / total) * 100)
-                        logger.info(f"📊 AI Progress: {pct}% ({i-50}/{total})")
-            
-                    # The math
-                    X_slice = numpy_matrix[i-49 : i+1] 
-                    ai_scores.append(ml_engine.predict_direction(X_slice))
+                    transformer_input_batch.append(numpy_matrix[i-49 : i+1])
+                
+                logger.info(f"📡 Sending {len(transformer_input_batch)} candles to Transformer in ONE batch...")
+                
+                # Get the raw Keras model and run everything in one go
+                transformer_model = ml_engine.experts['transformer'].model
+                full_batch_tensor = tf.convert_to_tensor(np.array(transformer_input_batch), dtype=tf.float32)
+                all_transformer_preds = transformer_model(full_batch_tensor, training=False).numpy()
+                
+                # Extract probabilities (usually index 1 for 'Buy')
+                transformer_scores = [float(p[1] if p.shape[0] > 1 else p[0]) for p in all_transformer_preds]
+                logger.info(f"✅ Transformer Batch Complete in {time.time() - batch_start_time:.2f}s")
+                # ----------------------------------------
+
+                # Now run the Expert loop using the pre-calculated scores
+                ai_scores = []
+                total = len(transformer_scores)
+                for i in range(total):
+                    if i % 1000 == 0:
+                        logger.info(f"📊 Final Stacking Progress: {i}/{total}")
+
+                    # We pass the pre-calculated transformer score to skip the 447ms delay
+                    # Ensure your predict_direction in StackingPredictor accepts this new param!
+                    score = ml_engine.predict_direction(
+                        transformer_input_batch[i], 
+                        precalc_transformer=transformer_scores[i]
+                    )
+                    ai_scores.append(score)
                 
                 logger.info(f"✅ AI CRUNCH DONE in {time.time() - batch_start_time:.2f}s")
                 

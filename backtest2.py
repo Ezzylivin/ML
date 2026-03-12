@@ -227,7 +227,6 @@ class Backtester:
                 feature_cols = ml_engine.experts['transformer'].feature_names
                 numpy_matrix = df_slice[feature_cols].values.astype('float32')
                 
-                # --- 🎯 TRANSFORMER BATCH ACCELERATION ---
                 transformer_input_batch = []
                 for i in range(50, len(df_slice)):
                     transformer_input_batch.append(numpy_matrix[i-49 : i+1])
@@ -235,24 +234,19 @@ class Backtester:
                 logger.info(f"📡 Sending {len(transformer_input_batch)} samples to Transformer in ONE batch...")
                 
                 transformer_model = ml_engine.experts['transformer'].model
-                # Convert list to one massive 3D NumPy array, then to a single Tensor
                 full_batch_tensor = tf.convert_to_tensor(np.array(transformer_input_batch), dtype=tf.float32)
                 
-                # One call to the model for all 9k candles
                 all_transformer_preds = transformer_model(full_batch_tensor, training=False).numpy()
                 
-                # Unpack results
                 transformer_scores = [float(p[1] if p.shape[0] > 1 else p[0]) for p in all_transformer_preds]
                 logger.info(f"✅ Transformer Batch Complete in {time.time() - batch_start_time:.2f}s")
 
-                # Process final stacking using pre-calculated scores
                 ai_scores = []
                 total = len(transformer_scores)
                 for i in range(total):
                     if i % 2000 == 0:
                         logger.info(f"📊 Final Stacking: {i}/{total}")
 
-                    # Passing pre-calculated score bypasses the slow Transformer expert
                     score = ml_engine.predict_direction(
                         transformer_input_batch[i], 
                         precalc_transformer=transformer_scores[i]
@@ -261,6 +255,7 @@ class Backtester:
                 
                 logger.info(f"✅ AI CRUNCH DONE in {time.time() - batch_start_time:.2f}s")
                 
+                # 🎯 SYNC LOCK: Capture exact AI rows
                 df_final = df_slice.iloc[50:].copy()
                 df_final['ai_conf'] = ai_scores
             else:
@@ -325,15 +320,22 @@ class Backtester:
                 if i % 4 == 0:
                     equity_curve.append({"time": current_time, "balance": round(balance, 2)})
 
+            # 🎯 SYNC-LOCK CHART DATA
+            # This ensures candlesticks match the AI prices 1:1
+            chart_candles = df_final.reset_index().rename(columns={'index': 'time'})
+            chart_data_json = chart_candles.tail(1000).to_dict('records')
+
+            metrics = {
+                "finalBalance": round(balance, 2),
+                "roi": round(((balance - self.initial_balance) / self.initial_balance) * 100, 2),
+                "totalTrades": len(trades),
+                "netProfit": round(balance - self.initial_balance, 2)
+            }
+
             return {
                 "status": "success",
-                "metrics": {
-                    "finalBalance": round(balance, 2),
-                    "roi": round(((balance - self.initial_balance) / self.initial_balance) * 100, 2),
-                    "totalTrades": len(trades),
-                    "netProfit": round(balance - self.initial_balance, 2)
-                },
-                "candleData": df_final.reset_index().rename(columns={'index': 'time'}).tail(500).to_dict('records'),
+                "metrics": metrics,
+                "candleData": chart_data_json,
                 "trades": trades,
                 "equityCurve": equity_curve,
                 "vetoed_signals": vetoed_logs[:100],

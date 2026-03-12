@@ -3,6 +3,7 @@ import pandas as pd
 import logging
 import os
 from .model_factory import ModelFactory
+import time
 
 logger = logging.getLogger("StackingPredictor")
 
@@ -29,9 +30,16 @@ class StackingPredictor:
         for e_type in self.expert_types:
             expert = self.experts.get(e_type) # 🚀 Ultra-fast lookup
             if expert:
+                start = time.time()
                 opinions[e_type] = expert.predict_direction(df_history)
+                duration = (time.time() - start) * 1000
+
+                if not hasattr(self, '_audited'):
+                    logger.info(f"⏱️ AUDIT: {e_type} took {duration:.2f}ms")
             else:
-                opinions[e_type] = 0.5 
+                opinions[e_type] = 0.5
+
+        self._audited = True
 
         # 2. Consult the Stacking Judge
         if self.judge:

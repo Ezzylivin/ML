@@ -30,7 +30,6 @@ class RawModelAdapter:
             self.feature_names = self.default_features
             self.is_meta_model = False
 
-        # 🎯 Signature Locking: Pre-compile/Warm-up the Transformer graph
         if hasattr(self.model, "input_shape") and not self.is_meta_model:
             try:
                 dummy_input = tf.zeros((1, 50, len(self.feature_names)))
@@ -40,48 +39,42 @@ class RawModelAdapter:
                 logger.warning(f"⚠️ Could not pre-warm model: {e}")
 
     def predict_direction(self, input_data, council_probs=None):
-            try:
-                # 1. JUDGE LOGIC (Stacking)
-                if self.is_meta_model and council_probs is not None:
-                    X = np.array([council_probs]) 
-                    return float(self.model.predict_proba(X)[0][1])
-        
-                # 🚀 THE TURBO FIX: Check if we are receiving a NumPy slice
-                is_numpy = isinstance(input_data, np.ndarray)
-        
-                # 2. TRANSFORMER LOGIC
-                if hasattr(self.model, "input_shape"):
-                    if is_numpy:
-                        X_raw = input_data.astype('float32') # Already sliced 50 rows!
-                    else:
-                        if len(input_data) < 50: return 0.5
-                        X_raw = input_data[self.feature_names].tail(50).values.astype('float32')
-                    
-                    X_tensor = tf.convert_to_tensor(X_raw)
-                    X_tensor = tf.expand_dims(X_tensor, 0)
-                    preds = self.model(X_tensor, training=False) 
-                    return float(preds[0][1] if preds.shape[1] > 1 else preds[0][0])
-        
-                # 3. EXPERT LOGIC (XGB/RF)
-                if is_numpy:
-                    # Last row of the 50-row slice
-                    last_row = input_data[-1:].astype('float32')
-                else:
-                    last_row = input_data[self.feature_names].iloc[[-1]]
-        
-                if hasattr(self.model, "predict_proba"):
-                    conf = float(self.model.predict_proba(last_row)[0][1])
-                    return min(0.99, max(0.01, conf))
-                
-                return float(self.model.predict(last_row)[0])
+        try:
+            if self.is_meta_model and council_probs is not None:
+                X = np.array([council_probs]) 
+                return float(self.model.predict_proba(X)[0][1])
 
-            except Exception as e:
-                logger.error(f"❌ Adapter Prediction Error: {e}")
-                return 0.5
-  
+            is_numpy = isinstance(input_data, np.ndarray)
+
+            if hasattr(self.model, "input_shape"):
+                if is_numpy:
+                    X_raw = input_data.astype('float32')
+                else:
+                    if len(input_data) < 50: return 0.5
+                    X_raw = input_data[self.feature_names].tail(50).values.astype('float32')
+                
+                X_tensor = tf.convert_to_tensor(X_raw)
+                X_tensor = tf.expand_dims(X_tensor, 0)
+                preds = self.model(X_tensor, training=False) 
+                return float(preds[0][1] if preds.shape[1] > 1 else preds[0][0])
+
+            if is_numpy:
+                last_row = input_data[-1:].astype('float32')
+            else:
+                last_row = input_data[self.feature_names].iloc[[-1]]
+
+            if hasattr(self.model, "predict_proba"):
+                conf = float(self.model.predict_proba(last_row)[0][1])
+                return min(0.99, max(0.01, conf))
+            
+            return float(self.model.predict(last_row)[0])
+
+        except Exception as e:
+            logger.error(f"❌ Adapter Prediction Error: {e}")
+            return 0.5
+
     def predict(self, df_history, council_probs=None):
         return self.predict_direction(df_history, council_probs=council_probs)
-
 
 class Backtester:
     def __init__(self, config: dict):
@@ -119,8 +112,7 @@ class Backtester:
         df['ema_20'] = ta.ema(df['close'], length=20)
         
         adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
-        if adx_df is not None:
-            df['adx'] = adx_df.iloc[:, 0]
+        if adx_df is not None: df['adx'] = adx_df.iloc[:, 0]
             
         bb = ta.bbands(df['close'], length=20, std=2.0)
         if bb is not None:
@@ -232,37 +224,35 @@ class Backtester:
                 from app.predictors.stacking_predictor import StackingPredictor
                 ml_engine = StackingPredictor(symbol=self.symbol, timeframe=self.timeframe)
                 
-                # Extract feature names and convert to NumPy Matrix ONCE
                 feature_cols = ml_engine.experts['transformer'].feature_names
                 numpy_matrix = df_slice[feature_cols].values.astype('float32')
                 
                 # --- 🎯 TRANSFORMER BATCH ACCELERATION ---
-                # We collect all 50-row windows into a single 3D block
                 transformer_input_batch = []
                 for i in range(50, len(df_slice)):
                     transformer_input_batch.append(numpy_matrix[i-49 : i+1])
                 
-                logger.info(f"📡 Sending {len(transformer_input_batch)} candles to Transformer in ONE batch...")
+                logger.info(f"📡 Sending {len(transformer_input_batch)} samples to Transformer in ONE batch...")
                 
-                # Get the raw Keras model and run everything in one go
                 transformer_model = ml_engine.experts['transformer'].model
+                # Convert list to one massive 3D NumPy array, then to a single Tensor
                 full_batch_tensor = tf.convert_to_tensor(np.array(transformer_input_batch), dtype=tf.float32)
+                
+                # One call to the model for all 9k candles
                 all_transformer_preds = transformer_model(full_batch_tensor, training=False).numpy()
                 
-                # Extract probabilities (usually index 1 for 'Buy')
+                # Unpack results
                 transformer_scores = [float(p[1] if p.shape[0] > 1 else p[0]) for p in all_transformer_preds]
                 logger.info(f"✅ Transformer Batch Complete in {time.time() - batch_start_time:.2f}s")
-                # ----------------------------------------
 
-                # Now run the Expert loop using the pre-calculated scores
+                # Process final stacking using pre-calculated scores
                 ai_scores = []
                 total = len(transformer_scores)
                 for i in range(total):
-                    if i % 1000 == 0:
-                        logger.info(f"📊 Final Stacking Progress: {i}/{total}")
+                    if i % 2000 == 0:
+                        logger.info(f"📊 Final Stacking: {i}/{total}")
 
-                    # We pass the pre-calculated transformer score to skip the 447ms delay
-                    # Ensure your predict_direction in StackingPredictor accepts this new param!
+                    # Passing pre-calculated score bypasses the slow Transformer expert
                     score = ml_engine.predict_direction(
                         transformer_input_batch[i], 
                         precalc_transformer=transformer_scores[i]
@@ -282,7 +272,6 @@ class Backtester:
             tp_price, tsl_price = 0, 0
             equity_curve, trades, vetoed_logs = [], [], []
 
-            # 🎯 THE FIX: Convert DataFrame to a list of dicts for faster iteration
             rows = df_final.to_dict('records')
             timestamps = df_final.index.astype(str).tolist()
 
@@ -290,20 +279,16 @@ class Backtester:
                 row = rows[i]
                 current_time = timestamps[i]
                 signal = self.get_signal(row, self.strategies)
-
                 conf_score = row['ai_conf']
-                is_short_trend = row['close'] < row.get('sma_200', 0)
-                limit = self.ml_limit_short if is_short_trend else self.ml_limit_long
+                limit = self.ml_limit_short if row['close'] < row.get('sma_200', 0) else self.ml_limit_long
                 gate_passed = conf_score >= limit
 
-                # Veto logging (sampled)
                 if signal != 0 and not gate_passed and position is None and i % 5 == 0:
                     vetoed_logs.append({
                         "time": current_time, "signal": "Long" if signal == 1 else "Short",
                         "conf_score": round(conf_score, 4), "limit": round(limit, 4), "price": row['close']
                     })
 
-                # --- EXIT LOGIC ---
                 if position:
                     exit_p, exit_r = None, None
                     if position == 'long':
@@ -318,14 +303,10 @@ class Backtester:
                     if exit_p:
                         pnl_v = (exit_p - entry_price)/entry_price if position == 'long' else (entry_price - exit_p)/entry_price
                         balance *= (1 + (pnl_v * self.risk_mult) - 0.0016)
-                        trades.append({
-                            "type": "exit", "reason": exit_r, "price": round(exit_p, 2), "time": current_time,
-                            "pnl": round(pnl_v * 100, 2), "balance": round(balance, 2)
-                        })
+                        trades.append({"type": "exit", "reason": exit_r, "price": round(exit_p, 2), "time": current_time, "pnl": round(pnl_v * 100, 2), "balance": round(balance, 2)})
                         position = None
                         continue
                     
-                    # Update TSL
                     if position == 'long':
                         new_tsl = row['high'] * (1 - self.ts_pct)
                         if new_tsl > tsl_price: tsl_price = new_tsl
@@ -333,17 +314,13 @@ class Backtester:
                         new_tsl = row['low'] * (1 + self.ts_pct)
                         if new_tsl < tsl_price: tsl_price = new_tsl
 
-                # --- ENTRY LOGIC ---
                 if position is None and gate_passed and signal != 0:
                     position = 'long' if signal == 1 else 'short'
                     entry_price = row['close']
                     tp_price = entry_price * (1 + self.tp_pct) if position == 'long' else entry_price * (1 - self.tp_pct)
                     tsl_price = entry_price * (1 - self.ts_pct) if position == 'long' else entry_price * (1 + self.ts_pct)
                     balance *= (1 - 0.0006)
-                    trades.append({
-                        "type": "buy" if position == 'long' else "sell", "price": entry_price, 
-                        "time": current_time, "ai_score": round(conf_score, 4), "gate_limit": round(limit, 4)
-                    })
+                    trades.append({"type": "buy" if position == 'long' else "sell", "price": entry_price, "time": current_time, "ai_score": round(conf_score, 4), "gate_limit": round(limit, 4)})
 
                 if i % 4 == 0:
                     equity_curve.append({"time": current_time, "balance": round(balance, 2)})
@@ -367,9 +344,7 @@ class Backtester:
             return {"status": "failed", "error": str(e)}
 
     async def run_with_precalculated_data(self, df_final):
-        # This method is used by the Progress Streamer if active
-        try:
-            return await self.run() # Direct to primary loop for now
+        try: return await self.run()
         except Exception as e:
             logger.error(f"Execution Loop Error: {e}")
             raise e

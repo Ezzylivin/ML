@@ -21,6 +21,7 @@ import uvicorn
 from contextlib import asynccontextmanager
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.responses import StreamingResponse
 import aiohttp
 from app.verify.engineer_and_train import apply_mega_features
 
@@ -970,29 +971,52 @@ async def run_backtest(request: BacktestRequest):
         
 @app.post('/api/backtest/combo')
 async def run_combo_backtest(req: ComboRequest):
-    try:
-        # 1. Convert Pydantic model to a raw dictionary
-        config = req.dict()
+    async def event_generator():
+        try:
+            # 1. Convert Pydantic model to raw dictionary
+            config = req.dict()
 
-        # 🎯 KEY BRIDGING: Ensure Combo also respects internal naming
-        config['mlThresholdLong'] = config.get('mlThresholdLong', 0.8)
-        config['mlThresholdShort'] = config.get('mlThresholdShort', 0.8)
-        config['risk_percentage'] = config.get('risk_percentage', 1.0)
+            # 🎯 KEY BRIDGING: Ensure internal naming is respected
+            config['mlThresholdLong'] = config.get('mlThresholdLong', 0.8)
+            config['mlThresholdShort'] = config.get('mlThresholdShort', 0.8)
+            config['risk_percentage'] = config.get('risk_percentage', 1.0)
 
-        logger.info(f"⚖️ COMBO RUN: {len(config.get('strategies', []))} Strategies | AI Limit: {config['mlThresholdLong']}")
-        
-        # 2. Import the Class from your file
-        from app.backtest2 import Backtester
-        
-        # 3. Initialize and Run
-        tester = Backtester(config)
-        result = await tester.run()
-        
-        # 4. Return the result EXACTLY as the file produced it
-        return result
-    except Exception as e:
-        logger.error(f"❌ Combo Link Error: {e}")
-        return JSONResponse(status_code=500, content={"status": "failed", "error": str(e)})
+            # 📈 10%: Initial Handshake
+            yield f"{json.dumps({'status': 'progress', 'percentage': 10, 'message': 'Assembling AI Council...'})}\n"
+
+            logger.info(f"⚖️ COMBO RUN START: {len(config.get('strategies', []))} Strategies | AI Limit: {config['mlThresholdLong']}")
+            
+            # 2. Initialize the Engine
+            from app.backtest2 import Backtester
+            tester = Backtester(config)
+            
+            # 📈 30%: Loading Data & Indicators
+            yield f"{json.dumps({'status': 'progress', 'percentage': 30, 'message': 'Fetching Market History...'})}\n"
+
+            # 3. Run the logic
+            # Note: We await it here. The browser will stay connected.
+            result = await tester.run()
+            
+            # 📈 90%: Crunching done, finalizing payload
+            yield f"{json.dumps({'status': 'progress', 'percentage': 90, 'message': 'Finalizing Analytics...'})}\n"
+
+            # 🏁 100%: The Final Success Result
+            # 🚀 We wrap the 'result' in the 'success' status key your frontend is looking for
+            yield f"{json.dumps({'status': 'success', 'result': result})}\n"
+
+        except Exception as e:
+            logger.error(f"❌ Combo Stream Error: {e}")
+            yield f"{json.dumps({'status': 'error', 'message': str(e)})}\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "X-Accel-Buffering": "no",  # Critical for Render.com/Nginx
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive"
+        }
+    )
 
 
 @app.get("/api/bot/status")

@@ -942,27 +942,26 @@ async def close_position(data: BotClosePositionRequest):
 @app.post('/api/backtest/run')
 async def run_backtest(request: BacktestRequest):
     try:
-        # 1. Standardize UI request keys for the Backtester class
-        # .dict() is used to manipulate the keys before passing to Backtester
+        # 1. Standardize UI request keys
         config = request.dict()
         
-        # 🎯 KEY BRIDGING: Map all possible UI names to the Engine's expected names
-        # We look for 'mlThresholdLong' first (UI), then 'ml_confidence_threshold' (API default)
+        # 🎯 KEY BRIDGING: Map UI names to Engine names
         final_thresh = config.get('mlThresholdLong') or config.get('ml_confidence_threshold') or 0.8
-        
         config['mlThresholdLong'] = final_thresh
         config['mlThresholdShort'] = config.get('mlThresholdShort') or final_thresh
         config['risk_percentage'] = config.get('riskPercentage', 1.0)
         
-        # 2. Wrap the single code into the list format the Backtester expects
+        # 2. Format strategies list
         config['strategies'] = [{"code": request.code, "params": request.params}]
 
-        # 3. Import and use the SINGLE SOURCE of truth
+        # 3. Initialize and Run
         from app.backtest2 import Backtester
         tester = Backtester(config)
-        
-        # This one call handles data loading, indicators, AI, and trading
-        return await tester.run()
+        result = await tester.run()
+
+        # 🏁 THE FIX: Use a custom encoder or JSONResponse with manual dump to handle Timestamps
+        # This prevents the 'Timestamp is not JSON serializable' error in Atomic runs
+        return json.loads(json.dumps(result, default=str))
 
     except Exception as e:
         logger.error(f"❌ Simplified Atomic Run Error: {e}")
@@ -973,46 +972,48 @@ async def run_backtest(request: BacktestRequest):
 async def run_combo_backtest(req: ComboRequest):
     async def event_generator():
         try:
-            # 1. Convert Pydantic model to raw dictionary
+            # 1. Setup Config
             config = req.dict()
-
-            # 🎯 KEY BRIDGING: Ensure internal naming is respected
             config['mlThresholdLong'] = config.get('mlThresholdLong', 0.8)
             config['mlThresholdShort'] = config.get('mlThresholdShort', 0.8)
             config['risk_percentage'] = config.get('risk_percentage', 1.0)
 
-            # 📈 10%: Initial Handshake
-            yield f"{json.dumps({'status': 'progress', 'percentage': 10, 'message': 'Assembling AI Council...'})}\n"
+            # 📈 10%: Progress
+            yield f"{json.dumps({'status': 'progress', 'percentage': 10, 'message': 'Assembling AI Council...'}, default=str)}\n"
 
             logger.info(f"⚖️ COMBO RUN START: {len(config.get('strategies', []))} Strategies | AI Limit: {config['mlThresholdLong']}")
             
-            # 2. Initialize the Engine
+            # 2. Initialize Engine
             from app.backtest2 import Backtester
             tester = Backtester(config)
             
-            # 📈 30%: Loading Data & Indicators
-            yield f"{json.dumps({'status': 'progress', 'percentage': 30, 'message': 'Fetching Market History...'})}\n"
+            # 📈 30%: Progress
+            yield f"{json.dumps({'status': 'progress', 'percentage': 30, 'message': 'Fetching Market History...'}, default=str)}\n"
 
-            # 3. Run the logic
-            # Note: We await it here. The browser will stay connected.
+            # 3. Execute Run
             result = await tester.run()
             
-            # 📈 90%: Crunching done, finalizing payload
-            yield f"{json.dumps({'status': 'progress', 'percentage': 90, 'message': 'Finalizing Analytics...'})}\n"
+            # 📈 90%: Progress
+            yield f"{json.dumps({'status': 'progress', 'percentage': 90, 'message': 'Finalizing Analytics...'}, default=str)}\n"
 
-            # 🏁 100%: The Final Success Result
-            # 🚀 We wrap the 'result' in the 'success' status key your frontend is looking for
-            yield f"{json.dumps({'status': 'success', 'result': result})}\n"
+            # 🏁 100%: SUCCESS HANDSHAKE
+            # 🚀 CRITICAL: default=str converts Pandas Timestamps to strings so JSON doesn't crash
+            final_payload = {
+                "status": "success",
+                "result": result
+            }
+            yield f"{json.dumps(final_payload, default=str)}\n"
 
         except Exception as e:
             logger.error(f"❌ Combo Stream Error: {e}")
-            yield f"{json.dumps({'status': 'error', 'message': str(e)})}\n"
+            # Ensure error messages are also string-serialized
+            yield f"{json.dumps({'status': 'error', 'message': str(e)}, default=str)}\n"
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "X-Accel-Buffering": "no",  # Critical for Render.com/Nginx
+            "X-Accel-Buffering": "no",  # Prevents Nginx/Render buffering
             "Cache-Control": "no-cache",
             "Connection": "keep-alive"
         }

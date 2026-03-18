@@ -408,70 +408,6 @@ class NeuralPredictor:
             logger.error(f"🧠 Council Predictor Error: {e}")
             return 0.5 # Neutral fallback
 
-async def execute_backtest_logic(data: BacktestRequest):
-    try:
-        df = None
-        csv_path = f"data/{data.symbol.replace('/', '-')}_{data.timeframe}.csv"
-        if os.path.exists(csv_path):
-            logger.info(f"📂 Loading historical data from {csv_path}")
-            df = pd.read_csv(csv_path)
-            df.columns = [c.lower() for c in df.columns]
-            rename_map = {'timestamp': 'time', 'date': 'time', 'volume': 'vol'}
-            df.rename(columns=rename_map, inplace=True)
-            df['time'] = pd.to_datetime(df['time'])
-            start_dt = pd.to_datetime(data.startDate).replace(tzinfo=None)
-            end_dt = pd.to_datetime(data.endDate).replace(tzinfo=None)
-            if df['time'].dt.tz is not None:
-                df['time'] = df['time'].dt.tz_localize(None)
-            df = df[(df['time'] >= start_dt) & (df['time'] <= end_dt)]
-            df.reset_index(drop=True, inplace=True)
-
-        if df is None or df.empty:
-            logger.info("⚠️ CSV not found or empty. Falling back to CCXT.")
-            async with ccxt.coinbase() as exchange:
-                since = exchange.parse8601(data.startDate)
-                ohlcv = await exchange.fetch_ohlcv(data.symbol.replace('-', '/'), data.timeframe, since=since, limit=1000)
-                df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
-                df['time'] = pd.to_datetime(df['time'], unit='ms')
-
-        if df.empty:
-            return {"status": "error", "message": "No data found for backtest range"}
-
-        balance, position, trades, curve = data.initialBalance, None, [], []
-        sim_config = {
-            "strategies": [{"code": data.trend_strategy, "params": data.params}],
-            "comboConfig": {"combinationRule": "OR"},
-            "mlModel": data.mlModel or "stacking" 
-        }
-
-        for i in range(50, len(df)):
-            window = df.iloc[:i+1].copy()
-            sig, _, _, _,_ = StrategyBrain.calculate_signals(window, sim_config, 0.5, 0.5)
-            row = df.iloc[i]
-            price = row['close']
-            ts = row['time'].isoformat()
-
-            if sig == 1 and position is None:
-                position = {"type": "long", "entry": price, "size": balance / price}
-                trades.append({"type": "buy", "price": price, "time": ts})
-            elif sig == -1 and position is None:
-                position = {"type": "short", "entry": price, "size": balance / price}
-                trades.append({"type": "short", "price": price, "time": ts})
-            elif (sig == -1 and position and position['type'] == 'long') or (sig == 1 and position and position['type'] == 'short'):
-                pnl = (price - position['entry']) * position['size'] if position['type'] == 'long' else (position['entry'] - price) * position['size']
-                balance += pnl; position = None
-                trades.append({"type": "exit", "price": price, "time": ts, "pnl": pnl})
-            curve.append({"time": ts, "equity": balance})
-
-        return {
-            "status": "success", 
-            "metrics": {"final_balance": round(balance, 2), "trade_count": len(trades)}, 
-            "trades": trades, 
-            "equity_curve": curve
-        }
-    except Exception as e: 
-        logger.error(f"Backtest Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
 # Packet Data
@@ -646,13 +582,11 @@ class StrategyBrain:
 # ==========================================
 # 🚀 3. THE HEARTBEAT (Dynamic Calculation Loop)
 # ==========================================
-global_exchange = ccxtpro.coinbase({'enableRateLimit': True, 'session': GLOBAL_SESSION})
 
 async def live_neural_heartbeat(user_id: str):
     last_log = 0
     last_ui_update = 0
     
-    # 🟢 1. INITIAL SETUP
     if user_id in ACTIVE_BOTS:
         if "equityCurve" not in ACTIVE_BOTS[user_id]: 
             ACTIVE_BOTS[user_id]["equityCurve"] = [{"time": datetime.now().isoformat(), "balance": ACTIVE_BOTS[user_id]["balance"], "confidence": 50}]
@@ -665,73 +599,83 @@ async def live_neural_heartbeat(user_id: str):
             params = config.get('params', {})
             strategies = config.get('strategies', [])
             symbol = config['symbol'].replace('-', '/')
-            ticker_symbol = config['symbol'] # e.g. BTC-USD
+            ticker_symbol = config['symbol'] 
             
-            try:
-                # 🟢 2. DATA FETCHING (Coinbase Pulse)
-                ohlcv_raw = await fetch_live_candles_ccxt(config['symbol'], config.get('timeframe', '1h'), 350)
-                if not ohlcv_raw:
-                    logger.warning(f"⚠️ Market feed unstable for {config['symbol']}")
-                    await emit_log(user_id, "⚠️ Market Data Feed Unstable - Retrying...")
-                    await asyncio.sleep(10); continue
+            # 🔐 STATE ROUTING
+            api_keys = bot.get('api_keys') or config.get('api_keys', {}) 
+            trading_mode = config.get('trading_mode', 'paper').lower()
+            use_margin = config.get('enable_shorting', False)
+            leverage_val = float(config.get('leverage', 1.0))
+            
+            target_exchange = "kraken" if use_margin else "coinbase"
+            
+            # Note: For Kraken, the UI should send 'krakenKey'. For Coinbase, 'apiKey'.
+            has_valid_keys = bool(api_keys.get('krakenKey') if use_margin else api_keys.get('apiKey'))
+            is_live_trading = (trading_mode == 'live') and has_valid_keys
 
-                ticker = await global_exchange.watch_ticker(symbol)
-                current_price = float(ticker['last'])
+            if trading_mode == 'live' and not is_live_trading:
+                logger.warning(f"User {user_id} selected LIVE but lacks API keys. Falling back to PAPER.")
+                await emit_log(user_id, "⚠️ LIVE MODE FAILED: Missing API Keys. Forcing PAPER MODE.")
+                config['trading_mode'] = 'paper'
+                bot['config'] = config 
+                DatabaseHandler.save_state(user_id, bot)
+
+            try:
+                # 🟢 2. DATA FETCHING (Dynamic Exchange Pulse)
+                ohlcv_raw = await fetch_live_candles_ccxt(config['symbol'], config.get('timeframe', '1h'), 350, exchange_id=target_exchange)
                 
-                # Zero-Drift Patch
+                if not ohlcv_raw:
+                    await emit_log(user_id, f"⚠️ {target_exchange.upper()} Feed Unstable - Retrying...")
+                    await asyncio.sleep(5); continue
+                
+                # 🚀 THE FIX: Dynamically fetch the ticker from the correct exchange
+                exchange_class = getattr(ccxt, target_exchange)
+                async with exchange_class({'enableRateLimit': True}) as ex:
+                    ticker = await ex.fetch_ticker(ticker_symbol.replace('-', '/'))
+                    current_price = float(ticker['last'])
+                
+                # Zero-Drift Patch using the live price
                 ohlcv_raw[-1]['close'] = current_price
                 ohlcv_raw[-1]['time'] = int(datetime.now(timezone.utc).timestamp())
                 
-                # 🟢 3. V25 MASTER FEATURE ENGINEERING (Replaces manual indicator loops)
-                # This ensures the AI sees all 25 features exactly as it was trained
+                # 🟢 3. THE ANTI-REPAINTING LOCK & THREAD FIX
                 df_raw = pd.DataFrame(ohlcv_raw)
-                from app.verify.engineer_and_train import apply_mega_features
-                df, _ = apply_mega_features(df_raw)
+                df_closed_history = df_raw.iloc[:-1].copy()
+                
+                # 🚀 CRITICAL FIX: Offload heavy math to background thread
+                df_ai, _ = await asyncio.to_thread(apply_mega_features, df_closed_history)
 
                 # 🟢 4. COUNCIL SIGNAL PROCESSING
-                # We pass the ticker_symbol so the NeuralPredictor loads the correct BTC/ETH models
                 sig, thoughts, nums, score, signals_map = StrategyBrain.calculate_signals(
-                    df, config, 0.5, 0.5, symbol=ticker_symbol
+                    df_ai, config, 0.5, 0.5, symbol=ticker_symbol
                 )
 
-                # Determine Sentiment for logs
                 sentiment = "STRONG BUY" if score > 0.85 else "BUY" if score > 0.70 else "NEUTRAL"
                 if score < 0.20: sentiment = "STRONG SELL"
                 elif score < 0.35: sentiment = "SELL"
 
-                # 🟢 5. PYRAMIDING-AWARE HUD CONSTRUCTION
+                # 🟢 5. HUD CONSTRUCTION
                 upnl = sum([(current_price - p['entry']) * p['size'] if p['type'] == 'long' else (p['entry'] - current_price) * p['size'] for p in bot['positions']])
                 current_equity = bot['balance'] + upnl
 
-                # A. Build Active Trade Summary (Exits/TSL)
                 active_summary = ""
-                buffer_bar = "[----------]" # Default
+                buffer_bar = "[----------]" 
                 if bot['positions']:
-                    p = bot['positions'][-1] # Focus on the latest leg
+                    p = bot['positions'][-1]
                     dist_to_stop = abs(current_price - p['tsl'])
                     stop_pct = round((dist_to_stop / current_price) * 100, 2)
                     buffer_bar = DiagnosticLayer.render_progress(stop_pct, 2.0, reverse=True)
                     active_summary = f"⚡ ACTIVE: {len(bot['positions'])} POS (${upnl:,.2f}) | TSL {buffer_bar} {stop_pct}% | "
 
-                # B. Build Hunting Summary (Entries/Council)
-                hunting_summary = ""
-                ui_limit = float(config.get('mlThresholdLong', 0.80)) if current_price > ta.ema(df['close'], 200).iloc[-1] else float(config.get('mlThresholdShort', 0.90))
-                waiting_msg = DiagnosticLayer.get_pending_conditions(df, config, score, ui_limit)
+                ui_limit = float(config.get('mlThresholdLong', 0.80)) if current_price > ta.ema(df_ai['close'], 200).iloc[-1] else float(config.get('mlThresholdShort', 0.90))
+                waiting_msg = DiagnosticLayer.get_pending_conditions(df_ai, config, score, ui_limit)
                 
                 if len(bot['positions']) < int(config.get('maxPyramiding', 1)):
                     hunting_summary = f"🏹 STALKING LEG {len(bot['positions'])+1}: {int(score*100)}% ({sentiment}) | {waiting_msg}"
                 else:
                     hunting_summary = "✅ PYRAMID FULL: Managing Exits"
 
-                # C. Build Indicator Targets String
-                active_results = []     
-                for strat in strategies:
-                    code = strat['code']
-                    val = int(signals_map.get(code, 0) * 100)
-                    bar = DiagnosticLayer.render_progress(val, 100)
-                    active_results.append(f"{code.upper()}: {bar}")
-                targets_str = " | ".join(active_results)
-
+                targets_str = " | ".join([f"{s['code'].upper()}: {DiagnosticLayer.render_progress(int(signals_map.get(s['code'], 0) * 100), 100)}" for s in strategies])
                 combined_status = f"{active_summary}{hunting_summary} | 🔍 {targets_str}"
 
                 # 🟢 6. EMIT LOGS & UI UPDATES
@@ -745,68 +689,113 @@ async def live_neural_heartbeat(user_id: str):
                     await emit_status(user_id, {
                         "status": "running", "currentBalance": round(current_equity, 2), "exposure": exposure_pct,
                         "activePositions": bot['positions'], "unrealizedPnl": round(upnl, 2),
-                        "tradeMarkers": bot['trade_history'], "candles": await process_data_packet(df_raw, strategies),
+                        "tradeMarkers": bot['trade_history'], "candles": await process_data_packet(df_raw, strategies), 
                         "currentConfidence": int(score * 100), "signalsMap": signals_map
                     })
-                    # Append to UI Equity Curve
                     bot["equityCurve"].append({"time": datetime.now().isoformat(), "balance": round(current_equity, 2), "confidence": int(score * 100)})
                     if len(bot["equityCurve"]) > 300: bot["equityCurve"].pop(0)
                     last_ui_update = now_ts
 
-                # 🟢 7. TRADE EXECUTION LOGIC (Pyramiding + Stability Gates)
+                # 🟢 7. TRADE EXECUTION LOGIC (Live Router)
                 max_p = min(5, int(config.get('maxPyramiding', 5)))
                 current_time = datetime.now(timezone.utc)
                 
-                # Stability Time Gate
-                time_gate_passed = True
-                if bot.get('last_trade_time'):
-                    last_trade_dt = datetime.fromisoformat(bot.get('last_trade_time'))
-                    if (current_time - last_trade_dt).total_seconds() / 60 < 60:
-                        time_gate_passed = False
-
-                # Confidence Climb Check (+10% Rule)
+                time_gate_passed = not bot.get('last_trade_time') or (current_time - datetime.fromisoformat(bot['last_trade_time'])).total_seconds() >= 3600
                 last_pos = bot['positions'][-1] if bot['positions'] else None
                 climb_satisfied = (score >= last_pos.get('entry_conf', 0) + 0.10) if last_pos else True
 
-                # Entry Execution
+                # ENTRY
                 if len(bot['positions']) < max_p and time_gate_passed:
-                    if (sig == 1 and (not last_pos or climb_satisfied)) or (sig == -1 and (not last_pos or climb_satisfied)):
+                    if (sig == 1 and climb_satisfied) or (sig == -1 and climb_satisfied):
                         trade_type = "long" if sig == 1 else "short"
-                        size = (bot['balance'] * (float(config.get('riskPercentage', 10.0)) / 100 / max_p)) / current_price
+                        size_in_fiat = bot['balance'] * (float(config.get('riskPercentage', 10.0)) / 100 / max_p)
+                        size_in_crypto = size_in_fiat / current_price
+                        
+                        # 🚀 CRITICAL FIX: Prevent Scientific Notation (1e-5) rejection
+                        safe_size = float(f"{size_in_crypto:.6f}") 
+                        actual_entry_price = current_price
+                        
+                        # 🔴 REAL API EXECUTION
+                        if is_live_trading:
+                            try:
+                                exchange_class = getattr(ccxt, target_exchange)
+                                async with exchange_class({
+                                    'apiKey': api_keys.get('krakenKey', api_keys.get('apiKey')),
+                                    'secret': api_keys.get('krakenSecret', api_keys.get('secret')),
+                                    'enableRateLimit': True
+                                }) as user_exchange:
+                                    
+                                    side = "buy" if sig == 1 else "sell"
+                                    order_params = {'leverage': leverage_val} if use_margin else {}
+                                    
+                                    await emit_log(user_id, f"🔗 ROUTING {side.upper()} TO {target_exchange.upper()}...")
+                                    order = await user_exchange.create_market_order(symbol, side, safe_size, params=order_params)
+                                    
+                                    actual_entry_price = order.get('average') or order.get('price') or current_price
+                                    fee_rate = 0.0026 if use_margin else 0.006
+                                    bot['balance'] -= (safe_size * actual_entry_price) * fee_rate
+                                    
+                            except Exception as ex_err:
+                                await emit_log(user_id, f"❌ {target_exchange.upper()} ORDER FAILED: {str(ex_err)}")
+                                await asyncio.sleep(5)
+                                continue 
                         
                         bot['positions'].append({
-                            "symbol": symbol, "type": trade_type, "entry": current_price, "size": size,
+                            "symbol": symbol, "type": trade_type, "entry": actual_entry_price, "size": safe_size,
                             "time": current_time.isoformat(), "entry_conf": score,
-                            "tp": current_price * (1 + float(params.get('take_profit', 0.1))) if sig == 1 else current_price * (1 - float(params.get('take_profit', 0.1))),
-                            "sl": current_price * (1 - float(params.get('stop_loss', 0.05))) if sig == 1 else current_price * (1 + float(params.get('stop_loss', 0.05))),
-                            "tsl": current_price * (1 - float(params.get('stop_loss', 0.05))) if sig == 1 else current_price * (1 + float(params.get('stop_loss', 0.05)))
+                            "tp": actual_entry_price * (1 + float(params.get('take_profit', 0.1))) if sig == 1 else actual_entry_price * (1 - float(params.get('take_profit', 0.1))),
+                            "sl": actual_entry_price * (1 - float(params.get('stop_loss', 0.05))) if sig == 1 else actual_entry_price * (1 + float(params.get('stop_loss', 0.05))),
+                            "tsl": actual_entry_price * (1 - float(params.get('stop_loss', 0.05))) if sig == 1 else actual_entry_price * (1 + float(params.get('stop_loss', 0.05)))
                         })
                         bot['last_trade_time'] = current_time.isoformat()
-                        await emit_log(user_id, f"🚀 ENTERED {trade_type.upper()} LEG {len(bot['positions'])} | Conf: {int(score*100)}%")
+                        await emit_log(user_id, f"🚀 ENTERED {trade_type.upper()} LEG {len(bot['positions'])} @ ${actual_entry_price:,.2f}")
                         DatabaseHandler.save_state(user_id, bot)
 
-                # 🟢 8. EXIT MONITORING (Individually per Leg)
+                # 🟢 8. EXIT MONITORING
                 tsl_pct = float(params.get('trailing_stop', 0.01))
                 for pos in bot['positions'][:]:
-                    closed, pnl = False, 0
-                    # Trailing Stop Movement
+                    closed = False
                     if pos['type'] == 'long':
                         if current_price * (1 - tsl_pct) > pos['tsl']: pos['tsl'] = current_price * (1 - tsl_pct)
-                        if current_price >= pos['tp'] or current_price <= pos['tsl']:
-                            closed = True; pnl = (current_price - pos['entry']) * pos['size']
+                        if current_price >= pos['tp'] or current_price <= pos['tsl']: closed = True
                     else:
                         if current_price * (1 + tsl_pct) < pos['tsl']: pos['tsl'] = current_price * (1 + tsl_pct)
-                        if current_price <= pos['tp'] or current_price >= pos['tsl']:
-                            closed = True; pnl = (pos['entry'] - current_price) * pos['size']
+                        if current_price <= pos['tp'] or current_price >= pos['tsl']: closed = True
                     
                     if closed:
-                        bot['balance'] += pnl
+                        actual_close_price = current_price
+                        
+                        # 🔴 REAL API EXECUTION
+                        if is_live_trading:
+                            try:
+                                exchange_class = getattr(ccxt, target_exchange)
+                                async with exchange_class({
+                                    'apiKey': api_keys.get('krakenKey', api_keys.get('apiKey')),
+                                    'secret': api_keys.get('krakenSecret', api_keys.get('secret')),
+                                    'enableRateLimit': True
+                                }) as user_exchange:
+                                    
+                                    close_side = "sell" if pos['type'] == 'long' else "buy"
+                                    order_params = {'leverage': leverage_val} if use_margin else {}
+                                    
+                                    await emit_log(user_id, f"🔗 ROUTING {close_side.upper()} EXIT TO {target_exchange.upper()}...")
+                                    order = await user_exchange.create_market_order(symbol, close_side, pos['size'], params=order_params)
+                                    actual_close_price = order.get('average') or order.get('price') or current_price
+                                    
+                            except Exception as ex_err:
+                                await emit_log(user_id, f"❌ {target_exchange.upper()} EXIT FAILED: {str(ex_err)}")
+                                continue 
+                        
+                        gross_pnl = (actual_close_price - pos['entry']) * pos['size'] if pos['type'] == 'long' else (pos['entry'] - actual_close_price) * pos['size']
+                        fee_rate = 0.0026 if use_margin else 0.006
+                        net_pnl = gross_pnl - ((pos['size'] * actual_close_price) * fee_rate)
+
+                        bot['balance'] += net_pnl
                         bot['positions'].remove(pos)
-                        bot['trade_history'].append({"type": "exit", "side": pos['type'], "price": current_price, "pnl": round(pnl, 2), "time": datetime.now(timezone.utc).isoformat()})
-                        await emit_log(user_id, f"💰 CLOSED {pos['type'].upper()} | PnL: ${round(pnl, 2)}")
+                        bot['trade_history'].append({"type": "exit", "side": pos['type'], "price": actual_close_price, "pnl": round(net_pnl, 2), "time": datetime.now(timezone.utc).isoformat()})
+                        await emit_log(user_id, f"💰 CLOSED {pos['type'].upper()} @ ${actual_close_price:,.2f} | Net PnL: ${round(net_pnl, 2)}")
                         DatabaseHandler.save_state(user_id, bot)
 
-                # 🟢 9. HOUSEKEEPING
                 if datetime.now().timestamp() - last_log >= 60:
                     DatabaseHandler.save_state(user_id, bot)
                 
@@ -820,12 +809,22 @@ async def live_neural_heartbeat(user_id: str):
 # =============================================================
 # ENDPOINTS
 # =============================================================
-async def fetch_live_candles_ccxt(symbol: str, timeframe: str, limit: int):
-    async with ccxt.coinbase() as ex:
+async def fetch_live_candles_ccxt(symbol: str, timeframe: str, limit: int, exchange_id: str = "coinbase"):
+    """
+    Dynamically fetches data from the correct exchange to prevent price mismatch.
+    """
+    # Initialize the correct exchange class dynamically
+    exchange_class = getattr(ccxt, exchange_id)
+    
+    async with exchange_class({'enableRateLimit': True}) as ex:
         try:
-            ohlcv = await ex.fetch_ohlcv(symbol.replace('-', '/'), timeframe, limit=limit)
+            # Kraken uses standard format, Coinbase uses dashed. CCXT handles most, but we ensure '/'
+            fetch_symbol = symbol.replace('-', '/')
+            ohlcv = await ex.fetch_ohlcv(fetch_symbol, timeframe, limit=limit)
             return [{"time": int(c[0]/1000), "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c) > 5 else 0} for c in ohlcv]
-        except: return []
+        except Exception as e:
+            logger.error(f"❌ {exchange_id.upper()} Fetch Error: {e}")
+            return []
 
 @app.get("/api/ml/available-models")
 @app.get("/ml/available-models")

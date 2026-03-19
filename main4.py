@@ -669,6 +669,38 @@ async def live_neural_heartbeat(user_id: str):
 
                 ui_limit = float(config.get('mlThresholdLong', 0.80)) if current_price > ta.ema(df_ai['close'], 200).iloc[-1] else float(config.get('mlThresholdShort', 0.90))
                 waiting_msg = DiagnosticLayer.get_pending_conditions(df_ai, config, score, ui_limit)
+
+                # ==========================================
+                # 🛡️ NEURAL VETO TRACKER (Inserted Here)
+                # ==========================================
+                if "vetoed_signals" not in bot:
+                    bot["vetoed_signals"] = []
+
+                # Reconstruct what the atomic strategies WANTED to do
+                rule = config.get('comboConfig', {}).get('combinationRule', 'OR')
+                raw_sig = 0
+                votes = sum([1 if signals_map.get(s['code'], 0) > 0.5 else -1 for s in strategies])
+                
+                if rule == "AND":
+                    if votes >= len(strategies): raw_sig = 1
+                    elif votes <= -len(strategies): raw_sig = -1
+                else:
+                    if votes > 0: raw_sig = 1
+                    elif votes < 0: raw_sig = -1
+
+                # If they wanted to trade, but the AI stopped them, log it!
+                if raw_sig != 0 and score < ui_limit:
+                    # Prevent spamming the same veto every 0.5 seconds (5-minute cooldown)
+                    if not bot["vetoed_signals"] or (datetime.now(timezone.utc) - datetime.fromisoformat(bot["vetoed_signals"][-1]["time"])).total_seconds() > 300:
+                        bot["vetoed_signals"].append({
+                            "time": datetime.now(timezone.utc).isoformat(),
+                            "signal": "Long" if raw_sig == 1 else "Short",
+                            "conf_score": round(score, 4),
+                            "limit": round(ui_limit, 4),
+                            "price": current_price
+                        })
+                        # Keep memory clean (last 100 vetoes)
+                        if len(bot["vetoed_signals"]) > 100: bot["vetoed_signals"].pop(0)
                 
                 if len(bot['positions']) < int(config.get('maxPyramiding', 1)):
                     hunting_summary = f"🏹 STALKING LEG {len(bot['positions'])+1}: {int(score*100)}% ({sentiment}) | {waiting_msg}"

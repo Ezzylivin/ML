@@ -89,7 +89,6 @@ class Backtester:
 
         p = self.params
         self.tp_pct = float(p.get('take_profit', 0.13))
-        self.sl_pct = float(p.get('stop_loss', 0.086))
         self.ts_pct = float(p.get('trailing_stop', 0.086))
         
         self.strategies = config.get('strategies', [])
@@ -268,11 +267,19 @@ class Backtester:
             equity_curve, trades, vetoed_logs = [], [], []
 
             rows = df_final.to_dict('records')
-            timestamps = df_final.index.astype(str).tolist()
+            
+            # 🚀 FIX 1: Convert to UNIX Timestamps (Seconds) for TradingView React compatibility
+            # This prevents the chart crashing on the frontend
+            timestamps = (df_final.index.astype('int64') // 10**9).tolist()
+            
+            # ISO String format for logs (easier for humans to read)
+            iso_timestamps = df_final.index.strftime('%Y-%m-%dT%H:%M:%S.000Z').tolist()
 
             for i in range(len(rows)):
                 row = rows[i]
-                current_time = timestamps[i]
+                current_time_unix = timestamps[i]
+                current_time_iso = iso_timestamps[i]
+                
                 signal = self.get_signal(row, self.strategies)
                 conf_score = row['ai_conf']
                 limit = self.ml_limit_short if row['close'] < row.get('sma_200', 0) else self.ml_limit_long
@@ -280,25 +287,32 @@ class Backtester:
 
                 if signal != 0 and not gate_passed and position is None and i % 5 == 0:
                     vetoed_logs.append({
-                        "time": current_time, "signal": "Long" if signal == 1 else "Short",
+                        "time": current_time_iso, "signal": "Long" if signal == 1 else "Short",
                         "conf_score": round(conf_score, 4), "limit": round(limit, 4), "price": row['close']
                     })
 
                 if position:
                     exit_p, exit_r = None, None
+                    
+                    # 🚀 FIX 2: Check STOP LOSS first to prevent Look-Ahead bias
                     if position == 'long':
-                        if row['high'] >= tp_price: exit_p, exit_r = tp_price, "Take Profit"
-                        elif row['low'] <= tsl_price: exit_p, exit_r = tsl_price, "Trailing Stop"
+                        # Check Worst-Case first
+                        if row['low'] <= tsl_price: exit_p, exit_r = tsl_price, "Trailing Stop"
+                        elif row['high'] >= tp_price: exit_p, exit_r = tp_price, "Take Profit"
                         elif signal == -1: exit_p, exit_r = row['close'], "Signal Flip"
                     else:
-                        if row['low'] <= tp_price: exit_p, exit_r = tp_price, "Take Profit"
-                        elif row['high'] >= tsl_price: exit_p, exit_r = tsl_price, "Trailing Stop"
+                        # Check Worst-Case first
+                        if row['high'] >= tsl_price: exit_p, exit_r = tsl_price, "Trailing Stop"
+                        elif row['low'] <= tp_price: exit_p, exit_r = tp_price, "Take Profit"
                         elif signal == 1: exit_p, exit_r = row['close'], "Signal Flip"
 
                     if exit_p:
+                        # 🚀 FIX 3: Realistic exchange fee math
                         pnl_v = (exit_p - entry_price)/entry_price if position == 'long' else (entry_price - exit_p)/entry_price
-                        balance *= (1 + (pnl_v * self.risk_mult) - 0.0016)
-                        trades.append({"type": "exit", "reason": exit_r, "price": round(exit_p, 2), "time": current_time, "pnl": round(pnl_v * 100, 2), "balance": round(balance, 2)})
+                        # Multiplier incorporates 0.06% Taker Fee for entry AND exit
+                        balance *= (1 + (pnl_v * self.risk_mult) - 0.0012) 
+                        
+                        trades.append({"type": "exit", "reason": exit_r, "price": round(exit_p, 2), "time": current_time_iso, "pnl": round(pnl_v * 100, 2), "balance": round(balance, 2)})
                         position = None
                         continue
                     
@@ -314,16 +328,17 @@ class Backtester:
                     entry_price = row['close']
                     tp_price = entry_price * (1 + self.tp_pct) if position == 'long' else entry_price * (1 - self.tp_pct)
                     tsl_price = entry_price * (1 - self.ts_pct) if position == 'long' else entry_price * (1 + self.ts_pct)
-                    balance *= (1 - 0.0006)
-                    trades.append({"type": "buy" if position == 'long' else "sell", "price": entry_price, "time": current_time, "ai_score": round(conf_score, 4), "gate_limit": round(limit, 4)})
+                    
+                    trades.append({"type": "buy" if position == 'long' else "sell", "price": entry_price, "time": current_time_iso, "ai_score": round(conf_score, 4), "gate_limit": round(limit, 4)})
 
                 if i % 4 == 0:
-                    equity_curve.append({"time": current_time, "balance": round(balance, 2)})
+                    equity_curve.append({"time": current_time_unix, "balance": round(balance, 2)})
 
             # 🎯 SYNC-LOCK CHART DATA
-            # This ensures candlesticks match the AI prices 1:1
-            chart_candles = df_final.reset_index().rename(columns={'index': 'time'})
-            chart_data_json = chart_candles.tail(1000).to_dict('records')
+            # Make sure we use the UNIX timestamps for the chart rendering
+            chart_candles = df_final.copy()
+            chart_candles['time'] = timestamps
+            chart_data_json = chart_candles.tail(1000)[['time', 'open', 'high', 'low', 'close', 'volume']].to_dict('records')
 
             metrics = {
                 "finalBalance": round(balance, 2),
@@ -338,7 +353,7 @@ class Backtester:
                 "candleData": chart_data_json,
                 "trades": trades,
                 "equityCurve": equity_curve,
-                "vetoed_signals": vetoed_logs[:100],
+                "vetoed_signals": vetoed_logs[-500:],
                 "initialBalance": self.initial_balance
             }
         except Exception as e:

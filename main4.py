@@ -182,17 +182,19 @@ ComboRequest.model_rebuild()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global GLOBAL_SESSION, global_exchange
+    global GLOBAL_SESSION
     GLOBAL_SESSION = aiohttp.ClientSession()
-    global_exchange = ccxtpro.coinbase({'enableRateLimit': True, 'session': GLOBAL_SESSION})
+    # 🗑️ Removed global_exchange initialization here
     yield
 
     await GLOBAL_SESSION.close()
-    await global_exchange.close()
+    # 🗑️ Removed global_exchange.close() here
+    
+    # 🛡️ This keeps your database safe on server restart
     for user_id, bot in ACTIVE_BOTS.items():
         bot["status"] = "stopped"
         DatabaseHandler.save_state(user_id, bot)
-
+        
 app = FastAPI(title="NEO-V25.14 Sovereign Engine", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 

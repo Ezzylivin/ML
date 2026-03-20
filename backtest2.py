@@ -269,6 +269,9 @@ class Backtester:
             peak_balance = float(self.initial_balance)
             max_drawdown = 0.0
 
+            pending_vetoes = []
+            veto_stats = {"saved": 0, "missed": 0}
+
             rows = df_final.to_dict('records')
             
             # 🚀 FIX 1: Convert to UNIX Timestamps (Seconds) for TradingView React compatibility
@@ -289,11 +292,42 @@ class Backtester:
                 limit = self.ml_limit_short if row['close'] < row.get('sma_200', 0) else self.ml_limit_long
                 gate_passed = conf_score >= limit
 
-                if signal != 0 and not gate_passed and position is None and i % 5 == 0:
-                    vetoed_logs.append({
-                        "time": current_time_iso, "signal": "Long" if signal == 1 else "Short",
-                        "conf_score": round(conf_score, 4), "limit": round(limit, 4), "price": row['close']
+                surviving_vetoes = []
+                for v in pending_vetoes:
+                    outcome = None
+                    if v["type"] == "long":
+                        if row['low'] <= v["sl"]: outcome = "saved"    # Hit Stop Loss: AI Saved us!
+                        elif row['high'] >= v["tp"]: outcome = "missed" # Hit Take Profit: AI Missed a win
+                    else:
+                        if row['high'] >= v["sl"]: outcome = "saved"
+                        elif row['low'] <= v["tp"]: outcome = "missed"
+                    
+                    if outcome:
+                        veto_stats[outcome] += 1
+                    else:
+                        surviving_vetoes.append(v)
+                pending_vetoes = surviving_vetoes
+
+                if signal != 0 and not gate_passed and position is None:
+                    trade_type = "long" if signal == 1 else "short"
+                    
+                    # Calculate hypothetical TP and SL based on your params
+                    hypo_tp = row['close'] * (1 + self.tp_pct) if signal == 1 else row['close'] * (1 - self.tp_pct)
+                    hypo_sl = row['close'] * (1 - self.ts_pct) if signal == 1 else row['close'] * (1 + self.ts_pct)
+                    
+                    # Add to our ghost tracker
+                    pending_vetoes.append({
+                        "type": trade_type,
+                        "tp": hypo_tp,
+                        "sl": hypo_sl
                     })
+
+                    # Keep your existing UI logging
+                    if i % 5 == 0:
+                        vetoed_logs.append({
+                            "time": current_time_iso, "signal": trade_type.capitalize(),
+                            "conf_score": round(conf_score, 4), "limit": round(limit, 4), "price": row['close']
+                        })
 
                 if position:
                     exit_p, exit_r = None, None
@@ -360,12 +394,18 @@ class Backtester:
             chart_candles['time'] = timestamps
             chart_data_json = chart_candles.tail(1000)[['time', 'open', 'high', 'low', 'close', 'volume']].to_dict('records')
 
+            total_resolved = veto_stats["saved"] + veto_stats["missed"]
+            ai_accuracy = (veto_stats["saved"] / total_resolved * 100) if total_resolved > 0 else 0.0
+
             metrics = {
                 "finalBalance": round(balance, 2),
                 "roi": round(((balance - self.initial_balance) / self.initial_balance) * 100, 2),
                 "totalTrades": len(trades),
                 "netProfit": round(balance - self.initial_balance, 2),
-                "max_drawdown": round(max_drawdown * 100, 2)
+                "max_drawdown": round(max_drawdown * 100, 2),
+                "aiShieldAccuracy": round(ai_accuracy, 1),
+                "saved": veto_stats["saved"],
+                "missed": veto_stats["missed"]
             }
 
             return {

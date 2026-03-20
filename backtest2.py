@@ -365,7 +365,7 @@ class Backtester:
                 "roi": round(((balance - self.initial_balance) / self.initial_balance) * 100, 2),
                 "totalTrades": len(trades),
                 "netProfit": round(balance - self.initial_balance, 2),
-                "maxDrawdown": round(max_drawdown * 100, 2)
+                "max_drawdown": round(max_drawdown * 100, 2)
             }
 
             return {

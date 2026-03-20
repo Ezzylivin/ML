@@ -265,6 +265,8 @@ class Backtester:
             balance, position, entry_price = self.initial_balance, None, 0
             tp_price, tsl_price = 0, 0
             equity_curve, trades, vetoed_logs = [], [], []
+
+            peak_balance = float(self.initial_balance)
             max_drawdown = 0.0
 
             rows = df_final.to_dict('records')

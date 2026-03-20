@@ -92,7 +92,7 @@ class Backtester:
         self.ts_pct = float(p.get('trailing_stop', 0.086))
         
         self.strategies = config.get('strategies', [])
-        raw_risk = config.get('risk_percentage', 1.0)
+        raw_risk = float(config.get('riskPercentage', config.get('risk_percentage', 100.0)))
         self.risk_mult = float(raw_risk) / 100.0
         
         self.ml_limit_long = float(config.get('mlThresholdLong', 0.80))
@@ -265,6 +265,7 @@ class Backtester:
             balance, position, entry_price = self.initial_balance, None, 0
             tp_price, tsl_price = 0, 0
             equity_curve, trades, vetoed_logs = [], [], []
+            max_drawdown = 0.0
 
             rows = df_final.to_dict('records')
             
@@ -274,6 +275,7 @@ class Backtester:
             
             # ISO String format for logs (easier for humans to read)
             iso_timestamps = df_final.index.strftime('%Y-%m-%dT%H:%M:%S.000Z').tolist()
+            
 
             for i in range(len(rows)):
                 row = rows[i]
@@ -307,10 +309,26 @@ class Backtester:
                         elif signal == 1: exit_p, exit_r = row['close'], "Signal Flip"
 
                     if exit_p:
-                        # 🚀 FIX 3: Realistic exchange fee math
+                        # 🚀 FIX 3: Realistic position sizing and fee math in absolute dollars
+                        position_size_fiat = balance * self.risk_mult
                         pnl_v = (exit_p - entry_price)/entry_price if position == 'long' else (entry_price - exit_p)/entry_price
-                        # Multiplier incorporates 0.06% Taker Fee for entry AND exit
-                        balance *= (1 + (pnl_v * self.risk_mult) - 0.0012) 
+                        
+                        gross_profit = position_size_fiat * pnl_v
+                        
+                        # Apply 0.06% Taker Fee correctly to the actual position size
+                        entry_fee = position_size_fiat * 0.0006
+                        exit_fee = (position_size_fiat + gross_profit) * 0.0006
+                        net_profit = gross_profit - (entry_fee + exit_fee)
+                        
+                        balance += net_profit
+                        
+                        # 🚀 FIX 4: Dynamically calculate Max Drawdown on every trade close
+                        if balance > peak_balance:
+                            peak_balance = balance
+                        
+                        current_dd = (peak_balance - balance) / peak_balance
+                        if current_dd > max_drawdown:
+                            max_drawdown = current_dd
                         
                         trades.append({"type": "exit", "reason": exit_r, "price": round(exit_p, 2), "time": current_time_iso, "pnl": round(pnl_v * 100, 2), "balance": round(balance, 2)})
                         position = None
@@ -344,7 +362,8 @@ class Backtester:
                 "finalBalance": round(balance, 2),
                 "roi": round(((balance - self.initial_balance) / self.initial_balance) * 100, 2),
                 "totalTrades": len(trades),
-                "netProfit": round(balance - self.initial_balance, 2)
+                "netProfit": round(balance - self.initial_balance, 2),
+                "maxDrawdown": round(max_drawdown * 100, 2)
             }
 
             return {

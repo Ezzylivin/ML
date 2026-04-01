@@ -148,8 +148,23 @@ def train_all_symbols():
             save_path_xgb = os.path.join(MODEL_STORAGE_DIR, f"{ticker}_1h_xgboost_model.joblib")
             save_path_rf = os.path.join(MODEL_STORAGE_DIR, f"{ticker}_1h_randomforest_model.joblib")
 
-            # Train XGBoost
-            xgb = XGBClassifier(n_estimators=150, max_depth=6, learning_rate=0.05, base_score=0.5)
+            # Train XGBoost (Regularized to reduce overfitting)
+            # OLD: max_depth=6, n_estimators=150 → memorized training data
+            # NEW: max_depth=3, fewer trees, min_child_weight prevents leaf overfitting
+            #      subsample/colsample add randomness to prevent memorization
+            #      reg_alpha/reg_lambda add L1/L2 penalties
+            xgb = XGBClassifier(
+                n_estimators=100,
+                max_depth=3,              # Was 6 — shallower trees generalize better
+                learning_rate=0.05,
+                base_score=0.5,
+                min_child_weight=10,      # Requires more samples per leaf
+                subsample=0.8,            # Only use 80% of rows per tree
+                colsample_bytree=0.8,     # Only use 80% of features per tree
+                reg_alpha=0.1,            # L1 regularization
+                reg_lambda=1.0,           # L2 regularization
+                gamma=1.0                 # Minimum loss reduction to split
+            )
             xgb.fit(X_train, y_train)
             
             xgb_train_acc = (xgb.predict(X_train) == y_train).mean() * 100
@@ -163,8 +178,16 @@ def train_all_symbols():
             
             joblib.dump({"model": xgb, "feature_names": feats}, save_path_xgb)
             
-            # Train RandomForest
-            rf = RandomForestClassifier(n_estimators=100, max_depth=10)
+            # Train RandomForest (Regularized)
+            # OLD: max_depth=10 → trees grew until they memorized everything
+            # NEW: max_depth=4, min_samples constraints, max_features adds randomness
+            rf = RandomForestClassifier(
+                n_estimators=100,
+                max_depth=4,              # Was 10 — much shallower
+                min_samples_split=20,     # Need 20+ samples to create a branch
+                min_samples_leaf=10,      # Each leaf needs 10+ samples
+                max_features='sqrt',      # Only consider sqrt(25)≈5 features per split
+            )
             rf.fit(X_train, y_train)
             
             rf_train_acc = (rf.predict(X_train) == y_train).mean() * 100

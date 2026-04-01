@@ -1,123 +1,122 @@
-import joblib
-import os
+"""
+RawModelAdapter — Unified prediction interface for all model types.
+
+Extracted from backtest2.py to break the circular import:
+    ModelFactory → backtest2.RawModelAdapter → ModelFactory
+
+Now both ModelFactory and backtest2 can import from here safely.
+
+Location: app/predictors/model_adapter.py
+"""
+import numpy as np
 import logging
+import tensorflow as tf
 
-# ============================================================
-# 🔧 FIX #1: Import MODEL_DIR from config2
-# ============================================================
-# OLD: base_dir = "models" (relative, never matched training output)
-# Training saved to: app/models/btc_1h_xgboost_model.joblib
-# Factory searched:  models/BTC_1h_xgboost_model.joblib
-# Result: Models NEVER loaded. Predictor always returned 0.5 (neutral).
-# NEW: Uses the canonical MODEL_DIR from config2
-from app.config2 import MODEL_DIR
+from app.config2 import FEATURE_COLUMNS
 
-logger = logging.getLogger("ModelFactory")
-
-# ============================================================
-# 🔧 FIX #2: In-memory model cache
-# ============================================================
-# OLD: Every call to load_model() hit disk with joblib.load().
-#      In live mode (0.5s heartbeat), StackingPredictor.__init__
-#      calls load_model 4 times = 8 disk reads per second.
-# NEW: Cache by file path. Loaded once, reused forever.
-#      Cache is invalidated only on server restart or manual clear.
-_MODEL_CACHE = {}
+logger = logging.getLogger("ModelAdapter")
 
 
-def clear_model_cache():
-    """Call this after retraining to force reload from disk."""
-    _MODEL_CACHE.clear()
-    logger.info("🗑️ Model cache cleared — next load will read from disk.")
-
-
-class ModelFactory:
-    @staticmethod
-    def load_model(model_name, symbol, timeframe="1h"):
-        # 1. Setup paths using config2's canonical directory
-        ticker = symbol.split('-')[0].upper() if '-' in symbol else symbol.split('/')[0].upper()
-        ticker_lower = ticker.lower()
+class RawModelAdapter:
+    """
+    Bridge between raw model files (.joblib/.keras) and the prediction interface.
+    Gives every model a unified .predict_direction() method.
+    
+    Handles three model types:
+    - Keras/TF models (Transformer/LSTM): Takes 50-bar sequences, shape (1, 50, N_features)
+    - Sklearn tree models (XGBoost/RF): Takes single row, shape (1, N_features)
+    - Meta models (Stacking Judge): Takes expert probability vector, shape (1, 3)
+    """
+    
+    def __init__(self, model_payload):
+        self.default_features = FEATURE_COLUMNS
         
         # ============================================================
-        # 🔧 FIX #1b: Search paths that MATCH training output
+        # 🔧 FIX: Support normalization stats for Keras models
         # ============================================================
-        # Training saves: {MODEL_DIR}/{ticker_lower}_1h_{model_name}_model.joblib
-        # Example:        app/models/btc_1h_xgboost_model.joblib
-        #
-        # We search multiple patterns to handle both old and new naming:
-        candidates = [
-            # Primary: matches engineer_and_train.py output exactly
-            os.path.join(MODEL_DIR, f"{ticker_lower}_{timeframe}_{model_name.lower()}_model.joblib"),
-            # Keras models from train_transformer.py
-            os.path.join(MODEL_DIR, f"{ticker_lower}_{timeframe}_{model_name.lower()}_model.keras"),
-            # Legacy patterns (in case old files exist)
-            os.path.join(MODEL_DIR, f"{model_name}_{symbol}.joblib"),
-            os.path.join(MODEL_DIR, f"{model_name}_{ticker}-USD.joblib"),
-        ]
+        # train_transformer.py now saves a companion .npz file with
+        # the mean/std used during training. If present in the payload,
+        # we apply the same normalization at inference time.
+        self.norm_mean = None
+        self.norm_std = None
         
-        path = None
-        for c in candidates:
-            if os.path.exists(c):
-                path = c
-                break
-        
-        if not path:
-            # 🔧 FIX #1c: Log which paths were searched (makes debugging trivial)
-            logger.warning(f"⚠️ Model not found for {model_name}/{symbol}. Searched:")
-            for c in candidates:
-                logger.warning(f"   ❌ {c}")
-            return None
+        if isinstance(model_payload, dict):
+            self.model = model_payload.get('model')
+            self.feature_names = model_payload.get('feature_names') or self.default_features
+            self.is_meta_model = model_payload.get('is_meta_model', False)
+            self.norm_mean = model_payload.get('norm_mean')
+            self.norm_std = model_payload.get('norm_std')
+        else:
+            self.model = model_payload
+            self.feature_names = self.default_features
+            self.is_meta_model = False
 
-        # ============================================================
-        # 🔧 FIX #2b: Check cache before loading from disk
-        # ============================================================
-        if path in _MODEL_CACHE:
-            logger.debug(f"⚡ Cache hit: {os.path.basename(path)}")
-            return _MODEL_CACHE[path]
-
-        # 3. Load and wrap the model
-        try:
-            logger.info(f"📂 Loading from disk: {path}")
-            
-            # ============================================================
-            # 🔧 FIX #3: Handle both .joblib and .keras files
-            # ============================================================
-            if path.endswith('.keras'):
-                import tensorflow as tf
-                raw_model = tf.keras.models.load_model(path)
-                payload = {
-                    'model': raw_model,
-                    'feature_names': None,  # Will use defaults from adapter
-                    'is_meta_model': False
-                }
-            else:
-                payload = joblib.load(path)
-            
-            # ============================================================
-            # 🔧 FIX #4: Break circular import
-            # ============================================================
-            # OLD: from app.backtest2 import RawModelAdapter
-            #      backtest2 imports ModelFactory → ModelFactory imports backtest2
-            #      Only worked because import was inside this method (lazy).
-            #      Any refactor that moves it to top-level = crash.
-            #
-            # NEW: Import from dedicated adapter module.
-            #      If you haven't moved RawModelAdapter yet, the old import
-            #      still works as fallback. But move it when you can.
+        # Pre-warm Keras models to avoid first-call latency
+        if hasattr(self.model, "input_shape") and not self.is_meta_model:
             try:
-                from app.predictors.model_adapter import RawModelAdapter
-            except ImportError:
-                # Fallback: old location (remove this once you move the class)
-                from app.backtest2 import RawModelAdapter
+                dummy_input = tf.zeros((1, 50, len(self.feature_names)))
+                self.model(dummy_input, training=False)
+                logger.info("✅ Keras model graph compiled & locked.")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not pre-warm model: {e}")
+
+    def predict_direction(self, input_data, council_probs=None):
+        """
+        Returns a float between 0.0 and 1.0 representing bullish confidence.
+        
+        Args:
+            input_data: DataFrame or numpy array of OHLCV + features
+            council_probs: List of [xgb_score, rf_score, tf_score] for meta-model
+        
+        Returns:
+            float: Probability of upward movement (0.0 = strong sell, 1.0 = strong buy)
+        """
+        try:
+            # META-MODEL PATH: Judge uses expert scores, ignores raw data
+            if self.is_meta_model and council_probs is not None:
+                X = np.array([council_probs]) 
+                return float(self.model.predict_proba(X)[0][1])
+
+            is_numpy = isinstance(input_data, np.ndarray)
+
+            # KERAS PATH: Needs 3D tensor (batch, timesteps, features)
+            if hasattr(self.model, "input_shape"):
+                if is_numpy:
+                    X_raw = input_data.astype('float32')
+                else:
+                    if len(input_data) < 50:
+                        return 0.5
+                    X_raw = input_data[self.feature_names].tail(50).values.astype('float32')
+                
+                # 🔧 FIX: Apply normalization if stats are available
+                # Without this, the model receives raw values (BTC ~60000)
+                # but was trained on normalized values (mean ~0, std ~1).
+                if self.norm_mean is not None and self.norm_std is not None:
+                    X_raw = (X_raw - self.norm_mean) / self.norm_std
+                
+                X_tensor = tf.convert_to_tensor(X_raw)
+                X_tensor = tf.expand_dims(X_tensor, 0)  # Add batch dim
+                preds = self.model(X_tensor, training=False)
+                
+                # Handle both Dense(1, sigmoid) and Dense(2, softmax) outputs
+                return float(preds[0][1] if preds.shape[1] > 1 else preds[0][0])
+
+            # TREE MODEL PATH: Needs 2D array (batch, features)
+            if is_numpy:
+                last_row = input_data[-1:].astype('float32')
+            else:
+                last_row = input_data[self.feature_names].iloc[[-1]]
+
+            if hasattr(self.model, "predict_proba"):
+                conf = float(self.model.predict_proba(last_row)[0][1])
+                return min(0.99, max(0.01, conf))
             
-            adapter = RawModelAdapter(payload)
-            
-            # 🔧 FIX #2c: Store in cache
-            _MODEL_CACHE[path] = adapter
-            logger.info(f"✅ Loaded & cached: {os.path.basename(path)}")
-            
-            return adapter
-            
+            return float(self.model.predict(last_row)[0])
+
         except Exception as e:
-            logger.error(f"❌ ModelFactory Crash: Could not load {path}. Error: {e}")
-            return None
+            logger.error(f"❌ Adapter Prediction Error: {e}")
+            return 0.5
+
+    def predict(self, df_history, council_probs=None):
+        """Alias for predict_direction — kept for backward compatibility."""
+        return self.predict_direction(df_history, council_probs=council_probs)

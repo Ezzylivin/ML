@@ -187,7 +187,17 @@ class Backtester:
                 logger.info(f"📡 Sending {len(transformer_input_batch)} samples to Transformer in ONE batch...")
                 
                 transformer_model = ml_engine.experts['transformer'].model
-                full_batch_tensor = tf.convert_to_tensor(np.array(transformer_input_batch), dtype=tf.float32)
+                
+                # 🔧 FIX: Apply normalization to batch (matches training)
+                # The turbo batch bypasses RawModelAdapter, so we must
+                # normalize manually using the same stats saved during training.
+                transformer_adapter = ml_engine.experts['transformer']
+                batch_array = np.array(transformer_input_batch)
+                if transformer_adapter.norm_mean is not None and transformer_adapter.norm_std is not None:
+                    batch_array = (batch_array - transformer_adapter.norm_mean) / transformer_adapter.norm_std
+                    logger.info("📐 Applied normalization to Transformer batch")
+                
+                full_batch_tensor = tf.convert_to_tensor(batch_array.astype('float32'), dtype=tf.float32)
                 
                 all_transformer_preds = transformer_model(full_batch_tensor, training=False).numpy()
                 

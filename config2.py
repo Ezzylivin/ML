@@ -72,7 +72,7 @@ ML_CONFIG = {
 #
 # NEW: Single source of truth. Import these in main4 and backtest2.
 # Standard Coinbase Advanced taker fee for most volume tiers
-DEFAULT_TAKER_FEE = 0.006      # 0.6% — the realistic rate for most users
+DEFAULT_TAKER_FEE = 0.0006     # 0.06% — Coinbase Advanced taker fee
 KRAKEN_TAKER_FEE = 0.0026      # 0.26% — Kraken margin taker fee
 SLIPPAGE_BPS = 1.0              # 0.1% expected slippage
 

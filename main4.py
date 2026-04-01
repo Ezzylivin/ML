@@ -27,11 +27,31 @@ from app.verify.engineer_and_train import apply_mega_features
 
 # 🟢 SOCKET HELPERS (Must be async/await)
 from app.services.socket_emitter import emit_log, emit_status
-from app.config2 import MODEL_DIR
+
+# ============================================================
+# 🔧 FIX #1: Import from config2 instead of redefining
+# ============================================================
+# OLD (BROKEN):
+#   from app.config2 import MODEL_DIR
+#   MODEL_DIR = "models"          # ← This SHADOWED the import!
+#   RESULTS_DIR = "results"       # ← Different from config2's RESULTS_DIR
+#
+# NEW: Use config2 as single source of truth
+from app.config2 import (
+    MODEL_DIR,
+    MODEL_STORAGE_DIR,
+    RESULTS_DIR,
+    DEFAULT_TAKER_FEE,
+    KRAKEN_TAKER_FEE,
+    FEATURE_COLUMNS,
+)
 from app.predictors.stacking_predictor import StackingPredictor
 
-MODEL_DIR = "models"
-RESULTS_DIR = "results"
+# 🔧 FIX: Removed these two lines that were shadowing config2 imports:
+# MODEL_DIR = "models"      ← DELETED
+# RESULTS_DIR = "results"   ← DELETED
+
+# Ensure directories exist (config2 handles MODEL_DIR, but keep for safety)
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
@@ -41,6 +61,24 @@ logger = logging.getLogger("NEO-Engine")
 GLOBAL_SESSION: Optional[aiohttp.ClientSession] = None
 ACTIVE_BOTS = {}
 TASK_REGISTRY = {}
+
+# ============================================================
+# 🔧 FIX #4: MODEL CACHE (Tier 3, but critical for performance)
+# ============================================================
+# OLD: StackingPredictor was instantiated every 0.5s in the heartbeat,
+# triggering 4x joblib.load() from disk = 8 disk reads per second.
+#
+# NEW: Cache by (symbol, timeframe). Loaded once, reused forever.
+_PREDICTOR_CACHE: Dict[str, StackingPredictor] = {}
+
+def get_cached_predictor(symbol: str, timeframe: str = "1h") -> StackingPredictor:
+    """Load a StackingPredictor once and cache it in memory."""
+    cache_key = f"{symbol}_{timeframe}"
+    if cache_key not in _PREDICTOR_CACHE:
+        _PREDICTOR_CACHE[cache_key] = StackingPredictor(symbol=symbol, timeframe=timeframe)
+        logger.info(f"🧠 Cached predictor for {cache_key}")
+    return _PREDICTOR_CACHE[cache_key]
+
 
 # ==========================================
 # 🗄️ 0. DATABASE HANDLER
@@ -141,14 +179,9 @@ class BacktestRequest(BaseModel):
     riskPercentage: float = 1.0
     code: str  
     mlModel: str = "stacking"
-    # 🎯 FIX: Make this Optional so the API doesn't crash if it's missing
-    # We will map 'mlThresholdLong' to this inside the endpoint logic
     ml_confidence_threshold: Optional[float] = 0.8 
-    
-    # 🎯 ADD: Support for the actual keys being sent by the frontend
     mlThresholdLong: Optional[float] = 0.8
     mlThresholdShort: Optional[float] = 0.8
-    
     trend_strategy: Optional[str] = "atr_breakout"
     range_strategy: Optional[str] = "bollinger_reversal"
     trade_direction: Optional[str] = "BOTH"
@@ -170,8 +203,6 @@ class ComboRequest(BaseModel):
     stop_loss: Optional[float] = 0.03
     trailing_stop: Optional[float] = 0.02
     mlModel: Optional[str] = "stacking"
-    # 🎯 FIX: Use defaults here as well to prevent "Field Required" errors
-    # if the frontend user leaves a slider untouched.
     mlThresholdLong: float = 0.8
     mlThresholdShort: float = 0.8
     mlMode: Optional[str] = None
@@ -184,13 +215,10 @@ ComboRequest.model_rebuild()
 async def lifespan(app: FastAPI):
     global GLOBAL_SESSION
     GLOBAL_SESSION = aiohttp.ClientSession()
-    # 🗑️ Removed global_exchange initialization here
     yield
 
     await GLOBAL_SESSION.close()
-    # 🗑️ Removed global_exchange.close() here
     
-    # 🛡️ This keeps your database safe on server restart
     for user_id, bot in ACTIVE_BOTS.items():
         bot["status"] = "stopped"
         DatabaseHandler.save_state(user_id, bot)
@@ -247,10 +275,7 @@ def load_data_robust(symbol, timeframe):
     return None
 
 
-async def ensure_full_data(symbol, timeframe, start_str, end_str,*args, **kwargs):
-    """
-    Checks local DB for data gaps and fetches from Coinbase (Async).
-    """
+async def ensure_full_data(symbol, timeframe, start_str, end_str, *args, **kwargs):
     start_ts = int(pd.to_datetime(start_str).timestamp() * 1000)
     end_ts = int(pd.to_datetime(end_str).timestamp() * 1000)
 
@@ -272,22 +297,18 @@ async def ensure_full_data(symbol, timeframe, start_str, end_str,*args, **kwargs
     if needs_fetch or current_since < end_ts:
         print(f"📡 US-DATA GAP: Fetching {symbol} from Coinbase...")
         
-        # 🟢 Use Async Coinbase
         exchange = ccxt.coinbase({'enableRateLimit': True}) 
         all_new_candles = []
         fetch_symbol = symbol.replace("-", "/") 
 
         try:
             while current_since < end_ts:
-                # 🟢 MUST AWAIT THIS CALL
                 new_batch = await exchange.fetch_ohlcv(fetch_symbol, timeframe, since=current_since, limit=300)
                 if not new_batch: break
                 
                 all_new_candles.extend(new_batch)
                 current_since = new_batch[-1][0] + 1 
-                # No need for time.sleep() with enableRateLimit in async
             
-            # 🔴 CRITICAL: Close the async session
             await exchange.close()
         except Exception as e:
             print(f"⚠️ Coinbase Fetch Error: {e}")
@@ -309,7 +330,6 @@ async def ensure_full_data(symbol, timeframe, start_str, end_str,*args, **kwargs
     target_start = pd.to_datetime(start_str, utc=True)
     target_end = pd.to_datetime(end_str, utc=True)
     return df
-
 
 
 # ==========================================
@@ -390,34 +410,34 @@ class DiagnosticLayer:
             return f"🔍 TARGETS ({rule}): " + " | ".join(pending[:2])
         except Exception: return "🔍 Scanning Market Conditions..."
 
+
 class NeuralPredictor:
     @staticmethod
     def get_prediction(model_id: str, df: pd.DataFrame, symbol: str = "BTC-USD") -> float:
         """
-        Swaps the old placeholder logic for the Full Council Stacking Judge.
+        # ============================================================
+        # 🔧 FIX #4b: Use cached predictor instead of creating new one
+        # ============================================================
+        # OLD: Created a brand new StackingPredictor every call (every 0.5s)
+        #      council = StackingPredictor(symbol=symbol, timeframe="1h")
+        #      This triggered 4x joblib.load() = 8 disk reads/sec
+        #
+        # NEW: Uses the module-level cache. First call loads, rest are free.
         """
         try:
-            # 1. Initialize the Stacking Predictor (The Council)
-            # Standardized for our 25-feature logic
-            council = StackingPredictor(symbol=symbol, timeframe="1h")
-            
-            # 2. Get the Final Probability from the Stacking Judge
-            # This internal call will also PRINT the debate to your terminal console
+            council = get_cached_predictor(symbol=symbol, timeframe="1h")
             prediction = council.predict_direction(df)
-            
             return float(prediction)
         except Exception as e:
             logger.error(f"🧠 Council Predictor Error: {e}")
-            return 0.5 # Neutral fallback
+            return 0.5
 
 
 # ==========================================
 # Packet Data
 # ==========================================
 async def process_data_packet(df: pd.DataFrame, strategies: list) -> list:
-    # 🎯 V25 UPGRADE: One call to rule them all
     df, feats = apply_mega_features(df)
-    
     
     keys = ['bb_lower', 'bb_upper', 'ema_fast', 'ema_slow', 'sma_fast', 'sma_slow', 
             'supertrend', 'rsi', 'macd', 'macd_signal', 'stoch_k', 'stoch_d', 
@@ -439,12 +459,11 @@ class StrategyBrain:
    @staticmethod
    def calculate_signals(df: pd.DataFrame, config: Dict[str, Any], l_thresh: float, s_thresh: float, symbol="BTC-USD"):
        active_thoughts, votes = [], 0
-        # 🟢 ADD THIS: Create a dictionary to store raw values for the logs
        signals_map = {} 
        strategies = config.get('strategies', [])
        current_price = df['close'].iloc[-1]
 
-        # 🟢 1. GLOBAL INDICATORS (Foundational)
+       # 🟢 1. GLOBAL INDICATORS
        ema20 = ta.ema(df['close'], length=20).iloc[-1]
        ema50 = ta.ema(df['close'], length=50).iloc[-1]
        ema200 = ta.ema(df['close'], length=200).iloc[-1]
@@ -452,33 +471,32 @@ class StrategyBrain:
        lower, mid, upper = bb.iloc[-1, 0], bb.iloc[-1, 1], bb.iloc[-1, 2]
        pr = int((current_price - lower) / (upper - lower) * 100)
 
-        # 🟢 2. FULL 10-STRATEGY DYNAMIC EVALUATION
+       # 🟢 2. FULL 10-STRATEGY DYNAMIC EVALUATION
        for strat in strategies:
            code = strat.get('code')
            p = strat.get('params', {})
            try:
-               # 1. RSI (Distance to 30/70)
                if code == "rsi_threshold":
                    rsi = ta.rsi(df['close'], length=int(p.get('rsi_length', 14))).iloc[-1]
                    dist = min(abs(rsi - 30), abs(rsi - 70))
                    signals_map[code] = max(0.1, min(1.0, 1.0 - (dist / 40)))
                    if rsi < p.get('oversold', 30): votes += 1; active_thoughts.append("RSI Low")
                    elif rsi > p.get('overbought', 70): votes -= 1; active_thoughts.append("RSI High")
-                # 2. SMA CROSSOVER (Proximity of Fast to Slow)
+
                elif code == "sma_crossover":
                    f = ta.sma(df['close'], length=int(p.get('fast_sma', 50))).iloc[-1]
                    s = ta.sma(df['close'], length=int(p.get('slow_sma', 200))).iloc[-1]
                    gap = abs(f - s) / s
                    signals_map[code] = 1.0 if f > s else max(0.1, min(0.95, 1.0 - (gap * 50)))
                    if f > s: votes += 1
-                # 3. MACD CROSSOVER (Histogram Intensity)
+
                elif code == "macd_crossover":
                    macd = ta.macd(df['close'], fast=int(p.get('fast', 12))).iloc[-1]
-                   hist = macd[1] # Histogram
+                   hist = macd[1]
                    norm_hist = abs(hist) / (current_price * 0.0005)
                    signals_map[code] = max(0.1, min(1.0, norm_hist))
                    votes += (1 if macd[0] > macd[2] else -1)
-                # 4. SUPERTREND (Price proximity to ST Line)
+
                elif code == "supertrend":
                    st_data = ta.supertrend(df['high'], df['low'], df['close']).iloc[-1]
                    st_line = st_data[0]
@@ -486,38 +504,42 @@ class StrategyBrain:
                    signals_map[code] = 1.0 if st_data[1] == 1 else max(0.1, min(0.95, 1.0 - (dist * 20)))
                    votes += (1 if st_data[1] == 1 else -1)
 
-                # 5. BOLLINGER FADE (Distance to Wall)
                elif code == "bb_fade":
                    signals_map[code] = max(0.1, min(1.0, pr / 100.0))
                    if current_price < lower: votes += 1
                    elif current_price > upper: votes -= 1
-                # 6. ATR BREAKOUT (Distance to EMA+ATR Channel)
+
                elif code == "atr_breakout":
                    atr = ta.atr(df['high'], df['low'], df['close']).iloc[-1]
                    target = ema20 + (atr * float(p.get('multiplier', 1.5)))
                    signals_map[code] = max(0.1, min(1.0, current_price / target))
                    if current_price > target: votes += 1
-                # 7. PRICE ACTION BREAKOUT (Distance to 20-candle High)
+
                elif code == "pa_breakout":
                    lb = int(p.get('lookback', 20))
                    high_lb = df['high'].tail(lb).max()
                    signals_map[code] = max(0.1, min(1.0, current_price / high_lb))
                    if current_price >= high_lb: votes += 1
-                # 8. VOL PROFILE (Volume Surge Ratio)
+
                elif code == "vol_profile":
                    v_ma = ta.sma(df['volume'], length=int(p.get('vol_ma', 20))).iloc[-1]
                    ratio = df['volume'].iloc[-1] / (v_ma * float(p.get('threshold', 1.5)))
                    signals_map[code] = max(0.1, min(1.0, ratio))
                    if ratio >= 1.0: votes += (1 if current_price > mid else -1)
-                # 9. STOCHASTIC (Proximity to 20/80 threshold)
+
+               # ============================================================
+               # 🔧 FIX #3: STOCHASTIC BUG
+               # ============================================================
+               # OLD: votes -= -1  (double negative = votes += 1, wrong!)
+               # NEW: votes -= 1   (correctly subtracts for overbought)
                elif code == "stoch":
                    stoch_df = ta.stoch(df['high'], df['low'], df['close']).iloc[-1]
                    k = stoch_df[0]
                    dist = min(abs(k - 20), abs(k - 80))
                    signals_map[code] = max(0.1, min(1.0, 1.0 - (dist / 40)))
                    if k < 20: votes += 1
-                   elif k > 80: votes -= -1
-                # 10. EMA CLOUD (Distance between Fast and Slow EMA)
+                   elif k > 80: votes -= 1  # 🔧 FIX: Was `votes -= -1`
+
                elif code == "ema_cloud":
                    f_ema = ta.ema(df['close'], length=int(p.get('fast_ema', 9))).iloc[-1]
                    s_ema = ta.ema(df['close'], length=int(p.get('slow_ema', 21))).iloc[-1]
@@ -528,7 +550,7 @@ class StrategyBrain:
                    signals_map[code] = 0.5
            except Exception: signals_map[code] = 0.0
         
-       # 🚀 3. DYNAMIC DUAL-GATE LOGIC (ML Filtering)
+       # 🚀 3. DYNAMIC DUAL-GATE LOGIC
        is_short = current_price < ema200
        ui_limit = float(config.get('mlThresholdShort', 0.90)) if is_short else float(config.get('mlThresholdLong', 0.80))
        conf = NeuralPredictor.get_prediction(config.get('mlModel', 'stacking'), df, symbol=symbol)
@@ -557,29 +579,23 @@ class StrategyBrain:
            }
        }
 
-        # 🎯 6. FINAL SIGNAL CALCULATION
-        # 🎯 6. FINAL SIGNAL CALCULATION (Directional Unlock Upgrade)
+       # 🎯 6. FINAL SIGNAL CALCULATION
        rule = config.get('comboConfig', {}).get('combinationRule', 'OR')
        final_sig = 0
        
        if gate_passed:
-           # Check for LONG: Votes must be positive
            if rule == "AND":
                if votes >= len(strategies): final_sig = 1
-           else: # "OR" logic
+           else:
                if votes > 0: final_sig = 1
            
-            # Check for SHORT: Votes must be negative
-            # Note: We check this separately so a Long can flip to Short and vice versa
            if rule == "AND":
                if votes <= -len(strategies): final_sig = -1
-           elif votes < 0: # "OR" logic
+           elif votes < 0:
                final_sig = -1
 
-        # 🚀 LOGIC OVERRIDE: 
-        # If the ML says we can trade (gate_passed), we take the signal 
-        # provided by the strategies, ignoring the trend bias.
        return final_sig, active_thoughts, numeric_details, conf, signals_map
+
 
 # ==========================================
 # 🚀 3. THE HEARTBEAT (Dynamic Calculation Loop)
@@ -603,7 +619,6 @@ async def live_neural_heartbeat(user_id: str):
             symbol = config['symbol'].replace('-', '/')
             ticker_symbol = config['symbol'] 
             
-            # 🔐 STATE ROUTING
             api_keys = bot.get('api_keys') or config.get('api_keys', {}) 
             trading_mode = config.get('trading_mode', 'paper').lower()
             use_margin = config.get('enable_shorting', False)
@@ -611,7 +626,6 @@ async def live_neural_heartbeat(user_id: str):
             
             target_exchange = "kraken" if use_margin else "coinbase"
             
-            # Note: For Kraken, the UI should send 'krakenKey'. For Coinbase, 'apiKey'.
             has_valid_keys = bool(api_keys.get('krakenKey') if use_margin else api_keys.get('apiKey'))
             is_live_trading = (trading_mode == 'live') and has_valid_keys
 
@@ -622,32 +636,33 @@ async def live_neural_heartbeat(user_id: str):
                 bot['config'] = config 
                 DatabaseHandler.save_state(user_id, bot)
 
+            # ============================================================
+            # 🔧 FIX #2b: Use config2 fee constants instead of hardcoded
+            # ============================================================
+            # OLD: fee_rate = 0.0026 if use_margin else 0.006
+            # NEW: Imported from config2
+            fee_rate = KRAKEN_TAKER_FEE if use_margin else DEFAULT_TAKER_FEE
+
             try:
-                # 🟢 2. DATA FETCHING (Dynamic Exchange Pulse)
                 ohlcv_raw = await fetch_live_candles_ccxt(config['symbol'], config.get('timeframe', '1h'), 350, exchange_id=target_exchange)
                 
                 if not ohlcv_raw:
                     await emit_log(user_id, f"⚠️ {target_exchange.upper()} Feed Unstable - Retrying...")
                     await asyncio.sleep(5); continue
                 
-                # 🚀 THE FIX: Dynamically fetch the ticker from the correct exchange
                 exchange_class = getattr(ccxt, target_exchange)
                 async with exchange_class({'enableRateLimit': True}) as ex:
                     ticker = await ex.fetch_ticker(ticker_symbol.replace('-', '/'))
                     current_price = float(ticker['last'])
                 
-                # Zero-Drift Patch using the live price
                 ohlcv_raw[-1]['close'] = current_price
                 ohlcv_raw[-1]['time'] = int(datetime.now(timezone.utc).timestamp())
                 
-                # 🟢 3. THE ANTI-REPAINTING LOCK & THREAD FIX
                 df_raw = pd.DataFrame(ohlcv_raw)
                 df_closed_history = df_raw.iloc[:-1].copy()
                 
-                # 🚀 CRITICAL FIX: Offload heavy math to background thread
                 df_ai, _ = await asyncio.to_thread(apply_mega_features, df_closed_history)
 
-                # 🟢 4. COUNCIL SIGNAL PROCESSING
                 sig, thoughts, nums, score, signals_map = StrategyBrain.calculate_signals(
                     df_ai, config, 0.5, 0.5, symbol=ticker_symbol
                 )
@@ -656,7 +671,6 @@ async def live_neural_heartbeat(user_id: str):
                 if score < 0.20: sentiment = "STRONG SELL"
                 elif score < 0.35: sentiment = "SELL"
 
-                # 🟢 5. HUD CONSTRUCTION
                 upnl = sum([(current_price - p['entry']) * p['size'] if p['type'] == 'long' else (p['entry'] - current_price) * p['size'] for p in bot['positions']])
                 current_equity = bot['balance'] + upnl
 
@@ -673,12 +687,11 @@ async def live_neural_heartbeat(user_id: str):
                 waiting_msg = DiagnosticLayer.get_pending_conditions(df_ai, config, score, ui_limit)
 
                 # ==========================================
-                # 🛡️ NEURAL VETO TRACKER (Inserted Here)
+                # 🛡️ NEURAL VETO TRACKER
                 # ==========================================
                 if "vetoed_signals" not in bot:
                     bot["vetoed_signals"] = []
 
-                # Reconstruct what the atomic strategies WANTED to do
                 rule = config.get('comboConfig', {}).get('combinationRule', 'OR')
                 raw_sig = 0
                 votes = sum([1 if signals_map.get(s['code'], 0) > 0.5 else -1 for s in strategies])
@@ -690,9 +703,7 @@ async def live_neural_heartbeat(user_id: str):
                     if votes > 0: raw_sig = 1
                     elif votes < 0: raw_sig = -1
 
-                # If they wanted to trade, but the AI stopped them, log it!
                 if raw_sig != 0 and score < ui_limit:
-                    # Prevent spamming the same veto every 0.5 seconds (5-minute cooldown)
                     if not bot["vetoed_signals"] or (datetime.now(timezone.utc) - datetime.fromisoformat(bot["vetoed_signals"][-1]["time"])).total_seconds() > 300:
                         bot["vetoed_signals"].append({
                             "time": datetime.now(timezone.utc).isoformat(),
@@ -701,7 +712,6 @@ async def live_neural_heartbeat(user_id: str):
                             "limit": round(ui_limit, 4),
                             "price": current_price
                         })
-                        # Keep memory clean (last 100 vetoes)
                         if len(bot["vetoed_signals"]) > 100: bot["vetoed_signals"].pop(0)
                 
                 if len(bot['positions']) < int(config.get('maxPyramiding', 1)):
@@ -712,7 +722,6 @@ async def live_neural_heartbeat(user_id: str):
                 targets_str = " | ".join([f"{s['code'].upper()}: {DiagnosticLayer.render_progress(int(signals_map.get(s['code'], 0) * 100), 100)}" for s in strategies])
                 combined_status = f"{active_summary}{hunting_summary} | 🔍 {targets_str}"
 
-                # 🟢 6. EMIT LOGS & UI UPDATES
                 now_ts = datetime.now().timestamp()
                 if (now_ts - last_log >= 15):
                     await emit_log(user_id, combined_status)
@@ -730,7 +739,7 @@ async def live_neural_heartbeat(user_id: str):
                     if len(bot["equityCurve"]) > 300: bot["equityCurve"].pop(0)
                     last_ui_update = now_ts
 
-                # 🟢 7. TRADE EXECUTION LOGIC (Live Router)
+                # 🟢 7. TRADE EXECUTION LOGIC
                 max_p = min(5, int(config.get('maxPyramiding', 5)))
                 current_time = datetime.now(timezone.utc)
                 
@@ -745,11 +754,9 @@ async def live_neural_heartbeat(user_id: str):
                         size_in_fiat = bot['balance'] * (float(config.get('riskPercentage', 10.0)) / 100 / max_p)
                         size_in_crypto = size_in_fiat / current_price
                         
-                        # 🚀 CRITICAL FIX: Prevent Scientific Notation (1e-5) rejection
                         safe_size = float(f"{size_in_crypto:.6f}") 
                         actual_entry_price = current_price
                         
-                        # 🔴 REAL API EXECUTION
                         if is_live_trading:
                             try:
                                 exchange_class = getattr(ccxt, target_exchange)
@@ -766,7 +773,7 @@ async def live_neural_heartbeat(user_id: str):
                                     order = await user_exchange.create_market_order(symbol, side, safe_size, params=order_params)
                                     
                                     actual_entry_price = order.get('average') or order.get('price') or current_price
-                                    fee_rate = 0.0026 if use_margin else 0.006
+                                    # 🔧 FIX #2b: Use the fee_rate variable defined above
                                     bot['balance'] -= (safe_size * actual_entry_price) * fee_rate
                                     
                             except Exception as ex_err:
@@ -799,7 +806,6 @@ async def live_neural_heartbeat(user_id: str):
                     if closed:
                         actual_close_price = current_price
                         
-                        # 🔴 REAL API EXECUTION
                         if is_live_trading:
                             try:
                                 exchange_class = getattr(ccxt, target_exchange)
@@ -821,7 +827,7 @@ async def live_neural_heartbeat(user_id: str):
                                 continue 
                         
                         gross_pnl = (actual_close_price - pos['entry']) * pos['size'] if pos['type'] == 'long' else (pos['entry'] - actual_close_price) * pos['size']
-                        fee_rate = 0.0026 if use_margin else 0.006
+                        # 🔧 FIX #2b: Use the fee_rate variable
                         net_pnl = gross_pnl - ((pos['size'] * actual_close_price) * fee_rate)
 
                         bot['balance'] += net_pnl
@@ -840,19 +846,15 @@ async def live_neural_heartbeat(user_id: str):
     finally:
         logger.info(f"🔌 Heartbeat loop terminated for {user_id}")
 
+
 # =============================================================
 # ENDPOINTS
 # =============================================================
 async def fetch_live_candles_ccxt(symbol: str, timeframe: str, limit: int, exchange_id: str = "coinbase"):
-    """
-    Dynamically fetches data from the correct exchange to prevent price mismatch.
-    """
-    # Initialize the correct exchange class dynamically
     exchange_class = getattr(ccxt, exchange_id)
     
     async with exchange_class({'enableRateLimit': True}) as ex:
         try:
-            # Kraken uses standard format, Coinbase uses dashed. CCXT handles most, but we ensure '/'
             fetch_symbol = symbol.replace('-', '/')
             ohlcv = await ex.fetch_ohlcv(fetch_symbol, timeframe, limit=limit)
             return [{"time": int(c[0]/1000), "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c) > 5 else 0} for c in ohlcv]
@@ -864,6 +866,7 @@ async def fetch_live_candles_ccxt(symbol: str, timeframe: str, limit: int, excha
 @app.get("/ml/available-models")
 @app.get("/api/models")
 def list_models():
+    # 🔧 FIX #1c: Uses imported MODEL_DIR from config2 (no longer shadowed)
     if not os.path.exists(MODEL_DIR): return {"status": "success", "models": []}
     models = [{"id": f.rsplit('.', 1)[0], "name": f.rsplit('.', 1)[0]} 
               for f in os.listdir(MODEL_DIR) if f.endswith(('.keras', '.joblib', '.pkl'))]
@@ -914,7 +917,6 @@ async def start_bot(data: BotStartRequest):
         if ACTIVE_BOTS[user_id]["positions"]:
             pos = ACTIVE_BOTS[user_id]["positions"][0]
             side = pos['type'].upper()
-            # This forces the "Activated" message into the flow on every start/refresh
             await emit_log(user_id, f"⚡ TRADE DURING STARTUP: {side} Position Detected @ ${pos['entry']}")
         
         await emit_log(user_id, f"♻️ SESSION STARTED: Balance updated to ${ui_capital}")
@@ -975,25 +977,19 @@ async def close_position(data: BotClosePositionRequest):
 @app.post('/api/backtest/run')
 async def run_backtest(request: BacktestRequest):
     try:
-        # 1. Standardize UI request keys
         config = request.dict()
         
-        # 🎯 KEY BRIDGING: Map UI names to Engine names
         final_thresh = config.get('mlThresholdLong') or config.get('ml_confidence_threshold') or 0.8
         config['mlThresholdLong'] = final_thresh
         config['mlThresholdShort'] = config.get('mlThresholdShort') or final_thresh
         config['risk_percentage'] = config.get('riskPercentage', 1.0)
         
-        # 2. Format strategies list
         config['strategies'] = [{"code": request.code, "params": request.params}]
 
-        # 3. Initialize and Run
         from app.backtest2 import Backtester
         tester = Backtester(config)
         result = await tester.run()
 
-        # 🏁 THE FIX: Use a custom encoder or JSONResponse with manual dump to handle Timestamps
-        # This prevents the 'Timestamp is not JSON serializable' error in Atomic runs
         return json.loads(json.dumps(result, default=str))
 
     except Exception as e:
@@ -1005,32 +1001,24 @@ async def run_backtest(request: BacktestRequest):
 async def run_combo_backtest(req: ComboRequest):
     async def event_generator():
         try:
-            # 1. Setup Config
             config = req.dict()
             config['mlThresholdLong'] = config.get('mlThresholdLong', 0.8)
             config['mlThresholdShort'] = config.get('mlThresholdShort', 0.8)
             config['risk_percentage'] = config.get('risk_percentage', 1.0)
 
-            # 📈 10%: Progress
             yield f"{json.dumps({'status': 'progress', 'percentage': 10, 'message': 'Assembling AI Council...'}, default=str)}\n"
 
             logger.info(f"⚖️ COMBO RUN START: {len(config.get('strategies', []))} Strategies | AI Limit: {config['mlThresholdLong']}")
             
-            # 2. Initialize Engine
             from app.backtest2 import Backtester
             tester = Backtester(config)
             
-            # 📈 30%: Progress
             yield f"{json.dumps({'status': 'progress', 'percentage': 30, 'message': 'Fetching Market History...'}, default=str)}\n"
 
-            # 3. Execute Run
             result = await tester.run()
             
-            # 📈 90%: Progress
             yield f"{json.dumps({'status': 'progress', 'percentage': 90, 'message': 'Finalizing Analytics...'}, default=str)}\n"
 
-            # 🏁 100%: SUCCESS HANDSHAKE
-            # 🚀 CRITICAL: default=str converts Pandas Timestamps to strings so JSON doesn't crash
             final_payload = {
                 "status": "success",
                 "result": result
@@ -1039,14 +1027,13 @@ async def run_combo_backtest(req: ComboRequest):
 
         except Exception as e:
             logger.error(f"❌ Combo Stream Error: {e}")
-            # Ensure error messages are also string-serialized
             yield f"{json.dumps({'status': 'error', 'message': str(e)}, default=str)}\n"
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "X-Accel-Buffering": "no",  # Prevents Nginx/Render buffering
+            "X-Accel-Buffering": "no",
             "Cache-Control": "no-cache",
             "Connection": "keep-alive"
         }
@@ -1066,7 +1053,6 @@ async def get_status(userId: str):
             "equityCurve": bot.get("equityCurve", []),
             "logs": bot.get("logs", []),
             "positions": bot.get("positions", []),
-            # 🟢 NEW: Return start time
             "startedAt": bot.get("startedAt"),
             "config": bot.get("config"),
             "candles": bot.get("candles", [])
@@ -1088,4 +1074,3 @@ async def reset_bot(data: BotStopRequest):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-(venv) root@intelligent-mendel:~/Project/ML# 

@@ -31,10 +31,21 @@ class RawModelAdapter:
     def __init__(self, model_payload):
         self.default_features = FEATURE_COLUMNS
         
+        # ============================================================
+        # 🔧 FIX: Support normalization stats for Keras models
+        # ============================================================
+        # train_transformer.py now saves a companion .npz file with
+        # the mean/std used during training. If present in the payload,
+        # we apply the same normalization at inference time.
+        self.norm_mean = None
+        self.norm_std = None
+        
         if isinstance(model_payload, dict):
             self.model = model_payload.get('model')
             self.feature_names = model_payload.get('feature_names') or self.default_features
             self.is_meta_model = model_payload.get('is_meta_model', False)
+            self.norm_mean = model_payload.get('norm_mean')
+            self.norm_std = model_payload.get('norm_std')
         else:
             self.model = model_payload
             self.feature_names = self.default_features
@@ -76,6 +87,12 @@ class RawModelAdapter:
                     if len(input_data) < 50:
                         return 0.5
                     X_raw = input_data[self.feature_names].tail(50).values.astype('float32')
+                
+                # 🔧 FIX: Apply normalization if stats are available
+                # Without this, the model receives raw values (BTC ~60000)
+                # but was trained on normalized values (mean ~0, std ~1).
+                if self.norm_mean is not None and self.norm_std is not None:
+                    X_raw = (X_raw - self.norm_mean) / self.norm_std
                 
                 X_tensor = tf.convert_to_tensor(X_raw)
                 X_tensor = tf.expand_dims(X_tensor, 0)  # Add batch dim

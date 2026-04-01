@@ -10,86 +10,17 @@ from app.predictors.model_factory import ModelFactory
 # ============================================================
 # 🔧 FIX #1: Import centralized constants from config2
 # ============================================================
-# OLD: Fee was hardcoded as 0.0006 (0.06%) — 10x less than live engine
-# OLD: Feature list was hardcoded inline in RawModelAdapter
-# NEW: Single source of truth
 from app.config2 import DEFAULT_TAKER_FEE, FEATURE_COLUMNS
 
+# ============================================================
+# 🔧 FIX #2: Import RawModelAdapter from its own module
+# ============================================================
+# OLD: RawModelAdapter was defined here in backtest2.py, causing a
+#      circular import: ModelFactory → backtest2 → ModelFactory
+# NEW: Lives in app/predictors/model_adapter.py. Both files import it cleanly.
+from app.predictors.model_adapter import RawModelAdapter
+
 logger = logging.getLogger("BacktestEngine")
-
-
-class RawModelAdapter:
-    """
-    Bridge between raw model files (.joblib/.keras) and the prediction interface.
-    Gives every model a unified .predict_direction() method.
-    
-    NOTE: This class should eventually move to its own file (e.g. app/predictors/model_adapter.py)
-    to break the circular dependency: ModelFactory imports RawModelAdapter from here,
-    and this file imports ModelFactory. Currently works only because the import is inside
-    a method call, but it's fragile.
-    """
-    def __init__(self, model_payload):
-        # ============================================================
-        # 🔧 FIX #2: Use FEATURE_COLUMNS from config2
-        # ============================================================
-        # OLD: Hardcoded 25-item list that could drift from training
-        # NEW: Import from config2 — one list to rule them all
-        self.default_features = FEATURE_COLUMNS
-        
-        if isinstance(model_payload, dict):
-            self.model = model_payload.get('model')
-            self.feature_names = model_payload.get('feature_names', self.default_features)
-            self.is_meta_model = model_payload.get('is_meta_model', False)
-        else:
-            self.model = model_payload
-            self.feature_names = self.default_features
-            self.is_meta_model = False
-
-        if hasattr(self.model, "input_shape") and not self.is_meta_model:
-            try:
-                dummy_input = tf.zeros((1, 50, len(self.feature_names)))
-                self.model(dummy_input, training=False)
-                logger.info("✅ Transformer Graph Compiled & Locked for Speed.")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not pre-warm model: {e}")
-
-    def predict_direction(self, input_data, council_probs=None):
-        try:
-            if self.is_meta_model and council_probs is not None:
-                X = np.array([council_probs]) 
-                return float(self.model.predict_proba(X)[0][1])
-
-            is_numpy = isinstance(input_data, np.ndarray)
-
-            if hasattr(self.model, "input_shape"):
-                if is_numpy:
-                    X_raw = input_data.astype('float32')
-                else:
-                    if len(input_data) < 50: return 0.5
-                    X_raw = input_data[self.feature_names].tail(50).values.astype('float32')
-                
-                X_tensor = tf.convert_to_tensor(X_raw)
-                X_tensor = tf.expand_dims(X_tensor, 0)
-                preds = self.model(X_tensor, training=False) 
-                return float(preds[0][1] if preds.shape[1] > 1 else preds[0][0])
-
-            if is_numpy:
-                last_row = input_data[-1:].astype('float32')
-            else:
-                last_row = input_data[self.feature_names].iloc[[-1]]
-
-            if hasattr(self.model, "predict_proba"):
-                conf = float(self.model.predict_proba(last_row)[0][1])
-                return min(0.99, max(0.01, conf))
-            
-            return float(self.model.predict(last_row)[0])
-
-        except Exception as e:
-            logger.error(f"❌ Adapter Prediction Error: {e}")
-            return 0.5
-
-    def predict(self, df_history, council_probs=None):
-        return self.predict_direction(df_history, council_probs=council_probs)
 
 
 class Backtester:

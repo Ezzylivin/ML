@@ -7,19 +7,34 @@ import tensorflow as tf
 from fastapi import HTTPException
 from app.predictors.model_factory import ModelFactory
 
+# ============================================================
+# 🔧 FIX #1: Import centralized constants from config2
+# ============================================================
+# OLD: Fee was hardcoded as 0.0006 (0.06%) — 10x less than live engine
+# OLD: Feature list was hardcoded inline in RawModelAdapter
+# NEW: Single source of truth
+from app.config2 import DEFAULT_TAKER_FEE, FEATURE_COLUMNS
+
 logger = logging.getLogger("BacktestEngine")
 
+
 class RawModelAdapter:
+    """
+    Bridge between raw model files (.joblib/.keras) and the prediction interface.
+    Gives every model a unified .predict_direction() method.
+    
+    NOTE: This class should eventually move to its own file (e.g. app/predictors/model_adapter.py)
+    to break the circular dependency: ModelFactory imports RawModelAdapter from here,
+    and this file imports ModelFactory. Currently works only because the import is inside
+    a method call, but it's fragile.
+    """
     def __init__(self, model_payload):
-        self.default_features = [
-            'open', 'high', 'low', 'close', 'volume',
-            'sma_50', 'sma_200', 'ema_9', 'ema_21', 'ema_20',
-            'rsi', 'atr', 'adx', 'st_trend', 
-            'BBL_20_2.0_2.0', 'BBU_20_2.0_2.0', 
-            'STOCHk_14_3_3', 'MACD_12_26_9', 'MACDs_12_26_9',
-            'pa_high', 'pa_low', 'vol_ma', 
-            'adx_logic', 'atr_logic', 'sma_logic'
-        ]
+        # ============================================================
+        # 🔧 FIX #2: Use FEATURE_COLUMNS from config2
+        # ============================================================
+        # OLD: Hardcoded 25-item list that could drift from training
+        # NEW: Import from config2 — one list to rule them all
+        self.default_features = FEATURE_COLUMNS
         
         if isinstance(model_payload, dict):
             self.model = model_payload.get('model')
@@ -76,6 +91,7 @@ class RawModelAdapter:
     def predict(self, df_history, council_probs=None):
         return self.predict_direction(df_history, council_probs=council_probs)
 
+
 class Backtester:
     def __init__(self, config: dict):
         self.config = config 
@@ -98,6 +114,13 @@ class Backtester:
         self.ml_limit_long = float(config.get('mlThresholdLong', 0.80))
         self.ml_limit_short = float(config.get('mlThresholdShort', 0.80))
         self.model_name = config.get('mlModel', 'stacking')
+
+        # ============================================================
+        # 🔧 FIX #3: Centralized fee rate
+        # ============================================================
+        # OLD: Hardcoded 0.0006 (0.06%) inline — 10x less than live engine
+        # NEW: Uses the same constant as main4.py
+        self.fee_rate = DEFAULT_TAKER_FEE
 
     def calculate_indicators(self, df):
         if len(df) < 200: return df 
@@ -254,7 +277,6 @@ class Backtester:
                 
                 logger.info(f"✅ AI CRUNCH DONE in {time.time() - batch_start_time:.2f}s")
                 
-                # 🎯 SYNC LOCK: Capture exact AI rows
                 df_final = df_slice.iloc[50:].copy()
                 df_final['ai_conf'] = ai_scores
             else:
@@ -272,15 +294,17 @@ class Backtester:
             pending_vetoes = []
             veto_stats = {"saved": 0, "missed": 0}
 
+            # ============================================================
+            # 🔧 FIX #4: Capture position size at ENTRY, not at exit
+            # ============================================================
+            # OLD: position_size_fiat = balance * self.risk_mult (at exit time)
+            # This meant size changed if balance changed between entry/exit.
+            # NEW: Store it when we enter, use the stored value at exit.
+            entry_position_size_fiat = 0
+
             rows = df_final.to_dict('records')
-            
-            # 🚀 FIX 1: Convert to UNIX Timestamps (Seconds) for TradingView React compatibility
-            # This prevents the chart crashing on the frontend
             timestamps = (df_final.index.astype('int64') // 10**9).tolist()
-            
-            # ISO String format for logs (easier for humans to read)
             iso_timestamps = df_final.index.strftime('%Y-%m-%dT%H:%M:%S.000Z').tolist()
-            
 
             for i in range(len(rows)):
                 row = rows[i]
@@ -296,8 +320,8 @@ class Backtester:
                 for v in pending_vetoes:
                     outcome = None
                     if v["type"] == "long":
-                        if row['low'] <= v["sl"]: outcome = "saved"    # Hit Stop Loss: AI Saved us!
-                        elif row['high'] >= v["tp"]: outcome = "missed" # Hit Take Profit: AI Missed a win
+                        if row['low'] <= v["sl"]: outcome = "saved"
+                        elif row['high'] >= v["tp"]: outcome = "missed"
                     else:
                         if row['high'] >= v["sl"]: outcome = "saved"
                         elif row['low'] <= v["tp"]: outcome = "missed"
@@ -311,54 +335,56 @@ class Backtester:
                 if signal != 0 and not gate_passed and position is None:
                     trade_type = "long" if signal == 1 else "short"
                     
-                    # Calculate hypothetical TP and SL based on your params
                     hypo_tp = row['close'] * (1 + self.tp_pct) if signal == 1 else row['close'] * (1 - self.tp_pct)
                     hypo_sl = row['close'] * (1 - self.ts_pct) if signal == 1 else row['close'] * (1 + self.ts_pct)
                     
-                    # Add to our ghost tracker
                     pending_vetoes.append({
                         "type": trade_type,
                         "tp": hypo_tp,
                         "sl": hypo_sl
                     })
 
-                    # Keep your existing UI logging
                     if i % 5 == 0:
                         vetoed_logs.append({
                             "time": current_time_iso, "signal": trade_type.capitalize(),
                             "conf_score": round(conf_score, 4), "limit": round(limit, 4), "price": row['close']
                         })
 
+                # ============================================================
+                # 🔧 FIX #5: Exit logic — record equity on close, no skip
+                # ============================================================
+                # OLD: `continue` after closing a position skipped the equity
+                # curve append at the bottom. Trades that closed never got
+                # their new balance recorded that candle → visual gaps.
+                # NEW: Use a flag instead of continue.
+                did_close_position = False
+
                 if position:
                     exit_p, exit_r = None, None
                     
-                    # 🚀 FIX 2: Check STOP LOSS first to prevent Look-Ahead bias
                     if position == 'long':
-                        # Check Worst-Case first
                         if row['low'] <= tsl_price: exit_p, exit_r = tsl_price, "Trailing Stop"
                         elif row['high'] >= tp_price: exit_p, exit_r = tp_price, "Take Profit"
                         elif signal == -1: exit_p, exit_r = row['close'], "Signal Flip"
                     else:
-                        # Check Worst-Case first
                         if row['high'] >= tsl_price: exit_p, exit_r = tsl_price, "Trailing Stop"
                         elif row['low'] <= tp_price: exit_p, exit_r = tp_price, "Take Profit"
                         elif signal == 1: exit_p, exit_r = row['close'], "Signal Flip"
 
                     if exit_p:
-                        # 🚀 FIX 3: Realistic position sizing and fee math in absolute dollars
-                        position_size_fiat = balance * self.risk_mult
-                        pnl_v = (exit_p - entry_price)/entry_price if position == 'long' else (entry_price - exit_p)/entry_price
+                        # 🔧 FIX #4b: Use the size captured at entry
+                        pnl_v = (exit_p - entry_price) / entry_price if position == 'long' else (entry_price - exit_p) / entry_price
                         
-                        gross_profit = position_size_fiat * pnl_v
+                        gross_profit = entry_position_size_fiat * pnl_v
                         
-                        # Apply 0.06% Taker Fee correctly to the actual position size
-                        entry_fee = position_size_fiat * 0.0006
-                        exit_fee = (position_size_fiat + gross_profit) * 0.0006
+                        # 🔧 FIX #3b: Use self.fee_rate from config2
+                        # OLD: hardcoded 0.0006
+                        entry_fee = entry_position_size_fiat * self.fee_rate
+                        exit_fee = (entry_position_size_fiat + gross_profit) * self.fee_rate
                         net_profit = gross_profit - (entry_fee + exit_fee)
                         
                         balance += net_profit
                         
-                        # 🚀 FIX 4: Dynamically calculate Max Drawdown on every trade close
                         if balance > peak_balance:
                             peak_balance = balance
                         
@@ -366,30 +392,46 @@ class Backtester:
                         if current_dd > max_drawdown:
                             max_drawdown = current_dd
                         
-                        trades.append({"type": "exit", "reason": exit_r, "price": round(exit_p, 2), "time": current_time_iso, "pnl": round(pnl_v * 100, 2), "balance": round(balance, 2)})
+                        trades.append({
+                            "type": "exit", "reason": exit_r, "price": round(exit_p, 2),
+                            "time": current_time_iso, "pnl": round(pnl_v * 100, 2),
+                            "balance": round(balance, 2)
+                        })
                         position = None
-                        continue
+                        entry_position_size_fiat = 0
+                        did_close_position = True
+                        # 🔧 FIX #5: Removed `continue` — fall through to equity append
                     
-                    if position == 'long':
-                        new_tsl = row['high'] * (1 - self.ts_pct)
-                        if new_tsl > tsl_price: tsl_price = new_tsl
-                    else:
-                        new_tsl = row['low'] * (1 + self.ts_pct)
-                        if new_tsl < tsl_price: tsl_price = new_tsl
+                    # Only update trailing stop if we didn't just close
+                    if not did_close_position and position:
+                        if position == 'long':
+                            new_tsl = row['high'] * (1 - self.ts_pct)
+                            if new_tsl > tsl_price: tsl_price = new_tsl
+                        else:
+                            new_tsl = row['low'] * (1 + self.ts_pct)
+                            if new_tsl < tsl_price: tsl_price = new_tsl
 
-                if position is None and gate_passed and signal != 0:
+                # Don't enter on the same bar we just exited (conservative, prevents look-ahead)
+                if not did_close_position and position is None and gate_passed and signal != 0:
                     position = 'long' if signal == 1 else 'short'
                     entry_price = row['close']
                     tp_price = entry_price * (1 + self.tp_pct) if position == 'long' else entry_price * (1 - self.tp_pct)
                     tsl_price = entry_price * (1 - self.ts_pct) if position == 'long' else entry_price * (1 + self.ts_pct)
                     
-                    trades.append({"type": "buy" if position == 'long' else "sell", "price": entry_price, "time": current_time_iso, "ai_score": round(conf_score, 4), "gate_limit": round(limit, 4)})
+                    # 🔧 FIX #4c: Capture position size at entry
+                    entry_position_size_fiat = balance * self.risk_mult
+                    
+                    trades.append({
+                        "type": "buy" if position == 'long' else "sell",
+                        "price": entry_price, "time": current_time_iso,
+                        "ai_score": round(conf_score, 4), "gate_limit": round(limit, 4)
+                    })
 
+                # 🔧 FIX #5b: This now always runs, even on bars where we closed
                 if i % 4 == 0:
                     equity_curve.append({"time": current_time_unix, "balance": round(balance, 2)})
 
             # 🎯 SYNC-LOCK CHART DATA
-            # Make sure we use the UNIX timestamps for the chart rendering
             chart_candles = df_final.copy()
             chart_candles['time'] = timestamps
             chart_data_json = chart_candles.tail(1000)[['time', 'open', 'high', 'low', 'close', 'volume']].to_dict('records')
@@ -421,8 +463,10 @@ class Backtester:
             logger.error(f"❌ Backtest Runtime Error: {e}")
             return {"status": "failed", "error": str(e)}
 
-    async def run_with_precalculated_data(self, df_final):
-        try: return await self.run()
-        except Exception as e:
-            logger.error(f"Execution Loop Error: {e}")
-            raise e
+    # ============================================================
+    # 🔧 FIX #6: Removed dead method run_with_precalculated_data
+    # ============================================================
+    # OLD: This method accepted df_final but ignored it completely,
+    # just calling self.run() which re-fetches everything.
+    # It was dead code that could mislead someone into thinking
+    # pre-calculated data was being used. Removed entirely.

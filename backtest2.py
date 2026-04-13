@@ -377,15 +377,41 @@ class Backtester:
             chart_candles['time'] = timestamps
             chart_data_json = chart_candles.tail(1000)[['time', 'open', 'high', 'low', 'close', 'volume']].to_dict('records')
 
+            # 🚀 1. Calculate AI Shield Metrics
             total_resolved = veto_stats["saved"] + veto_stats["missed"]
             ai_accuracy = (veto_stats["saved"] / total_resolved * 100) if total_resolved > 0 else 0.0
 
+            # 🚀 2. Calculate Win Rate & Profit Factor natively in Python
+            wins = 0
+            losses = 0
+            gross_total_profit = 0.0
+            gross_total_loss = 0.0
+
+            for t in trades:
+                if t.get("type") == "exit":
+                    trade_pnl = float(t.get("pnl", 0))
+                    if trade_pnl > 0:
+                        wins += 1
+                        gross_total_profit += trade_pnl
+                    elif trade_pnl < 0:
+                        losses += 1
+                        gross_total_loss += abs(trade_pnl)
+
+            total_closed = wins + losses
+            win_rate = (wins / total_closed * 100) if total_closed > 0 else 0.0
+            profit_factor = (gross_total_profit / gross_total_loss) if gross_total_loss > 0 else (99.9 if gross_total_profit > 0 else 0.0)
+            
             metrics = {
                 "finalBalance": round(balance, 2),
                 "roi": round(((balance - self.initial_balance) / self.initial_balance) * 100, 2),
                 "totalTrades": len(trades),
                 "netProfit": round(balance - self.initial_balance, 2),
+                "maxDrawdown": round(max_drawdown * 100, 2),
                 "max_drawdown": round(max_drawdown * 100, 2),
+                "winRate": round(win_rate, 1),
+                "wins": wins,
+                "losses": losses,
+                "profitFactor": round(profit_factor, 2),
                 "aiShieldAccuracy": round(ai_accuracy, 1),
                 "saved": veto_stats["saved"],
                 "missed": veto_stats["missed"]

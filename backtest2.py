@@ -386,6 +386,7 @@ class Backtester:
             losses = 0
             gross_total_profit = 0.0
             gross_total_loss = 0.0
+            trade_pnls = []
 
             for t in trades:
                 if t.get("type") == "exit":
@@ -400,7 +401,31 @@ class Backtester:
             total_closed = wins + losses
             win_rate = (wins / total_closed * 100) if total_closed > 0 else 0.0
             profit_factor = (gross_total_profit / gross_total_loss) if gross_total_loss > 0 else (99.9 if gross_total_profit > 0 else 0.0)
-            
+
+            # System Quality Number (SQN)
+            sqn = 0.0
+            if len(trade_pnls) > 0:
+                mean_pnl = np.mean(trade_pnls)
+                std_pnl = np.std(trade_pnls)
+                if std_pnl > 0:
+                    sqn = (mean_pnl / std_pnl) * np.sqrt(len(trade_pnls))
+
+            # 🚀 3. Calculate Sharpe Ratio
+            returns = []
+            for i in range(1, len(equity_curve)):
+                prev = equity_curve[i-1]["balance"]
+                curr = equity_curve[i]["balance"]
+                if prev > 0:
+                    returns.append((curr - prev) / prev)
+
+            sharpe = 0.0
+            if len(returns) > 0:
+                mean_return = np.mean(returns)
+                std_return = np.std(returns)
+                if std_return > 0:
+                    # Annualizing based on roughly hourly steps
+                    sharpe = (mean_return / std_return) * np.sqrt(365 * 24)
+                    
             metrics = {
                 "finalBalance": round(balance, 2),
                 "roi": round(((balance - self.initial_balance) / self.initial_balance) * 100, 2),
@@ -414,7 +439,10 @@ class Backtester:
                 "profitFactor": round(profit_factor, 2),
                 "aiShieldAccuracy": round(ai_accuracy, 1),
                 "saved": veto_stats["saved"],
-                "missed": veto_stats["missed"]
+                "missed": veto_stats["missed"],
+                "sharpeRatio": round(sharpe, 2),
+                "sharpe_ratio": round(sharpe, 2),
+                "sqn": round(sqn, 2)
             }
 
             return {

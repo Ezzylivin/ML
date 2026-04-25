@@ -933,7 +933,7 @@ async def start_bot(data: BotStartRequest):
         except Exception as e:
             logger.error(f"⚠️ Registry Cleanup Error: {e}")
            
-    initial_ohlcv = await fetch_live_candles_ccxt(data.config['symbol'], data.config.get('timeframe', '1h'), 150)
+    initial_ohlcv = await fetch_live_candles_ccxt(data.config['symbol'], data.config.get('timeframe', '1h'), 350)
     processed_candles = []
     if initial_ohlcv:
         df_init = pd.DataFrame(initial_ohlcv)

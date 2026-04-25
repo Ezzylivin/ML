@@ -757,6 +757,18 @@ async def live_neural_heartbeat(user_id: str):
                         safe_size = float(f"{size_in_crypto:.6f}") 
                         actual_entry_price = current_price
                         
+                        # ==========================================
+                # 🟢 ENTRY LOGIC (Bulletproof Live)
+                # ==========================================
+                if len(bot['positions']) < max_p and time_gate_passed:
+                    if (sig == 1 and climb_satisfied) or (sig == -1 and climb_satisfied):
+                        trade_type = "long" if sig == 1 else "short"
+                        size_in_fiat = bot['balance'] * (float(config.get('riskPercentage', 10.0)) / 100 / max_p)
+                        size_in_crypto = size_in_fiat / current_price
+                        
+                        safe_size = float(f"{size_in_crypto:.6f}") 
+                        actual_entry_price = current_price
+                        
                         if is_live_trading:
                             try:
                                 exchange_class = getattr(ccxt, target_exchange)
@@ -770,16 +782,29 @@ async def live_neural_heartbeat(user_id: str):
                                     order_params = {'leverage': leverage_val} if use_margin else {}
                                     
                                     await emit_log(user_id, f"🔗 ROUTING {side.upper()} TO {target_exchange.upper()}...")
-                                    order = await user_exchange.create_market_order(symbol, side, safe_size, params=order_params)
                                     
+                                    # 🚀 FIX 1: Load markets to get exact decimal rules
+                                    await user_exchange.load_markets()
+                                    
+                                    # 🚀 FIX 2: Format the size perfectly for the exchange
+                                    formatted_size = float(user_exchange.amount_to_precision(symbol, size_in_crypto))
+                                    
+                                    if formatted_size <= 0:
+                                        raise Exception("Order size too small for exchange limits")
+
+                                    order = await user_exchange.create_market_order(symbol, side, formatted_size, params=order_params)
+                                    
+                                    # 🚀 FIX 3: Safely extract the EXACT filled price & size
                                     actual_entry_price = order.get('average') or order.get('price') or current_price
-                                    # 🔧 FIX #2b: Use the fee_rate variable defined above
-                                    bot['balance'] -= (safe_size * actual_entry_price) * fee_rate
+                                    safe_size = order.get('filled') or formatted_size
                                     
                             except Exception as ex_err:
                                 await emit_log(user_id, f"❌ {target_exchange.upper()} ORDER FAILED: {str(ex_err)}")
                                 await asyncio.sleep(5)
                                 continue 
+                        else:
+                            # 🚀 PAPER TRADING ONLY: Manually deduct fees
+                            bot['balance'] -= (safe_size * actual_entry_price) * fee_rate
                         
                         bot['positions'].append({
                             "symbol": symbol, "type": trade_type, "entry": actual_entry_price, "size": safe_size,
@@ -792,7 +817,9 @@ async def live_neural_heartbeat(user_id: str):
                         await emit_log(user_id, f"🚀 ENTERED {trade_type.upper()} LEG {len(bot['positions'])} @ ${actual_entry_price:,.2f}")
                         DatabaseHandler.save_state(user_id, bot)
 
-                # 🟢 8. EXIT MONITORING
+                # ==========================================
+                # 🟢 EXIT MONITORING (Bulletproof Live)
+                # ==========================================
                 tsl_pct = float(params.get('trailing_stop', 0.01))
                 for pos in bot['positions'][:]:
                     closed = False
@@ -819,18 +846,39 @@ async def live_neural_heartbeat(user_id: str):
                                     order_params = {'leverage': leverage_val} if use_margin else {}
                                     
                                     await emit_log(user_id, f"🔗 ROUTING {close_side.upper()} EXIT TO {target_exchange.upper()}...")
-                                    order = await user_exchange.create_market_order(symbol, close_side, pos['size'], params=order_params)
+                                    
+                                    # Load markets for exact decimal rules on exit
+                                    await user_exchange.load_markets()
+                                    formatted_size = float(user_exchange.amount_to_precision(symbol, pos['size']))
+
+                                    order = await user_exchange.create_market_order(symbol, close_side, formatted_size, params=order_params)
+                                    
+                                    # Extract exact fill price
                                     actual_close_price = order.get('average') or order.get('price') or current_price
+                                    
+                                    # 🚀 FIX 4: Fetch ACTUAL account balance after trade completes
+                                    balance_data = await user_exchange.fetch_balance()
+                                    # Try to grab USD or USDC balance
+                                    real_fiat_balance = balance_data.get('USD', {}).get('free') or balance_data.get('USDC', {}).get('free')
+                                    if real_fiat_balance:
+                                        bot['balance'] = float(real_fiat_balance)
+                                        await emit_log(user_id, f"🔄 Synced Real Balance: ${bot['balance']:,.2f}")
                                     
                             except Exception as ex_err:
                                 await emit_log(user_id, f"❌ {target_exchange.upper()} EXIT FAILED: {str(ex_err)}")
                                 continue 
                         
                         gross_pnl = (actual_close_price - pos['entry']) * pos['size'] if pos['type'] == 'long' else (pos['entry'] - actual_close_price) * pos['size']
-                        # 🔧 FIX #2b: Use the fee_rate variable
-                        net_pnl = gross_pnl - ((pos['size'] * actual_close_price) * fee_rate)
+                        
+                        if not is_live_trading:
+                            # 🚀 PAPER TRADING ONLY: Manually calculate fees and adjust balance
+                            net_pnl = gross_pnl - ((pos['size'] * actual_close_price) * fee_rate)
+                            bot['balance'] += net_pnl
+                        else:
+                            # In Live mode, we already synced the true balance above. 
+                            # We just calculate net_pnl for the UI ledger.
+                            net_pnl = gross_pnl - ((pos['size'] * actual_close_price) * fee_rate)
 
-                        bot['balance'] += net_pnl
                         bot['positions'].remove(pos)
                         bot['trade_history'].append({"type": "exit", "side": pos['type'], "price": actual_close_price, "pnl": round(net_pnl, 2), "time": datetime.now(timezone.utc).isoformat()})
                         await emit_log(user_id, f"💰 CLOSED {pos['type'].upper()} @ ${actual_close_price:,.2f} | Net PnL: ${round(net_pnl, 2)}")

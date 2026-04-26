@@ -644,7 +644,8 @@ async def live_neural_heartbeat(user_id: str):
             fee_rate = KRAKEN_TAKER_FEE if use_margin else DEFAULT_TAKER_FEE
 
             try:
-                ohlcv_raw = await fetch_live_candles_ccxt(config['symbol'], config.get('timeframe', '1h'), 350, exchange_id=target_exchange)
+                # 🚀 FIX 1: Bump limit to 500 to guarantee plenty of warm-up data for 200 EMAs
+                ohlcv_raw = await fetch_live_candles_ccxt(config['symbol'], config.get('timeframe', '1h'), 500, exchange_id=target_exchange)
                 
                 if not ohlcv_raw:
                     await emit_log(user_id, f"⚠️ {target_exchange.upper()} Feed Unstable - Retrying...")
@@ -663,8 +664,9 @@ async def live_neural_heartbeat(user_id: str):
                 
                 df_ai, _ = await asyncio.to_thread(apply_mega_features, df_closed_history)
 
+                # 🚀 FIX 2: Pass 'df_raw' (the full 500 candles) instead of the chopped 'df_ai'
                 sig, thoughts, nums, score, signals_map = StrategyBrain.calculate_signals(
-                    df_ai, config, 0.5, 0.5, symbol=ticker_symbol
+                    df_raw, config, 0.5, 0.5, symbol=ticker_symbol
                 )
 
                 sentiment = "STRONG BUY" if score > 0.85 else "BUY" if score > 0.70 else "NEUTRAL"
@@ -683,8 +685,11 @@ async def live_neural_heartbeat(user_id: str):
                     buffer_bar = DiagnosticLayer.render_progress(stop_pct, 2.0, reverse=True)
                     active_summary = f"⚡ ACTIVE: {len(bot['positions'])} POS (${upnl:,.2f}) | TSL {buffer_bar} {stop_pct}% | "
 
-                ui_limit = float(config.get('mlThresholdLong', 0.80)) if current_price > ta.ema(df_ai['close'], 200).iloc[-1] else float(config.get('mlThresholdShort', 0.90))
-                waiting_msg = DiagnosticLayer.get_pending_conditions(df_ai, config, score, ui_limit)
+                # 🚀 FIX 3: Use 'df_raw' here to prevent the NoneType error on the 200 EMA check
+                ui_limit = float(config.get('mlThresholdLong', 0.80)) if current_price > ta.ema(df_raw['close'], 200).iloc[-1] else float(config.get('mlThresholdShort', 0.90))
+                
+                # 🚀 FIX 4: Use 'df_raw' for the pending conditions scanner too
+                waiting_msg = DiagnosticLayer.get_pending_conditions(df_raw, config, score, ui_limit)
 
                 # ==========================================
                 # 🛡️ NEURAL VETO TRACKER

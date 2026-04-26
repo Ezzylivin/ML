@@ -456,145 +456,142 @@ async def process_data_packet(df: pd.DataFrame, strategies: list) -> list:
 # 🧠 2. SHARED STRATEGY BRAIN
 # ==========================================
 class StrategyBrain:
-   @staticmethod
-   def calculate_signals(df: pd.DataFrame, config: Dict[str, Any], l_thresh: float, s_thresh: float, symbol="BTC-USD"):
-       active_thoughts, votes = [], 0
-       signals_map = {} 
-       strategies = config.get('strategies', [])
-       current_price = df['close'].iloc[-1]
+    @staticmethod
+    def calculate_signals(df_raw: pd.DataFrame, df_ai: pd.DataFrame, config: Dict[str, Any], l_thresh: float, s_thresh: float, symbol="BTC-USD"):
+        active_thoughts, votes = [], 0
+        signals_map = {} 
+        strategies = config.get('strategies', [])
+        current_price = df_raw['close'].iloc[-1]
 
-       # 🟢 1. GLOBAL INDICATORS
-       ema20 = ta.ema(df['close'], length=20).iloc[-1]
-       ema50 = ta.ema(df['close'], length=50).iloc[-1]
-       ema200 = ta.ema(df['close'], length=200).iloc[-1]
-       bb = ta.bbands(df['close'], length=20, std=2.0)
-       lower, mid, upper = bb.iloc[-1, 0], bb.iloc[-1, 1], bb.iloc[-1, 2]
-       pr = int((current_price - lower) / (upper - lower) * 100)
+        # 🟢 1. GLOBAL INDICATORS (Using df_raw)
+        ema20 = ta.ema(df_raw['close'], length=20).iloc[-1]
+        ema50 = ta.ema(df_raw['close'], length=50).iloc[-1]
+        ema200 = ta.ema(df_raw['close'], length=200).iloc[-1]
+        bb = ta.bbands(df_raw['close'], length=20, std=2.0)
+        lower, mid, upper = bb.iloc[-1, 0], bb.iloc[-1, 1], bb.iloc[-1, 2]
+        pr = int((current_price - lower) / (upper - lower) * 100)
 
-       # 🟢 2. FULL 10-STRATEGY DYNAMIC EVALUATION
-       for strat in strategies:
-           code = strat.get('code')
-           p = strat.get('params', {})
-           try:
-               if code == "rsi_threshold":
-                   rsi = ta.rsi(df['close'], length=int(p.get('rsi_length', 14))).iloc[-1]
-                   dist = min(abs(rsi - 30), abs(rsi - 70))
-                   signals_map[code] = max(0.1, min(1.0, 1.0 - (dist / 40)))
-                   if rsi < p.get('oversold', 30): votes += 1; active_thoughts.append("RSI Low")
-                   elif rsi > p.get('overbought', 70): votes -= 1; active_thoughts.append("RSI High")
+        # 🟢 2. FULL 10-STRATEGY DYNAMIC EVALUATION (Using df_raw)
+        for strat in strategies:
+            code = strat.get('code')
+            p = strat.get('params', {})
+            try:
+                if code == "rsi_threshold":
+                    rsi = ta.rsi(df_raw['close'], length=int(p.get('rsi_length', 14))).iloc[-1]
+                    dist = min(abs(rsi - 30), abs(rsi - 70))
+                    signals_map[code] = max(0.1, min(1.0, 1.0 - (dist / 40)))
+                    if rsi < p.get('oversold', 30): votes += 1; active_thoughts.append("RSI Low")
+                    elif rsi > p.get('overbought', 70): votes -= 1; active_thoughts.append("RSI High")
 
-               elif code == "sma_crossover":
-                   f = ta.sma(df['close'], length=int(p.get('fast_sma', 50))).iloc[-1]
-                   s = ta.sma(df['close'], length=int(p.get('slow_sma', 200))).iloc[-1]
-                   gap = abs(f - s) / s
-                   signals_map[code] = 1.0 if f > s else max(0.1, min(0.95, 1.0 - (gap * 50)))
-                   if f > s: votes += 1
+                elif code == "sma_crossover":
+                    f = ta.sma(df_raw['close'], length=int(p.get('fast_sma', 50))).iloc[-1]
+                    s = ta.sma(df_raw['close'], length=int(p.get('slow_sma', 200))).iloc[-1]
+                    gap = abs(f - s) / s
+                    signals_map[code] = 1.0 if f > s else max(0.1, min(0.95, 1.0 - (gap * 50)))
+                    if f > s: votes += 1
 
-               elif code == "macd_crossover":
-                   macd = ta.macd(df['close'], fast=int(p.get('fast', 12))).iloc[-1]
-                   hist = macd[1]
-                   norm_hist = abs(hist) / (current_price * 0.0005)
-                   signals_map[code] = max(0.1, min(1.0, norm_hist))
-                   votes += (1 if macd[0] > macd[2] else -1)
+                elif code == "macd_crossover":
+                    macd = ta.macd(df_raw['close'], fast=int(p.get('fast', 12))).iloc[-1]
+                    hist = macd[1]
+                    norm_hist = abs(hist) / (current_price * 0.0005)
+                    signals_map[code] = max(0.1, min(1.0, norm_hist))
+                    votes += (1 if macd[0] > macd[2] else -1)
 
-               elif code == "supertrend":
-                   st_data = ta.supertrend(df['high'], df['low'], df['close']).iloc[-1]
-                   st_line = st_data[0]
-                   dist = abs(current_price - st_line) / current_price
-                   signals_map[code] = 1.0 if st_data[1] == 1 else max(0.1, min(0.95, 1.0 - (dist * 20)))
-                   votes += (1 if st_data[1] == 1 else -1)
+                elif code == "supertrend":
+                    st_data = ta.supertrend(df_raw['high'], df_raw['low'], df_raw['close']).iloc[-1]
+                    st_line = st_data[0]
+                    dist = abs(current_price - st_line) / current_price
+                    signals_map[code] = 1.0 if st_data[1] == 1 else max(0.1, min(0.95, 1.0 - (dist * 20)))
+                    votes += (1 if st_data[1] == 1 else -1)
 
-               elif code == "bb_fade":
-                   signals_map[code] = max(0.1, min(1.0, pr / 100.0))
-                   if current_price < lower: votes += 1
-                   elif current_price > upper: votes -= 1
+                elif code == "bb_fade":
+                    signals_map[code] = max(0.1, min(1.0, pr / 100.0))
+                    if current_price < lower: votes += 1
+                    elif current_price > upper: votes -= 1
 
-               elif code == "atr_breakout":
-                   atr = ta.atr(df['high'], df['low'], df['close']).iloc[-1]
-                   target = ema20 + (atr * float(p.get('multiplier', 1.5)))
-                   signals_map[code] = max(0.1, min(1.0, current_price / target))
-                   if current_price > target: votes += 1
+                elif code == "atr_breakout":
+                    atr = ta.atr(df_raw['high'], df_raw['low'], df_raw['close']).iloc[-1]
+                    target = ema20 + (atr * float(p.get('multiplier', 1.5)))
+                    signals_map[code] = max(0.1, min(1.0, current_price / target))
+                    if current_price > target: votes += 1
 
-               elif code == "pa_breakout":
-                   lb = int(p.get('lookback', 20))
-                   high_lb = df['high'].tail(lb).max()
-                   signals_map[code] = max(0.1, min(1.0, current_price / high_lb))
-                   if current_price >= high_lb: votes += 1
+                elif code == "pa_breakout":
+                    lb = int(p.get('lookback', 20))
+                    high_lb = df_raw['high'].tail(lb).max()
+                    signals_map[code] = max(0.1, min(1.0, current_price / high_lb))
+                    if current_price >= high_lb: votes += 1
 
-               elif code == "vol_profile":
-                   v_ma = ta.sma(df['volume'], length=int(p.get('vol_ma', 20))).iloc[-1]
-                   ratio = df['volume'].iloc[-1] / (v_ma * float(p.get('threshold', 1.5)))
-                   signals_map[code] = max(0.1, min(1.0, ratio))
-                   if ratio >= 1.0: votes += (1 if current_price > mid else -1)
+                elif code == "vol_profile":
+                    v_ma = ta.sma(df_raw['volume'], length=int(p.get('vol_ma', 20))).iloc[-1]
+                    ratio = df_raw['volume'].iloc[-1] / (v_ma * float(p.get('threshold', 1.5)))
+                    signals_map[code] = max(0.1, min(1.0, ratio))
+                    if ratio >= 1.0: votes += (1 if current_price > mid else -1)
 
-               # ============================================================
-               # 🔧 FIX #3: STOCHASTIC BUG
-               # ============================================================
-               # OLD: votes -= -1  (double negative = votes += 1, wrong!)
-               # NEW: votes -= 1   (correctly subtracts for overbought)
-               elif code == "stoch":
-                   stoch_df = ta.stoch(df['high'], df['low'], df['close']).iloc[-1]
-                   k = stoch_df[0]
-                   dist = min(abs(k - 20), abs(k - 80))
-                   signals_map[code] = max(0.1, min(1.0, 1.0 - (dist / 40)))
-                   if k < 20: votes += 1
-                   elif k > 80: votes -= 1  # 🔧 FIX: Was `votes -= -1`
+                elif code == "stoch":
+                    stoch_df = ta.stoch(df_raw['high'], df_raw['low'], df_raw['close']).iloc[-1]
+                    k = stoch_df[0]
+                    dist = min(abs(k - 20), abs(k - 80))
+                    signals_map[code] = max(0.1, min(1.0, 1.0 - (dist / 40)))
+                    if k < 20: votes += 1
+                    elif k > 80: votes -= 1
 
-               elif code == "ema_cloud":
-                   f_ema = ta.ema(df['close'], length=int(p.get('fast_ema', 9))).iloc[-1]
-                   s_ema = ta.ema(df['close'], length=int(p.get('slow_ema', 21))).iloc[-1]
-                   gap = abs(f_ema - s_ema) / s_ema
-                   signals_map[code] = 1.0 if f_ema > s_ema else max(0.1, min(0.95, 1.0 - (gap * 100)))
-                   if f_ema > s_ema: votes += 1
-               else:
-                   signals_map[code] = 0.5
-           except Exception: signals_map[code] = 0.0
+                elif code == "ema_cloud":
+                    f_ema = ta.ema(df_raw['close'], length=int(p.get('fast_ema', 9))).iloc[-1]
+                    s_ema = ta.ema(df_raw['close'], length=int(p.get('slow_ema', 21))).iloc[-1]
+                    gap = abs(f_ema - s_ema) / s_ema
+                    signals_map[code] = 1.0 if f_ema > s_ema else max(0.1, min(0.95, 1.0 - (gap * 100)))
+                    if f_ema > s_ema: votes += 1
+                else:
+                    signals_map[code] = 0.5
+            except Exception: signals_map[code] = 0.0
         
-       # 🚀 3. DYNAMIC DUAL-GATE LOGIC
-       is_short = current_price < ema200
-       ui_limit = float(config.get('mlThresholdShort', 0.90)) if is_short else float(config.get('mlThresholdLong', 0.80))
-       conf = NeuralPredictor.get_prediction(config.get('mlModel', 'stacking'), df, symbol=symbol)
-       gate_passed = conf >= ui_limit
+        # 🚀 3. DYNAMIC DUAL-GATE LOGIC (Using df_ai for AI)
+        is_short = current_price < ema200
+        ui_limit = float(config.get('mlThresholdShort', 0.90)) if is_short else float(config.get('mlThresholdLong', 0.80))
+        
+        # Pass the pre-engineered 'df_ai' strictly to the Neural Predictor
+        conf = NeuralPredictor.get_prediction(config.get('mlModel', 'stacking'), df_ai, symbol=symbol)
+        gate_passed = conf >= ui_limit
 
-       logic_desc = f"📊 LOGIC: {'SHORT' if is_short else 'LONG'} GATE {'PASSED' if gate_passed else 'VETOED'} ({int(conf*100)}% vs {int(ui_limit*100)}% UI Limit) {'🟢' if gate_passed else '🔴'}"
-       signal_names = " + ".join(active_thoughts) if active_thoughts else "Scanning Setup"
-       gap = int(abs(current_price - ema50))
-       intent_desc = f"🎯 INTENT: STALKING {'SHORT' if is_short else 'LONG'} ({signal_names} | Gap: ${gap}) {'🔴' if is_short else '🟢'}"
+        logic_desc = f"📊 LOGIC: {'SHORT' if is_short else 'LONG'} GATE {'PASSED' if gate_passed else 'VETOED'} ({int(conf*100)}% vs {int(ui_limit*100)}% UI Limit) {'🟢' if gate_passed else '🔴'}"
+        signal_names = " + ".join(active_thoughts) if active_thoughts else "Scanning Setup"
+        gap = int(abs(current_price - ema50))
+        intent_desc = f"🎯 INTENT: STALKING {'SHORT' if is_short else 'LONG'} ({signal_names} | Gap: ${gap}) {'🔴' if is_short else '🟢'}"
 
-       trend_dist = current_price - ema200
-       trend_text = f"📡 TREND: {'UP' if trend_dist > 0 else 'DOWN'} (Price is ${int(abs(trend_dist))} {'above' if trend_dist > 0 else 'below'} 200EMA)"
-       spread = ema20 - ema50
-       bias_str = "BULLISH EXPANSION" if spread > 0 else "BEARISH CONTRACTION"
-       bias_text = f"⚖️ BIAS: {bias_str} (Fast EMA is ${int(abs(spread))} {'above' if spread > 0 else 'below'} Slow EMA)"
-       mindset_str = "⚠️ OVEREXTENDED" if pr >= 80 else "🎯 ACCUMULATION" if pr <= 20 else "⚖️ EQUILIBRIUM"
-       mindset_text = f"🤖 MINDSET: {mindset_str} - Price is at {pr}% of Bollinger Range"
+        trend_dist = current_price - ema200
+        trend_text = f"📡 TREND: {'UP' if trend_dist > 0 else 'DOWN'} (Price is ${int(abs(trend_dist))} {'above' if trend_dist > 0 else 'below'} 200EMA)"
+        spread = ema20 - ema50
+        bias_str = "BULLISH EXPANSION" if spread > 0 else "BEARISH CONTRACTION"
+        bias_text = f"⚖️ BIAS: {bias_str} (Fast EMA is ${int(abs(spread))} {'above' if spread > 0 else 'below'} Slow EMA)"
+        mindset_str = "⚠️ OVEREXTENDED" if pr >= 80 else "🎯 ACCUMULATION" if pr <= 20 else "⚖️ EQUILIBRIUM"
+        mindset_text = f"🤖 MINDSET: {mindset_str} - Price is at {pr}% of Bollinger Range"
 
-       numeric_details = {
-           "market": {
-               "logic": logic_desc, 
-               "intent": intent_desc,
-               "trend": trend_text,
-               "bias": bias_text,
-               "mindset": mindset_text
-           }
-       }
+        numeric_details = {
+            "market": {
+                "logic": logic_desc, 
+                "intent": intent_desc,
+                "trend": trend_text,
+                "bias": bias_text,
+                "mindset": mindset_text
+            }
+        }
 
-       # 🎯 6. FINAL SIGNAL CALCULATION
-       rule = config.get('comboConfig', {}).get('combinationRule', 'OR')
-       final_sig = 0
-       
-       if gate_passed:
-           if rule == "AND":
-               if votes >= len(strategies): final_sig = 1
-           else:
-               if votes > 0: final_sig = 1
-           
-           if rule == "AND":
-               if votes <= -len(strategies): final_sig = -1
-           elif votes < 0:
-               final_sig = -1
+        # 🎯 6. FINAL SIGNAL CALCULATION
+        rule = config.get('comboConfig', {}).get('combinationRule', 'OR')
+        final_sig = 0
+        
+        if gate_passed:
+            if rule == "AND":
+                if votes >= len(strategies): final_sig = 1
+            else:
+                if votes > 0: final_sig = 1
+            
+            if rule == "AND":
+                if votes <= -len(strategies): final_sig = -1
+            elif votes < 0:
+                final_sig = -1
 
-       return final_sig, active_thoughts, numeric_details, conf, signals_map
+        return final_sig, active_thoughts, numeric_details, conf, signals_map
 
 
 # ==========================================
@@ -666,7 +663,7 @@ async def live_neural_heartbeat(user_id: str):
 
                 # 🚀 FIX 2: Pass 'df_raw' (the full 500 candles) instead of the chopped 'df_ai'
                 sig, thoughts, nums, score, signals_map = StrategyBrain.calculate_signals(
-                    df_raw, config, 0.5, 0.5, symbol=ticker_symbol
+                    df_raw, df_ai, config, 0.5, 0.5, symbol=ticker_symbol
                 )
 
                 sentiment = "STRONG BUY" if score > 0.85 else "BUY" if score > 0.70 else "NEUTRAL"

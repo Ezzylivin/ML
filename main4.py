@@ -354,7 +354,7 @@ class DiagnosticLayer:
             ema200_val = ta.ema(df['close'], length=200).iloc[-1]
             is_uptrend = current_price > ema200_val
             if conf < ui_limit:
-                return f"🛑 AI VETO: Confidence {DiagnosticLayer.render_progress(conf, ui_limit, True)}"
+                return f"🛑 AI VETO: Needs {int(ui_limit*100)}% (At {int(conf*100)}%)"
             
             pending = []
             for strat in strategies:
@@ -654,7 +654,7 @@ async def live_neural_heartbeat(user_id: str):
                     current_price = float(ticker['last'])
                 
                 ohlcv_raw[-1]['close'] = current_price
-                ohlcv_raw[-1]['time'] = int(datetime.now(timezone.utc).timestamp())
+                #ohlcv_raw[-1]['time'] = int(datetime.now(timezone.utc).timestamp())
                 
                 df_raw = pd.DataFrame(ohlcv_raw)
                 df_closed_history = df_raw.iloc[:-1].copy()
@@ -721,7 +721,7 @@ async def live_neural_heartbeat(user_id: str):
                 else:
                     hunting_summary = "✅ PYRAMID FULL: Managing Exits"
 
-                targets_str = " | ".join([f"{s['code'].upper()}: {DiagnosticLayer.render_progress(int(signals_map.get(s['code'], 0) * 100), 100)}" for s in strategies])
+                targets_str = " | ".join([f"{s['code'].upper()}: {DiagnosticLayer.render_progress(int(signals_map.get(s['code'], 0) * 100), 100, reverse=True)}" for s in strategies])
                 combined_status = f"{active_summary}{hunting_summary} | 🔍 {targets_str}"
 
                 now_ts = datetime.now().timestamp()
@@ -749,23 +749,41 @@ async def live_neural_heartbeat(user_id: str):
                 last_pos = bot['positions'][-1] if bot['positions'] else None
                 climb_satisfied = (score >= last_pos.get('entry_conf', 0) + 0.10) if last_pos else True
 
-                # ENTRY
-                if len(bot['positions']) < max_p and time_gate_passed:
-                    if (sig == 1 and climb_satisfied) or (sig == -1 and climb_satisfied):
-                        trade_type = "long" if sig == 1 else "short"
-                        size_in_fiat = bot['balance'] * (float(config.get('riskPercentage', 10.0)) / 100 / max_p)
-                        size_in_crypto = size_in_fiat / current_price
-                        
-                        safe_size = float(f"{size_in_crypto:.6f}") 
-                        actual_entry_price = current_price
-                        
-                        # ==========================================
-                # 🟢 ENTRY LOGIC (Bulletproof Live)
+                # 🚀 Calculate Dynamic ATR for Stops/Targets
+                current_atr = ta.atr(df_raw['high'], df_raw['low'], df_raw['close'], length=14).iloc[-1]
+                atr_tp_mult = float(params.get('atr_tp_mult', 3.0)) 
+                atr_sl_mult = float(params.get('atr_sl_mult', 1.5))
+
                 # ==========================================
-                if len(bot['positions']) < max_p and time_gate_passed:
+                # 🟢 MACRO RISK FILTERS (The Seatbelts)
+                # ==========================================
+                # Volatility Regime Filter
+                volatility_pct = current_atr / current_price
+                is_volatility_safe = volatility_pct <= 0.03  
+
+                # Drawdown Circuit Breaker
+                start_capital = float(config.get('capitalAllocation', config.get('initialBalance', 200.0)))
+                max_dd_pct = float(config.get('maxDailyLoss', 0.05)) # Default 5% kill-switch
+                is_circuit_breaker_tripped = bot['balance'] <= (start_capital * (1.0 - max_dd_pct))
+
+                if is_circuit_breaker_tripped and len(bot['positions']) == 0:
+                    hunting_summary = "🛑 CIRCUIT BREAKER TRIPPED: Max Drawdown Reached. Trading Halted."
+
+                # 🚀 UPGRADE 3: Trend Alignment Filter (Hard Gate)
+                current_ema200 = ta.ema(df_raw['close'], length=200).iloc[-1]
+                is_trend_aligned = (sig == 1 and current_price > current_ema200) or (sig == -1 and current_price < current_ema200)
+
+                # ==========================================
+                # 🟢 ENTRY LOGIC (Bulletproof Live + ATR + Filters)
+                # ==========================================
+                if len(bot['positions']) < max_p and time_gate_passed and is_volatility_safe and not is_circuit_breaker_tripped and is_trend_aligned:
                     if (sig == 1 and climb_satisfied) or (sig == -1 and climb_satisfied):
                         trade_type = "long" if sig == 1 else "short"
-                        size_in_fiat = bot['balance'] * (float(config.get('riskPercentage', 10.0)) / 100 / max_p)
+                        
+                        # 🚀 FIX: Catch any naming convention the React frontend might be using
+                        raw_risk = config.get('riskPercentage') or config.get('risk_percentage') or config.get('riskTrade') or 10.0
+                        
+                        size_in_fiat = bot['balance'] * (float(raw_risk) / 100 / max_p)
                         size_in_crypto = size_in_fiat / current_price
                         
                         safe_size = float(f"{size_in_crypto:.6f}") 
@@ -785,18 +803,15 @@ async def live_neural_heartbeat(user_id: str):
                                     
                                     await emit_log(user_id, f"🔗 ROUTING {side.upper()} TO {target_exchange.upper()}...")
                                     
-                                    # 🚀 FIX 1: Load markets to get exact decimal rules
                                     await user_exchange.load_markets()
-                                    
-                                    # 🚀 FIX 2: Format the size perfectly for the exchange
                                     formatted_size = float(user_exchange.amount_to_precision(symbol, size_in_crypto))
                                     
                                     if formatted_size <= 0:
                                         raise Exception("Order size too small for exchange limits")
 
-                                    order = await user_exchange.create_market_order(symbol, side, formatted_size, params=order_params)
+                                    # 🚀 MAKER ORDER UPGRADE: Use Limit orders
+                                    order = await user_exchange.create_limit_order(symbol, side, formatted_size, current_price, params=order_params)
                                     
-                                    # 🚀 FIX 3: Safely extract the EXACT filled price & size
                                     actual_entry_price = order.get('average') or order.get('price') or current_price
                                     safe_size = order.get('filled') or formatted_size
                                     
@@ -805,32 +820,43 @@ async def live_neural_heartbeat(user_id: str):
                                 await asyncio.sleep(5)
                                 continue 
                         else:
-                            # 🚀 PAPER TRADING ONLY: Manually deduct fees
                             bot['balance'] -= (safe_size * actual_entry_price) * fee_rate
                         
+                        target_price = actual_entry_price + (current_atr * atr_tp_mult) if sig == 1 else actual_entry_price - (current_atr * atr_tp_mult)
+                        stop_price = actual_entry_price - (current_atr * atr_sl_mult) if sig == 1 else actual_entry_price + (current_atr * atr_sl_mult)
+
                         bot['positions'].append({
                             "symbol": symbol, "type": trade_type, "entry": actual_entry_price, "size": safe_size,
                             "time": current_time.isoformat(), "entry_conf": score,
-                            "tp": actual_entry_price * (1 + float(params.get('take_profit', 0.1))) if sig == 1 else actual_entry_price * (1 - float(params.get('take_profit', 0.1))),
-                            "sl": actual_entry_price * (1 - float(params.get('stop_loss', 0.05))) if sig == 1 else actual_entry_price * (1 + float(params.get('stop_loss', 0.05))),
-                            "tsl": actual_entry_price * (1 - float(params.get('stop_loss', 0.05))) if sig == 1 else actual_entry_price * (1 + float(params.get('stop_loss', 0.05)))
+                            "tp": target_price,
+                            "sl": stop_price,
+                            "tsl": stop_price, 
+                            "atr_at_entry": current_atr 
                         })
                         bot['last_trade_time'] = current_time.isoformat()
-                        await emit_log(user_id, f"🚀 ENTERED {trade_type.upper()} LEG {len(bot['positions'])} @ ${actual_entry_price:,.2f}")
+                        await emit_log(user_id, f"🚀 ENTERED {trade_type.upper()} @ ${actual_entry_price:,.2f} | TP: ${target_price:.2f} | SL: ${stop_price:.2f}")
                         DatabaseHandler.save_state(user_id, bot)
 
                 # ==========================================
-                # 🟢 EXIT MONITORING (Bulletproof Live)
+                # 🟢 EXIT MONITORING (Bulletproof Live + ATR Ratchet)
                 # ==========================================
-                tsl_pct = float(params.get('trailing_stop', 0.01))
                 for pos in bot['positions'][:]:
                     closed = False
+                    
+                    # 🚀 UPGRADE 5: ATR Ratchet Trailing Stop
+                    # We trail by the dynamic market ATR distance, not a static percentage.
+                    trail_dist = current_atr * atr_sl_mult
+                    
                     if pos['type'] == 'long':
-                        if current_price * (1 - tsl_pct) > pos['tsl']: pos['tsl'] = current_price * (1 - tsl_pct)
-                        if current_price >= pos['tp'] or current_price <= pos['tsl']: closed = True
+                        if current_price - trail_dist > pos['tsl']: 
+                            pos['tsl'] = current_price - trail_dist
+                        if current_price >= pos['tp'] or current_price <= pos['tsl']: 
+                            closed = True
                     else:
-                        if current_price * (1 + tsl_pct) < pos['tsl']: pos['tsl'] = current_price * (1 + tsl_pct)
-                        if current_price <= pos['tp'] or current_price >= pos['tsl']: closed = True
+                        if current_price + trail_dist < pos['tsl']: 
+                            pos['tsl'] = current_price + trail_dist
+                        if current_price <= pos['tp'] or current_price >= pos['tsl']: 
+                            closed = True
                     
                     if closed:
                         actual_close_price = current_price
@@ -849,18 +875,14 @@ async def live_neural_heartbeat(user_id: str):
                                     
                                     await emit_log(user_id, f"🔗 ROUTING {close_side.upper()} EXIT TO {target_exchange.upper()}...")
                                     
-                                    # Load markets for exact decimal rules on exit
                                     await user_exchange.load_markets()
                                     formatted_size = float(user_exchange.amount_to_precision(symbol, pos['size']))
 
                                     order = await user_exchange.create_market_order(symbol, close_side, formatted_size, params=order_params)
                                     
-                                    # Extract exact fill price
                                     actual_close_price = order.get('average') or order.get('price') or current_price
                                     
-                                    # 🚀 FIX 4: Fetch ACTUAL account balance after trade completes
                                     balance_data = await user_exchange.fetch_balance()
-                                    # Try to grab USD or USDC balance
                                     real_fiat_balance = balance_data.get('USD', {}).get('free') or balance_data.get('USDC', {}).get('free')
                                     if real_fiat_balance:
                                         bot['balance'] = float(real_fiat_balance)
@@ -873,12 +895,9 @@ async def live_neural_heartbeat(user_id: str):
                         gross_pnl = (actual_close_price - pos['entry']) * pos['size'] if pos['type'] == 'long' else (pos['entry'] - actual_close_price) * pos['size']
                         
                         if not is_live_trading:
-                            # 🚀 PAPER TRADING ONLY: Manually calculate fees and adjust balance
                             net_pnl = gross_pnl - ((pos['size'] * actual_close_price) * fee_rate)
                             bot['balance'] += net_pnl
                         else:
-                            # In Live mode, we already synced the true balance above. 
-                            # We just calculate net_pnl for the UI ledger.
                             net_pnl = gross_pnl - ((pos['size'] * actual_close_price) * fee_rate)
 
                         bot['positions'].remove(pos)

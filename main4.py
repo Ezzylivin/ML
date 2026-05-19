@@ -198,7 +198,7 @@ class ComboRequest(BaseModel):
     initialBalance: float
     strategies: List[StrategyConfig]
     combinationRule: str = "OR"
-    risk_percentage: float = 1.0
+    riskPercentage: float = 1.0
     take_profit: Optional[float] = 0.06
     stop_loss: Optional[float] = 0.03
     trailing_stop: Optional[float] = 0.02
@@ -551,7 +551,13 @@ class StrategyBrain:
         
         # Pass the pre-engineered 'df_ai' strictly to the Neural Predictor
         conf = NeuralPredictor.get_prediction(config.get('mlModel', 'stacking'), df_ai, symbol=symbol)
-        gate_passed = conf >= ui_limit
+        
+        if config.get('mlMode') == 'off':
+            gate_passed = True
+            logic_desc = f"📊 LOGIC: NEURAL GATE BYPASSED (AI: {int(conf*100)}%) 🟢"
+        else:
+            gate_passed = conf >= ui_limit
+            logic_desc = f"📊 LOGIC: {'SHORT' if is_short else 'LONG'} GATE {'PASSED' if gate_passed else 'VETOED'} ({int(conf*100)}% vs {int(ui_limit*100)}% UI Limit) {'🟢' if gate_passed else '🔴'}"
 
         logic_desc = f"📊 LOGIC: {'SHORT' if is_short else 'LONG'} GATE {'PASSED' if gate_passed else 'VETOED'} ({int(conf*100)}% vs {int(ui_limit*100)}% UI Limit) {'🟢' if gate_passed else '🔴'}"
         signal_names = " + ".join(active_thoughts) if active_thoughts else "Scanning Setup"
@@ -763,7 +769,9 @@ async def live_neural_heartbeat(user_id: str):
 
                 # Drawdown Circuit Breaker
                 start_capital = float(config.get('capitalAllocation', config.get('initialBalance', 200.0)))
-                max_dd_pct = float(config.get('maxDailyLoss', 0.05)) # Default 5% kill-switch
+                raw_dd = float(config.get('maxDailyLoss', 5.0))
+                max_dd_pct = raw_dd / 100.0 if raw_dd > 1.0 else raw_dd
+                
                 is_circuit_breaker_tripped = bot['balance'] <= (start_capital * (1.0 - max_dd_pct))
 
                 if is_circuit_breaker_tripped and len(bot['positions']) == 0:

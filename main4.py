@@ -31,12 +31,6 @@ from app.services.socket_emitter import emit_log, emit_status
 # ============================================================
 # 🔧 FIX #1: Import from config2 instead of redefining
 # ============================================================
-# OLD (BROKEN):
-#   from app.config2 import MODEL_DIR
-#   MODEL_DIR = "models"          # ← This SHADOWED the import!
-#   RESULTS_DIR = "results"       # ← Different from config2's RESULTS_DIR
-#
-# NEW: Use config2 as single source of truth
 from app.config2 import (
     MODEL_DIR,
     MODEL_STORAGE_DIR,
@@ -47,11 +41,7 @@ from app.config2 import (
 )
 from app.predictors.stacking_predictor import StackingPredictor
 
-# 🔧 FIX: Removed these two lines that were shadowing config2 imports:
-# MODEL_DIR = "models"      ← DELETED
-# RESULTS_DIR = "results"   ← DELETED
-
-# Ensure directories exist (config2 handles MODEL_DIR, but keep for safety)
+# Ensure directories exist
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
@@ -65,10 +55,6 @@ TASK_REGISTRY = {}
 # ============================================================
 # 🔧 FIX #4: MODEL CACHE (Tier 3, but critical for performance)
 # ============================================================
-# OLD: StackingPredictor was instantiated every 0.5s in the heartbeat,
-# triggering 4x joblib.load() from disk = 8 disk reads per second.
-#
-# NEW: Cache by (symbol, timeframe). Loaded once, reused forever.
 _PREDICTOR_CACHE: Dict[str, StackingPredictor] = {}
 
 def get_cached_predictor(symbol: str, timeframe: str = "1h") -> StackingPredictor:
@@ -109,14 +95,14 @@ class DatabaseHandler:
                      (user_id, config, balance, positions, trade_history, equity_curve, logs, status, last_update)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                   (user_id, 
-                   json.dumps(bot_data['config']), 
-                   bot_data['balance'], 
-                   json.dumps(bot_data['positions']), 
-                   json.dumps(bot_data['trade_history']), 
-                   json.dumps(bot_data.get('equityCurve', [])),
-                   json.dumps(bot_data.get('logs', [])), 
-                   bot_data['status'],
-                   datetime.now().isoformat()))
+                    json.dumps(bot_data['config']), 
+                    bot_data['balance'], 
+                    json.dumps(bot_data['positions']), 
+                    json.dumps(bot_data['trade_history']), 
+                    json.dumps(bot_data.get('equityCurve', [])),
+                    json.dumps(bot_data.get('logs', [])), 
+                    bot_data['status'],
+                    datetime.now().isoformat()))
         conn.commit()
         conn.close()
 
@@ -280,7 +266,8 @@ async def ensure_full_data(symbol, timeframe, start_str, end_str, *args, **kwarg
     end_ts = int(pd.to_datetime(end_str).timestamp() * 1000)
 
     df = load_data_robust(symbol, timeframe)
-    if df is None: df = pd.DataFrame()
+    if df is None:
+        df = pd.DataFrame()
 
     needs_fetch = False
     if df.empty:
@@ -295,20 +282,20 @@ async def ensure_full_data(symbol, timeframe, start_str, end_str, *args, **kwarg
             current_since = int(df.index.max().timestamp() * 1000)
 
     if needs_fetch or current_since < end_ts:
-        print(f"📡 US-DATA GAP: Fetching {symbol} from Coinbase...")
-        
-        exchange = ccxt.coinbase({'enableRateLimit': True}) 
+        print(f"📡 DATA GAP: Fetching {symbol} from Coinbase...")
+
+        exchange = ccxt.coinbase({'enableRateLimit': True})
         all_new_candles = []
-        fetch_symbol = symbol.replace("-", "/") 
+        fetch_symbol = symbol.replace("-", "/")
 
         try:
             while current_since < end_ts:
                 new_batch = await exchange.fetch_ohlcv(fetch_symbol, timeframe, since=current_since, limit=300)
-                if not new_batch: break
-                
+                if not new_batch:
+                    break
                 all_new_candles.extend(new_batch)
-                current_since = new_batch[-1][0] + 1 
-            
+                current_since = new_batch[-1][0] + 1
+
             await exchange.close()
         except Exception as e:
             print(f"⚠️ Coinbase Fetch Error: {e}")
@@ -319,13 +306,19 @@ async def ensure_full_data(symbol, timeframe, start_str, end_str, *args, **kwarg
             new_df['timestamp'] = pd.to_datetime(new_df['ts'], unit='ms', utc=True)
             new_df.set_index('timestamp', inplace=True)
             new_df.drop(columns=['ts'], inplace=True)
-            
+
             df = pd.concat([df, new_df]).sort_index()
             df = df[~df.index.duplicated(keep='first')]
-            
+
+            # 🔧 FIX: Save to CSV so data is reused on future runs
+            # Uses the same path that load_data_robust() searches first
             try:
-                save_to_local_db(df, symbol, timeframe)
-            except: pass
+                os.makedirs("data", exist_ok=True)
+                save_path = f"data/{symbol.replace('/', '-')}-{timeframe}.csv"
+                df.to_csv(save_path)
+                print(f"💾 Cached {len(df)} candles → {save_path}")
+            except Exception as e:
+                print(f"⚠️ Could not save candle cache: {e}")
 
     target_start = pd.to_datetime(start_str, utc=True)
     target_end = pd.to_datetime(end_str, utc=True)
@@ -333,7 +326,7 @@ async def ensure_full_data(symbol, timeframe, start_str, end_str, *args, **kwarg
 
 
 # ==========================================
-# 🧠 1. NEURAL PREDICTOR
+# Diagnostic Layer
 # ==========================================
 class DiagnosticLayer:
     @staticmethod
@@ -411,19 +404,13 @@ class DiagnosticLayer:
         except Exception: return "🔍 Scanning Market Conditions..."
 
 
+# ==========================================
+# 🧠 1. NEURAL PREDICTOR
+# ==========================================
 class NeuralPredictor:
     @staticmethod
     def get_prediction(model_id: str, df: pd.DataFrame, symbol: str = "BTC-USD") -> float:
-        """
-        # ============================================================
-        # 🔧 FIX #4b: Use cached predictor instead of creating new one
-        # ============================================================
-        # OLD: Created a brand new StackingPredictor every call (every 0.5s)
-        #      council = StackingPredictor(symbol=symbol, timeframe="1h")
-        #      This triggered 4x joblib.load() = 8 disk reads/sec
-        #
-        # NEW: Uses the module-level cache. First call loads, rest are free.
-        """
+        """Uses the module-level cache. First call loads, rest are free."""
         try:
             council = get_cached_predictor(symbol=symbol, timeframe="1h")
             prediction = council.predict_direction(df)
@@ -452,18 +439,19 @@ async def process_data_packet(df: pd.DataFrame, strategies: list) -> list:
         candles_to_send.append(c_obj)
     return candles_to_send
 
-# ==========================================
-# 🧠 2. SHARED STRATEGY BRAIN
-# ==========================================
+
+# ============================================================
+# 🔧 UPGRADED 2 & 10-STRATEGY WEIGHTED SIGNAL SYSTEM
+# ============================================================
 class StrategyBrain:
     @staticmethod
     def calculate_signals(df_raw: pd.DataFrame, df_ai: pd.DataFrame, config: Dict[str, Any], l_thresh: float, s_thresh: float, symbol="BTC-USD"):
         active_thoughts, votes = [], 0
-        signals_map = {} 
+        signals_map = {}
         strategies = config.get('strategies', [])
         current_price = df_raw['close'].iloc[-1]
 
-        # 🟢 1. GLOBAL INDICATORS (Using df_raw)
+        # Global indicators
         ema20 = ta.ema(df_raw['close'], length=20).iloc[-1]
         ema50 = ta.ema(df_raw['close'], length=50).iloc[-1]
         ema200 = ta.ema(df_raw['close'], length=200).iloc[-1]
@@ -471,131 +459,135 @@ class StrategyBrain:
         lower, mid, upper = bb.iloc[-1, 0], bb.iloc[-1, 1], bb.iloc[-1, 2]
         pr = int((current_price - lower) / (upper - lower) * 100)
 
-        # 🟢 2. FULL 10-STRATEGY DYNAMIC EVALUATION (Using df_raw)
+        # 🔧 UPGRADE 1: WEIGHTED VOTE SYSTEM
+        weighted_votes = 0.0
+
         for strat in strategies:
             code = strat.get('code')
             p = strat.get('params', {})
+            raw_vote = 0
+            confidence = 0.5
+
             try:
                 if code == "rsi_threshold":
                     rsi = ta.rsi(df_raw['close'], length=int(p.get('rsi_length', 14))).iloc[-1]
                     dist = min(abs(rsi - 30), abs(rsi - 70))
-                    signals_map[code] = max(0.1, min(1.0, 1.0 - (dist / 40)))
-                    if rsi < p.get('oversold', 30): votes += 1; active_thoughts.append("RSI Low")
-                    elif rsi > p.get('overbought', 70): votes -= 1; active_thoughts.append("RSI High")
+                    confidence = max(0.1, min(1.0, 1.0 - (dist / 40)))
+                    if rsi < p.get('oversold', 30): raw_vote = 1; active_thoughts.append("RSI Low")
+                    elif rsi > p.get('overbought', 70): raw_vote = -1; active_thoughts.append("RSI High")
 
                 elif code == "sma_crossover":
                     f = ta.sma(df_raw['close'], length=int(p.get('fast_sma', 50))).iloc[-1]
                     s = ta.sma(df_raw['close'], length=int(p.get('slow_sma', 200))).iloc[-1]
                     gap = abs(f - s) / s
-                    signals_map[code] = 1.0 if f > s else max(0.1, min(0.95, 1.0 - (gap * 50)))
-                    if f > s: votes += 1
+                    confidence = 1.0 if f > s else max(0.1, min(0.95, 1.0 - (gap * 50)))
+                    raw_vote = 1 if f > s else -1
 
                 elif code == "macd_crossover":
                     macd = ta.macd(df_raw['close'], fast=int(p.get('fast', 12))).iloc[-1]
                     hist = macd[1]
                     norm_hist = abs(hist) / (current_price * 0.0005)
-                    signals_map[code] = max(0.1, min(1.0, norm_hist))
-                    votes += (1 if macd[0] > macd[2] else -1)
+                    confidence = max(0.1, min(1.0, norm_hist))
+                    raw_vote = 1 if macd[0] > macd[2] else -1
 
                 elif code == "supertrend":
                     st_data = ta.supertrend(df_raw['high'], df_raw['low'], df_raw['close']).iloc[-1]
                     st_line = st_data[0]
                     dist = abs(current_price - st_line) / current_price
-                    signals_map[code] = 1.0 if st_data[1] == 1 else max(0.1, min(0.95, 1.0 - (dist * 20)))
-                    votes += (1 if st_data[1] == 1 else -1)
+                    confidence = 1.0 if st_data[1] == 1 else max(0.1, min(0.95, 1.0 - (dist * 20)))
+                    raw_vote = 1 if st_data[1] == 1 else -1
 
                 elif code == "bb_fade":
-                    signals_map[code] = max(0.1, min(1.0, pr / 100.0))
-                    if current_price < lower: votes += 1
-                    elif current_price > upper: votes -= 1
+                    confidence = max(0.1, min(1.0, pr / 100.0))
+                    if current_price < lower: raw_vote = 1
+                    elif current_price > upper: raw_vote = -1
 
                 elif code == "atr_breakout":
                     atr = ta.atr(df_raw['high'], df_raw['low'], df_raw['close']).iloc[-1]
                     target = ema20 + (atr * float(p.get('multiplier', 1.5)))
-                    signals_map[code] = max(0.1, min(1.0, current_price / target))
-                    if current_price > target: votes += 1
+                    confidence = max(0.1, min(1.0, current_price / target))
+                    raw_vote = 1 if current_price > target else -1
 
                 elif code == "pa_breakout":
                     lb = int(p.get('lookback', 20))
                     high_lb = df_raw['high'].tail(lb).max()
-                    signals_map[code] = max(0.1, min(1.0, current_price / high_lb))
-                    if current_price >= high_lb: votes += 1
+                    confidence = max(0.1, min(1.0, current_price / high_lb))
+                    raw_vote = 1 if current_price >= high_lb else -1
 
                 elif code == "vol_profile":
                     v_ma = ta.sma(df_raw['volume'], length=int(p.get('vol_ma', 20))).iloc[-1]
                     ratio = df_raw['volume'].iloc[-1] / (v_ma * float(p.get('threshold', 1.5)))
-                    signals_map[code] = max(0.1, min(1.0, ratio))
-                    if ratio >= 1.0: votes += (1 if current_price > mid else -1)
+                    confidence = max(0.1, min(1.0, ratio))
+                    raw_vote = (1 if current_price > mid else -1) if ratio >= 1.0 else 0
 
                 elif code == "stoch":
                     stoch_df = ta.stoch(df_raw['high'], df_raw['low'], df_raw['close']).iloc[-1]
                     k = stoch_df[0]
                     dist = min(abs(k - 20), abs(k - 80))
-                    signals_map[code] = max(0.1, min(1.0, 1.0 - (dist / 40)))
-                    if k < 20: votes += 1
-                    elif k > 80: votes -= 1
+                    confidence = max(0.1, min(1.0, 1.0 - (dist / 40)))
+                    if k < 20: raw_vote = 1
+                    elif k > 80: raw_vote = -1
 
                 elif code == "ema_cloud":
                     f_ema = ta.ema(df_raw['close'], length=int(p.get('fast_ema', 9))).iloc[-1]
                     s_ema = ta.ema(df_raw['close'], length=int(p.get('slow_ema', 21))).iloc[-1]
                     gap = abs(f_ema - s_ema) / s_ema
-                    signals_map[code] = 1.0 if f_ema > s_ema else max(0.1, min(0.95, 1.0 - (gap * 100)))
-                    if f_ema > s_ema: votes += 1
+                    confidence = 1.0 if f_ema > s_ema else max(0.1, min(0.95, 1.0 - (gap * 100)))
+                    raw_vote = 1 if f_ema > s_ema else -1
                 else:
-                    signals_map[code] = 0.5
-            except Exception: signals_map[code] = 0.0
-        
-        # 🚀 3. DYNAMIC DUAL-GATE LOGIC (Using df_ai for AI)
+                    confidence = 0.5
+
+                signals_map[code] = confidence
+                votes += raw_vote  # Keep integer votes for AND/OR logic
+                weighted_votes += raw_vote * confidence  # Weighted signal strength
+
+            except Exception:
+                signals_map[code] = 0.0
+
+        # ML Gate
         is_short = current_price < ema200
-        ui_limit = float(config.get('mlThresholdShort', 0.90)) if is_short else float(config.get('mlThresholdLong', 0.80))
-        
-        # Pass the pre-engineered 'df_ai' strictly to the Neural Predictor
+        ui_limit = float(config.get('mlThresholdShort', 0.55)) if is_short else float(config.get('mlThresholdLong', 0.55))
         conf = NeuralPredictor.get_prediction(config.get('mlModel', 'stacking'), df_ai, symbol=symbol)
-        
+
+        # 🔧 BUG FIX: Don't overwrite logic_desc after setting it
         if config.get('mlMode') == 'off':
             gate_passed = True
-            logic_desc = f"📊 LOGIC: NEURAL GATE BYPASSED (AI: {int(conf*100)}%) 🟢"
+            logic_desc = f"📊 LOGIC: NEURAL GATE BYPASSED (AI Score: {int(conf*100)}%) 🟡"
         else:
             gate_passed = conf >= ui_limit
-            logic_desc = f"📊 LOGIC: {'SHORT' if is_short else 'LONG'} GATE {'PASSED' if gate_passed else 'VETOED'} ({int(conf*100)}% vs {int(ui_limit*100)}% UI Limit) {'🟢' if gate_passed else '🔴'}"
+            logic_desc = f"📊 LOGIC: {'SHORT' if is_short else 'LONG'} GATE {'PASSED' if gate_passed else 'VETOED'} ({int(conf*100)}% vs {int(ui_limit*100)}%) {'🟢' if gate_passed else '🔴'}"
 
-        logic_desc = f"📊 LOGIC: {'SHORT' if is_short else 'LONG'} GATE {'PASSED' if gate_passed else 'VETOED'} ({int(conf*100)}% vs {int(ui_limit*100)}% UI Limit) {'🟢' if gate_passed else '🔴'}"
         signal_names = " + ".join(active_thoughts) if active_thoughts else "Scanning Setup"
-        gap = int(abs(current_price - ema50))
-        intent_desc = f"🎯 INTENT: STALKING {'SHORT' if is_short else 'LONG'} ({signal_names} | Gap: ${gap}) {'🔴' if is_short else '🟢'}"
-
+        gap_val = int(abs(current_price - ema50))
+        intent_desc = f"🎯 INTENT: STALKING {'SHORT' if is_short else 'LONG'} ({signal_names} | Gap: ${gap_val}) {'🔴' if is_short else '🟢'}"
         trend_dist = current_price - ema200
-        trend_text = f"📡 TREND: {'UP' if trend_dist > 0 else 'DOWN'} (Price is ${int(abs(trend_dist))} {'above' if trend_dist > 0 else 'below'} 200EMA)"
+        trend_text = f"📡 TREND: {'UP' if trend_dist > 0 else 'DOWN'} (Price ${int(abs(trend_dist))} {'above' if trend_dist > 0 else 'below'} 200EMA)"
         spread = ema20 - ema50
-        bias_str = "BULLISH EXPANSION" if spread > 0 else "BEARISH CONTRACTION"
-        bias_text = f"⚖️ BIAS: {bias_str} (Fast EMA is ${int(abs(spread))} {'above' if spread > 0 else 'below'} Slow EMA)"
+        bias_text = f"⚖️ BIAS: {'BULLISH' if spread > 0 else 'BEARISH'} (EMA Gap: ${int(abs(spread))})"
         mindset_str = "⚠️ OVEREXTENDED" if pr >= 80 else "🎯 ACCUMULATION" if pr <= 20 else "⚖️ EQUILIBRIUM"
-        mindset_text = f"🤖 MINDSET: {mindset_str} - Price is at {pr}% of Bollinger Range"
+        mindset_text = f"🤖 MINDSET: {mindset_str} ({pr}% of BB Range)"
 
         numeric_details = {
             "market": {
-                "logic": logic_desc, 
-                "intent": intent_desc,
-                "trend": trend_text,
-                "bias": bias_text,
-                "mindset": mindset_text
+                "logic": logic_desc, "intent": intent_desc, "trend": trend_text,
+                "bias": bias_text, "mindset": mindset_text,
+                "weighted_signal_strength": round(weighted_votes, 3)
             }
         }
 
-        # 🎯 6. FINAL SIGNAL CALCULATION
+        # Final signal using BOTH binary votes (for AND/OR rule) and weighted strength
         rule = config.get('comboConfig', {}).get('combinationRule', 'OR')
         final_sig = 0
-        
+
         if gate_passed:
             if rule == "AND":
-                if votes >= len(strategies): final_sig = 1
+                if votes >= len(strategies) and weighted_votes > 0: final_sig = 1
+                elif votes <= -len(strategies) and weighted_votes < 0: final_sig = -1
             else:
-                if votes > 0: final_sig = 1
-            
-            if rule == "AND":
-                if votes <= -len(strategies): final_sig = -1
-            elif votes < 0:
-                final_sig = -1
+                # OR: require weighted signal to be meaningfully positive/negative
+                min_weighted = float(config.get('minWeightedSignal', 0.3))
+                if votes > 0 and weighted_votes >= min_weighted: final_sig = 1
+                elif votes < 0 and weighted_votes <= -min_weighted: final_sig = -1
 
         return final_sig, active_thoughts, numeric_details, conf, signals_map
 
@@ -603,7 +595,6 @@ class StrategyBrain:
 # ==========================================
 # 🚀 3. THE HEARTBEAT (Dynamic Calculation Loop)
 # ==========================================
-
 async def live_neural_heartbeat(user_id: str):
     last_log = 0
     last_ui_update = 0
@@ -642,8 +633,6 @@ async def live_neural_heartbeat(user_id: str):
             # ============================================================
             # 🔧 FIX #2b: Use config2 fee constants instead of hardcoded
             # ============================================================
-            # OLD: fee_rate = 0.0026 if use_margin else 0.006
-            # NEW: Imported from config2
             fee_rate = KRAKEN_TAKER_FEE if use_margin else DEFAULT_TAKER_FEE
 
             try:
@@ -660,7 +649,6 @@ async def live_neural_heartbeat(user_id: str):
                     current_price = float(ticker['last'])
                 
                 ohlcv_raw[-1]['close'] = current_price
-                #ohlcv_raw[-1]['time'] = int(datetime.now(timezone.utc).timestamp())
                 
                 df_raw = pd.DataFrame(ohlcv_raw)
                 df_closed_history = df_raw.iloc[:-1].copy()
@@ -747,56 +735,109 @@ async def live_neural_heartbeat(user_id: str):
                     if len(bot["equityCurve"]) > 300: bot["equityCurve"].pop(0)
                     last_ui_update = now_ts
 
-                # 🟢 7. TRADE EXECUTION LOGIC
+                # ============================================================
+                # 🔧 INTEGRATED UPGRADE SECTION 2: ENTRY / EXIT CONTROLLER
+                # ============================================================
                 max_p = min(5, int(config.get('maxPyramiding', 5)))
                 current_time = datetime.now(timezone.utc)
-                
-                time_gate_passed = not bot.get('last_trade_time') or (current_time - datetime.fromisoformat(bot['last_trade_time'])).total_seconds() >= 3600
+
+                time_gate_passed = not bot.get('last_trade_time') or (
+                    current_time - datetime.fromisoformat(bot['last_trade_time'])
+                ).total_seconds() >= 3600
                 last_pos = bot['positions'][-1] if bot['positions'] else None
                 climb_satisfied = (score >= last_pos.get('entry_conf', 0) + 0.10) if last_pos else True
 
-                # 🚀 Calculate Dynamic ATR for Stops/Targets
-                current_atr = ta.atr(df_raw['high'], df_raw['low'], df_raw['close'], length=14).iloc[-1]
-                atr_tp_mult = float(params.get('atr_tp_mult', 3.0)) 
-                atr_sl_mult = float(params.get('atr_sl_mult', 1.5))
+                # ATR calculations
+                current_atr = float(ta.atr(df_raw['high'], df_raw['low'], df_raw['close'], length=14).iloc[-1])
+                atr_tp_mult = float(params.get('atr_tp_mult', config.get('atrTpMultiplier', 3.0)))
+                atr_sl_mult = float(params.get('atr_sl_mult', config.get('atrSlMultiplier', 1.5)))
+                current_ema200 = float(ta.ema(df_raw['close'], length=200).iloc[-1])
 
-                # ==========================================
-                # 🟢 MACRO RISK FILTERS (The Seatbelts)
-                # ==========================================
-                # Volatility Regime Filter
-                volatility_pct = current_atr / current_price
-                is_volatility_safe = volatility_pct <= 0.03  
+                # 🔧 UPGRADE 2: ADX TREND STRENGTH FILTER
+                try:
+                    adx_val = float(ta.adx(df_raw['high'], df_raw['low'], df_raw['close'], length=14).iloc[-1, 0])
+                    adx_trending = adx_val >= float(config.get('minAdx', 20.0))
+                except Exception:
+                    adx_val = 25.0
+                    adx_trending = True
 
-                # Drawdown Circuit Breaker
+                # 🔧 UPGRADE 3: VOLUME CONFIRMATION
+                try:
+                    vol_ma = float(ta.sma(df_raw['volume'], length=20).iloc[-1])
+                    vol_ratio = df_raw['volume'].iloc[-1] / vol_ma if vol_ma > 0 else 1.0
+                    volume_confirmed = vol_ratio >= float(config.get('minVolRatio', 0.8))
+                except Exception:
+                    vol_ratio = 1.0
+                    volume_confirmed = True
+
+                # 🔧 UPGRADE 4: ADAPTIVE THRESHOLD BASED ON MARKET REGIME
+                base_threshold = ui_limit  
+                if adx_val > 30:
+                    adaptive_threshold = max(0.50, base_threshold - 0.05)  # Easier bar in strong trends
+                elif adx_val < 20:
+                    adaptive_threshold = min(0.85, base_threshold + 0.05)  # Harder bar in choppy markets
+                else:
+                    adaptive_threshold = base_threshold
+                adaptive_gate = score >= adaptive_threshold
+
+                # 🔧 UPGRADE 5: CONSECUTIVE LOSS CIRCUIT
+                recent_trades = [t for t in bot.get('trade_history', []) if t.get('type') == 'exit'][-5:]
+                consecutive_losses = 0
+                for t in reversed(recent_trades):
+                    if float(t.get('pnl', 0)) < 0:
+                        consecutive_losses += 1
+                    else:
+                        break
+
+                if consecutive_losses >= 3:
+                    adaptive_threshold = min(0.85, adaptive_threshold + (consecutive_losses - 2) * 0.03)
+                    adaptive_gate = score >= adaptive_threshold
+                    if consecutive_losses == 3:
+                        await emit_log(user_id, f"⚠️ COLD STREAK: {consecutive_losses} losses — raising bar to {int(adaptive_threshold*100)}%")
+
+                # Macro risk gates
+                atr_pct = (current_atr / current_price) * 100
+                is_volatility_safe = atr_pct <= float(config.get('maxAtrPct', 3.0))
+
                 start_capital = float(config.get('capitalAllocation', config.get('initialBalance', 200.0)))
-                raw_dd = float(config.get('maxDailyLoss', 5.0))
-                max_dd_pct = raw_dd / 100.0 if raw_dd > 1.0 else raw_dd
-                
+                max_dd_pct = float(config.get('maxDailyLoss', 5.0)) / 100.0
                 is_circuit_breaker_tripped = bot['balance'] <= (start_capital * (1.0 - max_dd_pct))
 
-                if is_circuit_breaker_tripped and len(bot['positions']) == 0:
-                    hunting_summary = "🛑 CIRCUIT BREAKER TRIPPED: Max Drawdown Reached. Trading Halted."
-
-                # 🚀 UPGRADE 3: Trend Alignment Filter (Hard Gate)
-                current_ema200 = ta.ema(df_raw['close'], length=200).iloc[-1]
                 is_trend_aligned = (sig == 1 and current_price > current_ema200) or (sig == -1 and current_price < current_ema200)
 
+                # Combined entry gate
+                all_filters_pass = (
+                    is_volatility_safe and
+                    not is_circuit_breaker_tripped and
+                    is_trend_aligned and
+                    adx_trending and
+                    volume_confirmed and
+                    adaptive_gate
+                )
+
+                if sig != 0 and not all_filters_pass:
+                    reasons = []
+                    if not is_trend_aligned: reasons.append("trend misaligned")
+                    if not adx_trending: reasons.append(f"ADX {adx_val:.0f} too low")
+                    if not volume_confirmed: reasons.append(f"vol {vol_ratio:.1f}x weak")
+                    if not is_volatility_safe: reasons.append(f"ATR {atr_pct:.1f}% too high")
+                    if not adaptive_gate: reasons.append(f"AI {int(score*100)}% < {int(adaptive_threshold*100)}%")
+                    if is_circuit_breaker_tripped: reasons.append("circuit breaker")
+                    await emit_log(user_id, f"⛔ ENTRY BLOCKED: {', '.join(reasons)}")
+
                 # ==========================================
-                # 🟢 ENTRY LOGIC (Bulletproof Live + ATR + Filters)
+                # 🟢 ENTRY LOGIC
                 # ==========================================
-                if len(bot['positions']) < max_p and time_gate_passed and is_volatility_safe and not is_circuit_breaker_tripped and is_trend_aligned:
+                if len(bot['positions']) < max_p and time_gate_passed and all_filters_pass:
                     if (sig == 1 and climb_satisfied) or (sig == -1 and climb_satisfied):
                         trade_type = "long" if sig == 1 else "short"
-                        
-                        # 🚀 FIX: Catch any naming convention the React frontend might be using
-                        raw_risk = config.get('riskPercentage') or config.get('risk_percentage') or config.get('riskTrade') or 10.0
-                        
-                        size_in_fiat = bot['balance'] * (float(raw_risk) / 100 / max_p)
+
+                        raw_risk = config.get('riskPercentage') or config.get('risk_percentage') or 1.0
+                        size_in_fiat = bot['balance'] * (float(raw_risk) / 100.0 / max_p)
                         size_in_crypto = size_in_fiat / current_price
-                        
-                        safe_size = float(f"{size_in_crypto:.6f}") 
+                        safe_size = float(f"{size_in_crypto:.6f}")
                         actual_entry_price = current_price
-                        
+
                         if is_live_trading:
                             try:
                                 exchange_class = getattr(ccxt, target_exchange)
@@ -805,70 +846,130 @@ async def live_neural_heartbeat(user_id: str):
                                     'secret': api_keys.get('krakenSecret', api_keys.get('secret')),
                                     'enableRateLimit': True
                                 }) as user_exchange:
-                                    
                                     side = "buy" if sig == 1 else "sell"
                                     order_params = {'leverage': leverage_val} if use_margin else {}
-                                    
                                     await emit_log(user_id, f"🔗 ROUTING {side.upper()} TO {target_exchange.upper()}...")
-                                    
                                     await user_exchange.load_markets()
                                     formatted_size = float(user_exchange.amount_to_precision(symbol, size_in_crypto))
-                                    
                                     if formatted_size <= 0:
-                                        raise Exception("Order size too small for exchange limits")
-
-                                    # 🚀 MAKER ORDER UPGRADE: Use Limit orders
-                                    order = await user_exchange.create_limit_order(symbol, side, formatted_size, current_price, params=order_params)
+                                        raise Exception("Order size too small")
                                     
+                                    # Market order configuration guarantees an instant fill
+                                    order = await user_exchange.create_market_order(symbol, side, formatted_size, params=order_params)
                                     actual_entry_price = order.get('average') or order.get('price') or current_price
                                     safe_size = order.get('filled') or formatted_size
-                                    
                             except Exception as ex_err:
                                 await emit_log(user_id, f"❌ {target_exchange.upper()} ORDER FAILED: {str(ex_err)}")
                                 await asyncio.sleep(5)
-                                continue 
+                                continue
                         else:
                             bot['balance'] -= (safe_size * actual_entry_price) * fee_rate
-                        
-                        target_price = actual_entry_price + (current_atr * atr_tp_mult) if sig == 1 else actual_entry_price - (current_atr * atr_tp_mult)
-                        stop_price = actual_entry_price - (current_atr * atr_sl_mult) if sig == 1 else actual_entry_price + (current_atr * atr_sl_mult)
+
+                        tp_price_calc = actual_entry_price + (current_atr * atr_tp_mult) if sig == 1 else actual_entry_price - (current_atr * atr_tp_mult)
+                        sl_price_calc = actual_entry_price - (current_atr * atr_sl_mult) if sig == 1 else actual_entry_price + (current_atr * atr_sl_mult)
+
+                        # 🔧 UPGRADE 6: PARTIAL TP TARGETS
+                        partial_tp = actual_entry_price + (current_atr * 1.5) if sig == 1 else actual_entry_price - (current_atr * 1.5)
 
                         bot['positions'].append({
-                            "symbol": symbol, "type": trade_type, "entry": actual_entry_price, "size": safe_size,
+                            "symbol": symbol, "type": trade_type,
+                            "entry": actual_entry_price, "size": safe_size,
                             "time": current_time.isoformat(), "entry_conf": score,
-                            "tp": target_price,
-                            "sl": stop_price,
-                            "tsl": stop_price, 
-                            "atr_at_entry": current_atr 
+                            "tp": tp_price_calc, "sl": sl_price_calc, "tsl": sl_price_calc,
+                            "partial_tp": partial_tp,
+                            "partial_taken": False,  
+                            "atr_at_entry": round(current_atr, 4),
+                            "adx_at_entry": round(adx_val, 1),
+                            "vol_ratio_at_entry": round(vol_ratio, 2)
                         })
                         bot['last_trade_time'] = current_time.isoformat()
-                        await emit_log(user_id, f"🚀 ENTERED {trade_type.upper()} @ ${actual_entry_price:,.2f} | TP: ${target_price:.2f} | SL: ${stop_price:.2f}")
+                        rr = round(atr_tp_mult / atr_sl_mult, 1)
+                        await emit_log(user_id, f"🚀 ENTERED {trade_type.upper()} @ ${actual_entry_price:,.2f} | TP ${tp_price_calc:,.2f} | SL ${sl_price_calc:,.2f} | R:R {rr} | ADX {adx_val:.0f}")
                         DatabaseHandler.save_state(user_id, bot)
 
                 # ==========================================
-                # 🟢 EXIT MONITORING (Bulletproof Live + ATR Ratchet)
+                # 🟢 EXIT MONITORING (Partial TP + ATR Ratchet)
                 # ==========================================
                 for pos in bot['positions'][:]:
                     closed = False
+                    exit_reason = ""
                     
-                    # 🚀 UPGRADE 5: ATR Ratchet Trailing Stop
-                    # We trail by the dynamic market ATR distance, not a static percentage.
-                    trail_dist = current_atr * atr_sl_mult
-                    
+                    pos_atr = pos.get('atr_at_entry', current_atr)
+                    trail_dist = pos_atr * atr_sl_mult
+
+                    # 🔧 UPGRADE 6b: PARTIAL PROFIT TAKING
+                    if not pos.get('partial_taken', True):
+                        if pos['type'] == 'long' and current_price >= pos.get('partial_tp', float('inf')):
+                            half_size = pos['size'] / 2.0
+                            partial_pnl = (current_price - pos['entry']) * half_size
+
+                            if is_live_trading:
+                                try:
+                                    exchange_class = getattr(ccxt, target_exchange)
+                                    async with exchange_class({
+                                        'apiKey': api_keys.get('krakenKey', api_keys.get('apiKey')),
+                                        'secret': api_keys.get('krakenSecret', api_keys.get('secret')),
+                                        'enableRateLimit': True
+                                    }) as user_exchange:
+                                        await user_exchange.load_markets()
+                                        fmt_size = float(user_exchange.amount_to_precision(symbol, half_size))
+                                        order = await user_exchange.create_market_order(symbol, "sell", fmt_size)
+                                        partial_pnl = ((order.get('average') or current_price) - pos['entry']) * half_size
+                                except Exception as e:
+                                    await emit_log(user_id, f"⚠️ Partial exit failed: {e}")
+                            else:
+                                net_partial = partial_pnl - (half_size * current_price * fee_rate)
+                                bot['balance'] += net_partial
+                                partial_pnl = net_partial
+
+                            pos['size'] = half_size
+                            pos['partial_taken'] = True
+                            pos['tsl'] = max(pos['tsl'], pos['entry'])  # Stop to breakeven
+                            await emit_log(user_id, f"💎 PARTIAL EXIT: Took 50% at ${current_price:,.2f} | Locked ${partial_pnl:.2f} | Stop → Breakeven")
+                            bot['trade_history'].append({
+                                "type": "partial_exit", "side": pos['type'],
+                                "price": current_price, "pnl": round(partial_pnl, 2),
+                                "time": datetime.now(timezone.utc).isoformat()
+                            })
+                            DatabaseHandler.save_state(user_id, bot)
+                            continue
+
+                        elif pos['type'] == 'short' and current_price <= pos.get('partial_tp', 0):
+                            half_size = pos['size'] / 2.0
+                            partial_pnl = (pos['entry'] - current_price) * half_size
+
+                            if not is_live_trading:
+                                net_partial = partial_pnl - (half_size * current_price * fee_rate)
+                                bot['balance'] += net_partial
+                                partial_pnl = net_partial
+
+                            pos['size'] = half_size
+                            pos['partial_taken'] = True
+                            pos['tsl'] = min(pos['tsl'], pos['entry'])  # Stop to breakeven
+                            await emit_log(user_id, f"💎 PARTIAL EXIT: Took 50% SHORT at ${current_price:,.2f} | Locked ${partial_pnl:.2f} | Stop → Breakeven")
+                            continue
+
+                    # Full exit checks with ATR ratchet
                     if pos['type'] == 'long':
-                        if current_price - trail_dist > pos['tsl']: 
-                            pos['tsl'] = current_price - trail_dist
-                        if current_price >= pos['tp'] or current_price <= pos['tsl']: 
-                            closed = True
+                        new_tsl = current_price - trail_dist
+                        if new_tsl > pos['tsl']:
+                            pos['tsl'] = new_tsl
+                        if current_price >= pos['tp']:
+                            closed = True; exit_reason = "Take Profit"
+                        elif current_price <= pos['tsl']:
+                            closed = True; exit_reason = "Trailing Stop"
                     else:
-                        if current_price + trail_dist < pos['tsl']: 
-                            pos['tsl'] = current_price + trail_dist
-                        if current_price <= pos['tp'] or current_price >= pos['tsl']: 
-                            closed = True
-                    
+                        new_tsl = current_price + trail_dist
+                        if new_tsl < pos['tsl']:
+                            pos['tsl'] = new_tsl
+                        if current_price <= pos['tp']:
+                            closed = True; exit_reason = "Take Profit"
+                        elif current_price >= pos['tsl']:
+                            closed = True; exit_reason = "Trailing Stop"
+
                     if closed:
                         actual_close_price = current_price
-                        
+
                         if is_live_trading:
                             try:
                                 exchange_class = getattr(ccxt, target_exchange)
@@ -877,45 +978,38 @@ async def live_neural_heartbeat(user_id: str):
                                     'secret': api_keys.get('krakenSecret', api_keys.get('secret')),
                                     'enableRateLimit': True
                                 }) as user_exchange:
-                                    
                                     close_side = "sell" if pos['type'] == 'long' else "buy"
                                     order_params = {'leverage': leverage_val} if use_margin else {}
-                                    
-                                    await emit_log(user_id, f"🔗 ROUTING {close_side.upper()} EXIT TO {target_exchange.upper()}...")
-                                    
                                     await user_exchange.load_markets()
-                                    formatted_size = float(user_exchange.amount_to_precision(symbol, pos['size']))
-
-                                    order = await user_exchange.create_market_order(symbol, close_side, formatted_size, params=order_params)
-                                    
+                                    fmt_size = float(user_exchange.amount_to_precision(symbol, pos['size']))
+                                    order = await user_exchange.create_market_order(symbol, close_side, fmt_size, params=order_params)
                                     actual_close_price = order.get('average') or order.get('price') or current_price
-                                    
                                     balance_data = await user_exchange.fetch_balance()
-                                    real_fiat_balance = balance_data.get('USD', {}).get('free') or balance_data.get('USDC', {}).get('free')
-                                    if real_fiat_balance:
-                                        bot['balance'] = float(real_fiat_balance)
-                                        await emit_log(user_id, f"🔄 Synced Real Balance: ${bot['balance']:,.2f}")
-                                    
+                                    real_fiat = balance_data.get('USD', {}).get('free') or balance_data.get('USDC', {}).get('free')
+                                    if real_fiat:
+                                        bot['balance'] = float(real_fiat)
                             except Exception as ex_err:
-                                await emit_log(user_id, f"❌ {target_exchange.upper()} EXIT FAILED: {str(ex_err)}")
-                                continue 
-                        
+                                await emit_log(user_id, f"❌ EXIT FAILED: {str(ex_err)}")
+                                continue
+
                         gross_pnl = (actual_close_price - pos['entry']) * pos['size'] if pos['type'] == 'long' else (pos['entry'] - actual_close_price) * pos['size']
-                        
+                        net_pnl = gross_pnl - ((pos['size'] * actual_close_price) * fee_rate)
                         if not is_live_trading:
-                            net_pnl = gross_pnl - ((pos['size'] * actual_close_price) * fee_rate)
                             bot['balance'] += net_pnl
-                        else:
-                            net_pnl = gross_pnl - ((pos['size'] * actual_close_price) * fee_rate)
 
                         bot['positions'].remove(pos)
-                        bot['trade_history'].append({"type": "exit", "side": pos['type'], "price": actual_close_price, "pnl": round(net_pnl, 2), "time": datetime.now(timezone.utc).isoformat()})
-                        await emit_log(user_id, f"💰 CLOSED {pos['type'].upper()} @ ${actual_close_price:,.2f} | Net PnL: ${round(net_pnl, 2)}")
+                        bot['trade_history'].append({
+                            "type": "exit", "side": pos['type'],
+                            "price": actual_close_price, "pnl": round(net_pnl, 2),
+                            "reason": exit_reason,
+                            "time": datetime.now(timezone.utc).isoformat()
+                        })
+                        await emit_log(user_id, f"💰 {exit_reason}: CLOSED {pos['type'].upper()} @ ${actual_close_price:,.2f} | Net PnL: ${round(net_pnl, 2)}")
                         DatabaseHandler.save_state(user_id, bot)
 
                 if datetime.now().timestamp() - last_log >= 60:
                     DatabaseHandler.save_state(user_id, bot)
-                
+
                 await asyncio.sleep(0.5)
 
             except Exception as e:
@@ -943,7 +1037,6 @@ async def fetch_live_candles_ccxt(symbol: str, timeframe: str, limit: int, excha
 @app.get("/ml/available-models")
 @app.get("/api/models")
 def list_models():
-    # 🔧 FIX #1c: Uses imported MODEL_DIR from config2 (no longer shadowed)
     if not os.path.exists(MODEL_DIR): return {"status": "success", "models": []}
     models = [{"id": f.rsplit('.', 1)[0], "name": f.rsplit('.', 1)[0]} 
               for f in os.listdir(MODEL_DIR) if f.endswith(('.keras', '.joblib', '.pkl'))]

@@ -596,6 +596,7 @@ class StrategyBrain:
 # 🚀 3. THE HEARTBEAT (Dynamic Calculation Loop)
 # ==========================================
 async def live_neural_heartbeat(user_id: str):
+    signal_has_reset = True
     last_log = 0
     last_ui_update = 0
     
@@ -741,9 +742,17 @@ async def live_neural_heartbeat(user_id: str):
                 max_p = min(5, int(config.get('maxPyramiding', 5)))
                 current_time = datetime.now(timezone.utc)
 
-                time_gate_passed = not bot.get('last_trade_time') or (
-                    current_time - datetime.fromisoformat(bot['last_trade_time'])
-                ).total_seconds() >= 3600
+                if len(bot['positions']) == 0:
+                    if sig == 0:
+                        signal_has_reset = True
+                else:
+                    # While a trade is running or immediately after it closes, 
+                    # lock re-entries until a zero-signal state is confirmed
+                    signal_has_reset = False
+
+                # Entry is authorized strictly based on structural market change
+                market_gate_passed = signal_has_reset
+                
                 last_pos = bot['positions'][-1] if bot['positions'] else None
                 climb_satisfied = (score >= last_pos.get('entry_conf', 0) + 0.10) if last_pos else True
 
@@ -778,7 +787,12 @@ async def live_neural_heartbeat(user_id: str):
                     adaptive_threshold = min(0.85, base_threshold + 0.05)  # Harder bar in choppy markets
                 else:
                     adaptive_threshold = base_threshold
-                adaptive_gate = score >= adaptive_threshold
+                
+                # 🚀 PATCH: Force pass if ML Mode is explicitly turned off/bypassed via UI
+                if config.get('mlMode') == 'off':
+                    adaptive_gate = True
+                else:
+                    adaptive_gate = score >= adaptive_threshold
 
                 # 🔧 UPGRADE 5: CONSECUTIVE LOSS CIRCUIT
                 recent_trades = [t for t in bot.get('trade_history', []) if t.get('type') == 'exit'][-5:]
@@ -791,7 +805,13 @@ async def live_neural_heartbeat(user_id: str):
 
                 if consecutive_losses >= 3:
                     adaptive_threshold = min(0.85, adaptive_threshold + (consecutive_losses - 2) * 0.03)
-                    adaptive_gate = score >= adaptive_threshold
+                    
+                    # 🚀 PATCH: Ensure cold-streak checks don't override an explicit AI bypass choice
+                    if config.get('mlMode') == 'off':
+                        adaptive_gate = True
+                    else:
+                        adaptive_gate = score >= adaptive_threshold
+                        
                     if consecutive_losses == 3:
                         await emit_log(user_id, f"⚠️ COLD STREAK: {consecutive_losses} losses — raising bar to {int(adaptive_threshold*100)}%")
 
@@ -803,7 +823,12 @@ async def live_neural_heartbeat(user_id: str):
                 max_dd_pct = float(config.get('maxDailyLoss', 5.0)) / 100.0
                 is_circuit_breaker_tripped = bot['balance'] <= (start_capital * (1.0 - max_dd_pct))
 
-                is_trend_aligned = (sig == 1 and current_price > current_ema200) or (sig == -1 and current_price < current_ema200)
+                # 🚀 PATCH: Allow counter-trend technical strategies if AI is off OR combo rule is set to loose 'OR'
+                rule = config.get('comboConfig', {}).get('combinationRule', 'OR')
+                if config.get('mlMode') == 'off' or rule == "OR":
+                    is_trend_aligned = True
+                else:
+                    is_trend_aligned = (sig == 1 and current_price > current_ema200) or (sig == -1 and current_price < current_ema200)
 
                 # Combined entry gate
                 all_filters_pass = (
@@ -812,7 +837,8 @@ async def live_neural_heartbeat(user_id: str):
                     is_trend_aligned and
                     adx_trending and
                     volume_confirmed and
-                    adaptive_gate
+                    adaptive_gate and
+                    market_gate_passed
                 )
 
                 if sig != 0 and not all_filters_pass:
@@ -828,7 +854,7 @@ async def live_neural_heartbeat(user_id: str):
                 # ==========================================
                 # 🟢 ENTRY LOGIC
                 # ==========================================
-                if len(bot['positions']) < max_p and time_gate_passed and all_filters_pass:
+                if len(bot['positions']) < max_p and all_filters_pass:
                     if (sig == 1 and climb_satisfied) or (sig == -1 and climb_satisfied):
                         trade_type = "long" if sig == 1 else "short"
 
@@ -1068,7 +1094,14 @@ async def start_bot(data: BotStartRequest):
         ACTIVE_BOTS[user_id]["config"] = data.config
         ACTIVE_BOTS[user_id]["balance"] = ui_capital 
         ACTIVE_BOTS[user_id]["startedAt"] = datetime.now(timezone.utc).isoformat()
-        await emit_log(user_id, f"♻️ SESSION RESET: Balance updated to ${ui_capital}")
+        
+        # 🚀 UX FIX: Wipe old tracking metrics so the UI layout loads on a crisp slate
+        ACTIVE_BOTS[user_id]["trade_history"] = []
+        ACTIVE_BOTS[user_id]["logs"] = []
+        ACTIVE_BOTS[user_id]["positions"] = []
+        ACTIVE_BOTS[user_id]["equityCurve"] = [{"time": datetime.now().isoformat(), "balance": ui_capital, "confidence": 50}]
+        
+        await emit_log(user_id, f"♻️ SESSION INITIALIZED: Fresh slate at ${ui_capital}")
     else:
         ACTIVE_BOTS[user_id] = {
             "status": "running",
@@ -1090,6 +1123,7 @@ async def start_bot(data: BotStartRequest):
             await emit_log(user_id, f"⚡ TRADE DURING STARTUP: {side} Position Detected @ ${pos['entry']}")
         
         await emit_log(user_id, f"♻️ SESSION STARTED: Balance updated to ${ui_capital}")
+        
     DatabaseHandler.save_state(user_id, ACTIVE_BOTS[user_id])
     
     await emit_status(user_id, {
@@ -1225,7 +1259,8 @@ async def get_status(userId: str):
             "positions": bot.get("positions", []),
             "startedAt": bot.get("startedAt"),
             "config": bot.get("config"),
-            "candles": bot.get("candles", [])
+            "candles": bot.get("candles", []),
+            "trade_history": bot.get('trade_history', [])
         }
     return {"status": "inactive", "balance": 0}
 

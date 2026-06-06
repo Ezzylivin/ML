@@ -1,6 +1,17 @@
+import sys
+import os
+
+# ============================================================
+# ⚙️ RUNTIME ENVIRONMENT PATH INJECTION
+# ============================================================
+current_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals() else os.getcwd()
+sys.path.append(current_dir)
+sys.path.append(os.path.join(current_dir, "Project", "ML"))
+if "/root/Project/ML" not in sys.path:
+    sys.path.append("/root/Project/ML")
+
 import asyncio
 import logging
-import os
 import joblib
 import json
 import re
@@ -29,7 +40,7 @@ from app.verify.engineer_and_train import apply_mega_features
 from app.services.socket_emitter import emit_log, emit_status
 
 # ============================================================
-# 🔧 FIX #1: Import from config2 instead of redefining
+# 🔧 IMPORT CONFIGURATION
 # ============================================================
 from app.config2 import (
     MODEL_DIR,
@@ -53,7 +64,7 @@ ACTIVE_BOTS = {}
 TASK_REGISTRY = {}
 
 # ============================================================
-# 🔧 FIX #4: MODEL CACHE (Tier 3, but critical for performance)
+# 🧠 PREDICTOR MODEL IN-MEMORY CACHE
 # ============================================================
 _PREDICTOR_CACHE: Dict[str, StackingPredictor] = {}
 
@@ -67,7 +78,7 @@ def get_cached_predictor(symbol: str, timeframe: str = "1h") -> StackingPredicto
 
 
 # ==========================================
-# 🗄️ 0. DATABASE HANDLER
+# 🗄️ DATABASE HANDLER STATE STORAGE
 # ==========================================
 class DatabaseHandler:
     DB_FILE = "bot_state.db"
@@ -219,7 +230,7 @@ async def validation_exception_handler(request, exc):
     return JSONResponse(status_code=422, content={"detail": exc.errors(), "body": exc.body})
 
 # ==========================================
-# BACK TEST DATA
+# HISTORICAL DATA DATA MANAGEMENT LAYER
 # ==========================================
 def load_data_robust(symbol, timeframe):
     possible_paths = [
@@ -324,7 +335,7 @@ async def ensure_full_data(symbol, timeframe, start_str, end_str, *args, **kwarg
 
 
 # ==========================================
-# Diagnostic Layer
+# DIAGNOSTIC LAYOUT METRIC COMPILER
 # ==========================================
 class DiagnosticLayer:
     @staticmethod
@@ -342,15 +353,12 @@ class DiagnosticLayer:
         strategies = config.get('strategies', [])
         try:
             current_price = float(df['close'].iloc[-1])
-            ema200_val = ta.ema(df['close'], length=200).iloc[-1]
-            is_uptrend = current_price > ema200_val
             if conf < ui_limit:
                 return f"🛑 AI VETO: Needs {int(ui_limit*100)}% (At {int(conf*100)}%)"
             
             pending = []
             for strat in strategies:
                 code = strat.get('code')
-                p = strat.get('params', {})
                 if code == "rsi_threshold":
                     val = ta.rsi(df['close']).iloc[-1]
                     target = 30 if current_price < ta.ema(df['close'], 200).iloc[-1] else 70
@@ -403,47 +411,43 @@ class DiagnosticLayer:
 
 
 # ============================================================
-# 🔮 10-STRATEGY PREDICTIVE ENSEMBLE REGIME OPTIMIZER
+# 🔮 FIX 1: OPTIMIZED REGIME OPTIMIZER (NO INNER MUTATIONS)
 # ============================================================
 class PredictiveRegimeOptimizer:
     @staticmethod
     def dynamically_tune_strategies(bot_config: Dict[str, Any], ai_score: float, current_adx: float) -> List[Dict[str, Any]]:
         """
-        Dynamically coordinates all 10 system indicators into highly specific, 
-        synergetic engine subsets depending upon the forward projected AI market phase.
+        Returns the best strategy set for the current regime WITHOUT
+        overwriting the user's saved config. Caller must use the
+        returned value as a local variable only.
         """
         if bot_config.get("comboConfig", {}).get("combinationRule") == "AND":
             return bot_config.get("strategies", [])
 
-        # REGIME 1: Parabolic Bullish Momentum Expansion (4 Modules Activated)
         if ai_score >= 0.68 or (ai_score > 0.55 and current_adx > 30):
             return [
-                {"code": "supertrend", "params": {"st_atr": 10, "st_factor": 3.0}},
-                {"code": "pa_breakout", "params": {"lookback": 20, "buffer": 0.01}},
-                {"code": "ema_cloud", "params": {"fast_ema": 9, "slow_ema": 21}},
+                {"code": "supertrend",    "params": {"st_atr": 10, "st_factor": 3.0}},
+                {"code": "pa_breakout",   "params": {"lookback": 20, "buffer": 0.01}},
+                {"code": "ema_cloud",     "params": {"fast_ema": 9, "slow_ema": 21}},
                 {"code": "sma_crossover", "params": {"fast_sma": 20, "slow_sma": 100}}
             ]
-
-        # REGIME 2: Violent Bearish Breakout / Liquidation (4 Modules Activated)
         elif ai_score <= 0.32 or (ai_score < 0.45 and current_adx > 30):
             return [
-                {"code": "supertrend", "params": {"st_atr": 10, "st_factor": 2.5}},
-                {"code": "atr_breakout", "params": {"atr_length": 14, "multiplier": 1.5}},
+                {"code": "supertrend",     "params": {"st_atr": 10, "st_factor": 2.5}},
+                {"code": "atr_breakout",   "params": {"atr_length": 14, "multiplier": 1.5}},
                 {"code": "macd_crossover", "params": {"fast": 12, "slow": 26, "signal": 9}},
-                {"code": "vol_profile", "params": {"vol_ma": 20, "threshold": 1.2}}
+                {"code": "vol_profile",    "params": {"vol_ma": 20, "threshold": 1.2}}
             ]
-
-        # REGIME 3: Mean-Reverting Choppy / Range Bound Market Structure (3 Modules Activated)
         else:
             return [
-                {"code": "bb_fade", "params": {"bb_period": 20, "bb_std": 2.0}},
-                {"code": "rsi_threshold", "params": {"rsi_length": 14, "oversold": 30, "overbought": 70}},
-                {"code": "stoch", "params": {"k_period": 14, "d_period": 3}}
+                {"code": "bb_fade",        "params": {"bb_period": 20, "bb_std": 2.0}},
+                {"code": "rsi_threshold",  "params": {"rsi_length": 14, "oversold": 30, "overbought": 70}},
+                {"code": "stoch",          "params": {"k_period": 14, "d_period": 3}}
             ]
 
 
 # ==========================================
-# 🧠 1. NEURAL PREDICTOR
+# 🧠 NEURAL MACHINE LEARNING PREDICTOR
 # ==========================================
 class NeuralPredictor:
     @staticmethod
@@ -459,7 +463,7 @@ class NeuralPredictor:
 
 
 # ==========================================
-# Packet Data
+# PACKET FORMATTING LAYER
 # ==========================================
 async def process_data_packet(df: pd.DataFrame, strategies: list) -> list:
     df, feats = apply_mega_features(df)
@@ -479,7 +483,7 @@ async def process_data_packet(df: pd.DataFrame, strategies: list) -> list:
 
 
 # ============================================================
-# 🔧 UPGRADED 2 & 10-STRATEGY WEIGHTED SIGNAL SYSTEM
+# 🔧 STRATEGY BRAIN INDICATOR SIGNAL COMPILER
 # ============================================================
 class StrategyBrain:
     @staticmethod
@@ -497,7 +501,6 @@ class StrategyBrain:
         lower, mid, upper = bb.iloc[-1, 0], bb.iloc[-1, 1], bb.iloc[-1, 2]
         pr = int((current_price - lower) / (upper - lower) * 100)
 
-        # 🔧 UPGRADE 1: WEIGHTED VOTE SYSTEM
         weighted_votes = 0.0
 
         for strat in strategies:
@@ -508,7 +511,8 @@ class StrategyBrain:
 
             try:
                 if code == "rsi_threshold":
-                    rsi = ta.rsi(df_raw['close'], length=int(p.get('rsi_length', 14))).iloc[-1]
+                    digits = int(p.get('rsi_length', 14))
+                    rsi = ta.rsi(df_raw['close'], length=digits).iloc[-1]
                     dist = min(abs(rsi - 30), abs(rsi - 70))
                     confidence = max(0.1, min(1.0, 1.0 - (dist / 40)))
                     if rsi < p.get('oversold', 30): raw_vote = 1; active_thoughts.append("RSI Low")
@@ -576,43 +580,21 @@ class StrategyBrain:
                     confidence = 0.5
 
                 signals_map[code] = confidence
-                votes += raw_vote  # Keep integer votes for AND/OR logic
-                weighted_votes += raw_vote * confidence  # Weighted signal strength
+                votes += raw_vote  
+                weighted_votes += raw_vote * confidence  
 
             except Exception:
                 signals_map[code] = 0.0
 
-        # ML Gate
         is_short = current_price < ema200
         ui_limit = float(config.get('mlThresholdShort', 0.55)) if is_short else float(config.get('mlThresholdLong', 0.55))
         conf = NeuralPredictor.get_prediction(config.get('mlModel', 'stacking'), df_ai, symbol=symbol)
 
         if config.get('mlMode') == 'off':
             gate_passed = True
-            logic_desc = f"📊 LOGIC: NEURAL GATE BYPASSED (AI Score: {int(conf*100)}%) 🟡"
         else:
             gate_passed = conf >= ui_limit
-            logic_desc = f"📊 LOGIC: {'SHORT' if is_short else 'LONG'} GATE {'PASSED' if gate_passed else 'VETOED'} ({int(conf*100)}% vs {int(ui_limit*100)}%) {'🟢' if gate_passed else '🔴'}"
 
-        signal_names = " + ".join(active_thoughts) if active_thoughts else "Scanning Setup"
-        gap_val = int(abs(current_price - ema50))
-        intent_desc = f"🎯 INTENT: STALKING {'SHORT' if is_short else 'LONG'} ({signal_names} | Gap: ${gap_val}) {'🔴' if is_short else '🟢'}"
-        trend_dist = current_price - ema200
-        trend_text = f"📡 TREND: {'UP' if trend_dist > 0 else 'DOWN'} (Price ${int(abs(trend_dist))} {'above' if trend_dist > 0 else 'below'} 200EMA)"
-        spread = ema20 - ema50
-        bias_text = f"⚖️ BIAS: {'BULLISH' if spread > 0 else 'BEARISH'} (EMA Gap: ${int(abs(spread))})"
-        mindset_str = "⚠️ OVEREXTENDED" if pr >= 80 else "🎯 ACCUMULATION" if pr <= 20 else "⚖️ EQUILIBRIUM"
-        mindset_text = f"🤖 MINDSET: {mindset_str} ({pr}% of BB Range)"
-
-        numeric_details = {
-            "market": {
-                "logic": logic_desc, "intent": intent_desc, "trend": trend_text,
-                "bias": bias_text, "mindset": mindset_text,
-                "weighted_signal_strength": round(weighted_votes, 3)
-            }
-        }
-
-        # Final signal using BOTH binary votes (for AND/OR rule) and weighted strength
         rule = config.get('comboConfig', {}).get('combinationRule', 'OR')
         final_sig = 0
 
@@ -625,11 +607,11 @@ class StrategyBrain:
                 if votes > 0 and weighted_votes >= min_weighted: final_sig = 1
                 elif votes < 0 and weighted_votes <= -min_weighted: final_sig = -1
 
-        return final_sig, active_thoughts, numeric_details, conf, signals_map
+        return final_sig, active_thoughts, {}, conf, signals_map
 
 
 # ============================================================================
-# 🚀 3. THE HEARTBEAT (Perfect Top-Down Synchronized Calculation Loop)
+# 🚀 FIX 2: 3. THE HEARTBEAT (Perfect Top-Down Synchronized Calculation Loop)
 # ============================================================================
 async def live_neural_heartbeat(user_id: str):
     signal_has_reset = True
@@ -673,8 +655,9 @@ async def live_neural_heartbeat(user_id: str):
             fee_rate = KRAKEN_TAKER_FEE if use_margin else DEFAULT_TAKER_FEE
 
             try:
-
+                # Core high-fidelity time vector instantiation at runtime block entry
                 current_time = datetime.now(timezone.utc)
+
                 # ------------------------------------------------------------
                 # TIER 1: CORE MARKET FEED FETCHING & RAW INDICATORS
                 # ------------------------------------------------------------
@@ -694,10 +677,9 @@ async def live_neural_heartbeat(user_id: str):
                 df_closed_history = df_raw.iloc[:-1].copy()
                 df_ai, _ = await asyncio.to_thread(apply_mega_features, df_closed_history)
 
-                # Initialize deep mathematical indicators immediately to resolve scope dependencies
                 current_ema200 = float(ta.ema(df_raw['close'], length=200).iloc[-1])
                 current_atr = float(ta.atr(df_raw['high'], df_raw['low'], df_raw['close'], length=14).iloc[-1])
-
+                
                 atr_tp_mult = float(params.get('atr_tp_mult', config.get('atrTpMultiplier', 3.0)))
                 atr_sl_mult = float(params.get('atr_sl_mult', config.get('atrSlMultiplier', 1.5)))
                 
@@ -713,43 +695,57 @@ async def live_neural_heartbeat(user_id: str):
                     vol_ratio = 1.0
 
                 # ------------------------------------------------------------
-                # TIER 2: AI COUNCILS & STRATEGY SIGNAL GENERATION
+                # TIER 2: AI COUNCIL — SINGLE PREDICTION, SHARED EVERYWHERE
                 # ------------------------------------------------------------
-                conf_score = NeuralPredictor.get_prediction(config.get('mlModel', 'stacking'), df_ai, symbol=ticker_symbol)
+                conf_score = NeuralPredictor.get_prediction(
+                    config.get('mlModel', 'stacking'), df_ai, symbol=ticker_symbol
+                )
 
                 if config.get('mlMode') == 'on':
-                    optimized_modules = PredictiveRegimeOptimizer.dynamically_tune_strategies(config, conf_score, current_adx)
-                    config['strategies'] = optimized_modules
-                    bot['config']['strategies'] = optimized_modules
-                    strategies = optimized_modules 
-                
+                    active_strategies = PredictiveRegimeOptimizer.dynamically_tune_strategies(
+                        config, conf_score, current_adx
+                    )
+                else:
+                    active_strategies = config.get('strategies', strategies)
+
+                temp_config = {**config, 'strategies': active_strategies}
+
                 sig, thoughts, nums, score, signals_map = StrategyBrain.calculate_signals(
-                    df_raw, df_ai, config, 0.5, 0.5, symbol=ticker_symbol
+                    df_raw, df_ai, temp_config, 0.5, 0.5, symbol=ticker_symbol
                 )
 
                 # ------------------------------------------------------------
-                # TIER 3: CHRONOLOGICAL PROP-MAPPING & SHORT FILTERS
+                # TIER 3: PROP-MAPPING
                 # ------------------------------------------------------------
                 sentiment = "STRONG BUY" if score > 0.85 else "BUY" if score > 0.70 else "NEUTRAL"
                 if score < 0.20: sentiment = "STRONG SELL"
                 elif score < 0.35: sentiment = "SELL"
 
                 last_pos = bot['positions'][-1] if bot['positions'] else None
-                climb_satisfied = (score >= last_pos.get('entry_conf', 0) + 0.10) if last_pos else True
+                if last_pos:
+                    pos_is_profitable = (
+                        (last_pos['type'] == 'long'  and current_price > last_pos['entry']) or
+                        (last_pos['type'] == 'short' and current_price < last_pos['entry'])
+                    )
+                    climb_satisfied = (
+                        score >= last_pos.get('entry_conf', 0) + 0.10 and
+                        pos_is_profitable
+                    )
+                else:
+                    climb_satisfied = True
 
-                # Interceptor checks for Spot account short restrictions
                 is_short_allowed = True
                 if sig == -1 and not config.get('enable_shorting', False):
                     is_short_allowed = False
 
-                #if sig == -1 and len(bot['positions']) == 0 and not is_short_allowed:
-                    #sig = 0
-
-                upnl = sum([(current_price - p['entry']) * p['size'] if p['type'] == 'long' else (p['entry'] - current_price) * p['size'] for p in bot['positions']])
+                upnl = sum([
+                    (current_price - p['entry']) * p['size'] if p['type'] == 'long'
+                    else (p['entry'] - current_price) * p['size']
+                    for p in bot['positions']
+                ])
                 current_equity = bot['balance'] + upnl
 
                 active_summary = ""
-                buffer_bar = "[----------]" 
                 if bot['positions']:
                     p = bot['positions'][-1]
                     dist_to_stop = abs(current_price - p['tsl'])
@@ -758,19 +754,23 @@ async def live_neural_heartbeat(user_id: str):
                     active_summary = f"⚡ ACTIVE: {len(bot['positions'])} POS (${upnl:,.2f}) | TSL {buffer_bar} {stop_pct}% | "
 
                 # ------------------------------------------------------------
-                # TIER 4: DYNAMIC EXECUTIONS RISKS FILTERS AND RISK GATEWAY
+                # TIER 4: RISK GATEWAY
                 # ------------------------------------------------------------
-                ui_limit = float(config.get('mlThresholdShort', 0.55)) if current_price < current_ema200 else float(config.get('mlThresholdLong', 0.55))
-                waiting_msg = DiagnosticLayer.get_pending_conditions(df_raw, config, score, ui_limit)
+                ui_limit = (
+                    float(config.get('mlThresholdShort', 0.55))
+                    if current_price < current_ema200
+                    else float(config.get('mlThresholdLong', 0.55))
+                )
+                waiting_msg = DiagnosticLayer.get_pending_conditions(df_raw, temp_config, score, ui_limit)
 
-                base_threshold = ui_limit  
+                base_threshold = ui_limit
                 if current_adx > 30:
-                    adaptive_threshold = max(0.10, base_threshold - 0.05)
+                    adaptive_threshold = max(0.45, base_threshold - 0.05)
                 elif current_adx < 20:
-                    adaptive_threshold = min(0.95, base_threshold + 0.05)
+                    adaptive_threshold = min(0.80, base_threshold + 0.05)
                 else:
                     adaptive_threshold = base_threshold
-                
+
                 adaptive_gate = score >= adaptive_threshold if config.get('mlMode') == 'on' else True
 
                 recent_trades = [t for t in bot.get('trade_history', []) if t.get('type') == 'exit'][-5:]
@@ -780,81 +780,90 @@ async def live_neural_heartbeat(user_id: str):
                     else: break
 
                 if consecutive_losses >= 3:
-                    adaptive_threshold = min(0.85, adaptive_threshold + (consecutive_losses - 2) * 0.03)
+                    adaptive_threshold = min(0.80, adaptive_threshold + (consecutive_losses - 2) * 0.03)
                     if config.get('mlMode') == 'on':
                         adaptive_gate = score >= adaptive_threshold
-                        
                     if consecutive_losses == 3 and (datetime.now().timestamp() - last_log >= 15):
                         await emit_log(user_id, f"⚠️ COLD STREAK: {consecutive_losses} losses — raising bar to {int(adaptive_threshold*100)}%")
 
                 atr_pct = (current_atr / current_price) * 100
-                is_volatility_safe = atr_pct <= float(config.get('maxAtrPct', 3.0))
+                min_atr_pct = float(config.get('minAtrPct', 0.3))
+                max_atr_pct = float(config.get('maxAtrPct', 3.0))
+                is_volatility_safe = min_atr_pct <= atr_pct <= max_atr_pct
 
                 max_dd_pct = float(config.get('maxDailyLoss', 5.0)) / 100.0
                 is_circuit_breaker_tripped = bot['balance'] <= (start_capital * (1.0 - max_dd_pct))
 
-                # Clean structural loop state tracking reset architecture
                 if len(bot['positions']) == 0 and sig == 0:
                     signal_has_reset = True
                 elif len(bot['positions']) > 0:
                     signal_has_reset = False
-
                 market_gate_passed = signal_has_reset if len(bot['positions']) == 0 else True
 
-                # 🌟 FIX SOLUTION: Explicitly compile adx_trending before passing to safety filter matrices
                 try:
                     adx_trending = current_adx >= float(config.get('minAdx', 20.0))
                 except Exception:
                     adx_trending = True
 
-                volume_confirmed = True  # Permanently bypassed per volume settings configuration
+                volume_confirmed = vol_ratio >= float(config.get('minVolRatio', 0.8))
 
-                rule = config.get('comboConfig', {}).get('combinationRule', 'OR')
-                if config.get('mlMode') == 'off' or rule == "OR":
-                    is_trend_aligned = True
-                else:
-                    is_trend_aligned = (sig == 1 and current_price > current_ema200) or (sig == -1 and current_price < current_ema200)
+                is_trend_aligned = (
+                    (sig == 1 and current_price > current_ema200) or
+                    (sig == -1 and current_price < current_ema200) or
+                    (sig == 0)  
+                )
+
+                min_gap_seconds = float(config.get('minMinutesBetweenTrades', 60)) * 60
+                time_gate_passed = (
+                    not bot.get('last_trade_time') or
+                    (current_time - datetime.fromisoformat(bot['last_trade_time'])).total_seconds() >= min_gap_seconds
+                )
 
                 all_filters_pass = (
-                    is_volatility_safe and 
-                    not is_circuit_breaker_tripped and 
+                    is_volatility_safe and
+                    not is_circuit_breaker_tripped and
                     is_trend_aligned and
-                    adx_trending and 
-                    volume_confirmed and 
-                    adaptive_gate and 
-                    market_gate_passed and 
-                    is_short_allowed
+                    adx_trending and
+                    volume_confirmed and
+                    adaptive_gate and
+                    market_gate_passed and
+                    is_short_allowed and
+                    time_gate_passed  
                 )
 
                 # ------------------------------------------------------------
-                # TIER 5: TELEMETRY TRANSMISSION PACKAGING (WebSockets Sync)
+                # TIER 5: TELEMETRY
                 # ------------------------------------------------------------
                 if "vetoed_signals" not in bot:
                     bot["vetoed_signals"] = []
 
                 raw_sig = 0
-                votes = sum([1 if signals_map.get(s['code'], 0) > 0.5 else -1 for s in strategies])
+                votes = sum([1 if signals_map.get(s['code'], 0) > 0.5 else -1 for s in active_strategies])
+                rule = config.get('comboConfig', {}).get('combinationRule', 'OR')
                 if rule == "AND":
-                    if votes >= len(strategies): raw_sig = 1
-                    elif votes <= -len(strategies): raw_sig = -1
+                    if votes >= len(active_strategies): raw_sig = 1
+                    elif votes <= -len(active_strategies): raw_sig = -1
                 else:
                     if votes > 0: raw_sig = 1
                     elif votes < 0: raw_sig = -1
 
                 if raw_sig != 0 and score < ui_limit:
-                    if not bot["vetoed_signals"] or (datetime.now(timezone.utc) - datetime.fromisoformat(bot["vetoed_signals"][-1]["time"])).total_seconds() > 300:
+                    if not bot["vetoed_signals"] or (current_time - datetime.fromisoformat(bot["vetoed_signals"][-1]["time"])).total_seconds() > 300:
                         bot["vetoed_signals"].append({
-                            "time": datetime.now(timezone.utc).isoformat(), "signal": "Long" if raw_sig == 1 else "Short",
+                            "time": current_time.isoformat(), "signal": "Long" if raw_sig == 1 else "Short",
                             "conf_score": round(score, 4), "limit": round(ui_limit, 4), "price": current_price
                         })
                         if len(bot["vetoed_signals"]) > 100: bot["vetoed_signals"].pop(0)
-                
+
                 if len(bot['positions']) < int(config.get('maxPyramiding', 1)):
                     hunting_summary = f"🏹 STALKING LEG {len(bot['positions'])+1}: {int(score*100)}% ({sentiment}) | {waiting_msg}"
                 else:
                     hunting_summary = "✅ PYRAMID FULL: Managing Exits"
 
-                targets_str = " | ".join([f"{s['code'].upper()}: {DiagnosticLayer.render_progress(int(signals_map.get(s['code'], 0) * 100), 100, reverse=True)}" for s in strategies])
+                targets_str = " | ".join([
+                    f"{s['code'].upper()}: {DiagnosticLayer.render_progress(int(signals_map.get(s['code'], 0) * 100), 100, reverse=True)}"
+                    for s in active_strategies
+                ])
                 combined_status = f"{active_summary}{hunting_summary} | 🔍 {targets_str}"
 
                 now_ts = datetime.now().timestamp()
@@ -863,58 +872,33 @@ async def live_neural_heartbeat(user_id: str):
                     last_log = now_ts
 
                 if (now_ts - last_ui_update >= 10):
-                    exposure_pct = round((sum([p['entry'] * p['size'] for p in bot['positions']]) / current_equity) * 100, 1) if current_equity > 0 else 0
-                    latest_candles = await process_data_packet(df_raw, strategies)
-                    
+                    exposure_pct = round(
+                        (sum([p['entry'] * p['size'] for p in bot['positions']]) / current_equity) * 100, 1
+                    ) if current_equity > 0 else 0
+                    latest_candles = await process_data_packet(df_raw, active_strategies)
+
                     if config.get('mlMode') == 'on':
                         if conf_score >= 0.68 or (conf_score > 0.55 and current_adx > 30):
                             deployed_gear = "Trend Armor (SuperTrend, PA Breakout, EMA Cloud, SMA Cross)"
                         elif conf_score <= 0.32 or (conf_score < 0.45 and current_adx > 30):
                             deployed_gear = "Capitulation Armor (SuperTrend, ATR Breakout, MACD Cross, Vol Profile)"
                         else:
-                            deployed_gear = "Range Armor (Bollinger Bands, RSI Threshold, Stochastic Oscillator)"
+                            deployed_gear = "Range Armor (Bollinger Bands, RSI Threshold, Stochastic)"
                     else:
-                        deployed_gear = f"Custom Suite ({', '.join([s['code'].upper() for s in strategies])})"
+                        deployed_gear = f"Custom Suite ({', '.join([s['code'].upper() for s in active_strategies])})"
 
                     if len(bot['positions']) >= max_p:
                         regime_title = "Portfolio Full"
-                        regime_desc = f"Capital allocation optimized. The bot has safely filled all available risk slots ({len(bot['positions'])}/{max_p}) to maintain institutional asset diversification. Trading pipelines are locked; the engine is now exclusively managing active trailing stops and profit targets."
+                        regime_desc = f"Capital allocation optimized. The bot has filled all slots ({len(bot['positions'])}/{max_p}). Pipelines are locked; managing exits."
                     elif sig != 0 and all_filters_pass:
                         regime_title = "Executing Entry"
-                        regime_desc = f"All quantitative and structural check-gates cleared! Technical and neural systems have achieved absolute confluence. Dispatching open market {'BUY (Long)' if sig == 1 else 'SELL (Short)'} order route to the exchange order book at ${current_price:,.2f}."
+                        regime_desc = f"All checkpoints cleared! Technical and neural confluence achieved. Dispatching market route at ${current_price:,.2f}."
                     elif sig != 0 and not all_filters_pass:
                         regime_title = "Entry Guarded"
-                        reasons_snapshot = []
-                        if not is_short_allowed:
-                            reasons_snapshot.append(f"Capital Type Mismatch: A technical sell model triggered a SHORT entry request, but your profile configuration is strictly set to SPOT mode. To protect capital, the bot has blocked it. Spot portfolios only allow asset appreciation; holding for a compliant buy signal.")
-                        elif not is_trend_aligned: 
-                            reasons_snapshot.append(f"Macro Trend Protection: To maximize win-rate safety, the bot is waiting for live price (${current_price:,.2f}) to print a definitive structural breakout {'above' if sig == 1 else 'below'} the institutional 200 EMA baseline (${current_ema200:,.2f}) to ensure we are trading in harmony with long-term market direction.")
-                        elif not adx_trending: 
-                            reasons_snapshot.append(f"Chop-Loss Mitigation: The price is grinding sideways, exposing trades to bad fills. The engine is waiting for trend velocity (ADX) to cross back above our required momentum floor of {float(config.get('minAdx', 20.0)):.1f} to ensure a healthy, sustained price expansion is underway (Current ADX: {current_adx:.1f}).")
-                        elif not volume_confirmed: 
-                            reasons_snapshot.append(f"Institutional Volume Filter: The current price breakout lacks institutional backing. The engine is waiting for network transaction volume to cross above {float(config.get('minVolRatio', 0.8)):.2f}x of the 20-period moving average to prove the move is driven by smart money instead of a retail fake-out (Current Vol Ratio: {vol_ratio:.2f}x).")
-                        elif not is_volatility_safe: 
-                            reasons_snapshot.append(f"Extreme Volatility Defense: Market price swings are too erratic for a predictable entry. The bot is waiting for price action to stabilize and compress below our maximum security ceiling of {float(config.get('maxAtrPct', 3.0)):.1f}% of price to guarantee reliable stop-loss insurance coverage (Current ATR Volatility: {atr_pct:.2f}%).")
-                        elif not adaptive_gate: 
-                            reasons_snapshot.append(f"AI Council Veto: While individual chart indicators want to enter, our machine learning model smells a trap. The bot is withholding entry until our Ensemble Stacking Predictor's unified confidence score meets or breaches our strict risk safety threshold of {int(adaptive_threshold*100)}% (Current AI Confidence: {int(score*100)}%).")
-                        elif not market_gate_passed: 
-                            reasons_snapshot.append(f"Execution Timing Guard: Technical indicators are highly overextended. The bot is pausing execution to prevent 'chasing the market' late at the tip of a price leg. Waiting for active strategy modules to cleanly cycle back to a Neutral (0) baseline for a safer entry point.")
-                        elif is_circuit_breaker_tripped: 
-                            reasons_snapshot.append(f"Drawdown Protection Active: The bot has executed an automatic risk shutdown to insulate your capital. Net equity has breached your protective daily defensive drawdown firewall threshold of {float(config.get('maxDailyLoss', 5.0)):.1f}%. Systems are frozen until the daily interval resets to maintain strict capital preservation discipline.")
-                        
-                        regime_desc = reasons_snapshot[0] if reasons_snapshot else "Defensive safety filters engaged. Holding routing execution until downstream matrix parameters optimize."
+                        regime_desc = "Defensive logic parameters engaged. Holding execution tracking blocks until signals optimize."
                     else:
-                        has_rsi_indicators = any(s['code'] == 'rsi_threshold' for s in strategies) or any(s['code'] == 'stoch' or s['code'] == 'bb_fade' for s in strategies)
-                        has_trend_indicators = any(s['code'] == 'pa_breakout' for s in strategies) or any(s['code'] == 'supertrend' or s['code'] == 'atr_breakout' for s in strategies)
-                        if has_rsi_indicators and has_trend_indicators and any(signals_map.get(s['code'], 0) >= 0.75 for s in strategies):
-                            regime_title = "Indicators Disagree"
-                            regime_desc = "System Standoff: Technical sub-modules are conflicting. Mean-reverting tools indicate the asset is overbought/oversold, while trend-following blocks show breakout momentum. Capital remains safe in cash until our quantitative layers achieve absolute agreement."
-                        elif consecutive_losses >= 3:
-                            regime_title = "Cold-Streak Shield Active"
-                            regime_desc = f"Strategic Drawdown Shield: Following {consecutive_losses} consecutive small losses, the bot has automatically raised its security requirements. Mathematical entry parameters have been tightened by +{int((consecutive_losses - 2) * 3)}% to insulate your balance and fish exclusively for gold-medal setups."
-                        else:
-                            regime_title = "Quiet Market Structure"
-                            regime_desc = f"Consolidation Phase: The market has flatlined sideways at ${current_price:,.2f} within a balanced consolidation range. Waiting for indicator triggers or an AI confidence spike past {int(adaptive_threshold*100)}% to capitalize on an explosive breakout."
+                        regime_title = "Quiet Market Structure"
+                        regime_desc = f"Consolidation Phase: Market flatlined at ${current_price:,.2f}. Standing guard in liquidity cash position."
 
                     closed_trades = [t for t in bot.get('trade_history', []) if t.get('type') == 'exit']
                     total_closed = len(closed_trades)
@@ -923,7 +907,7 @@ async def live_neural_heartbeat(user_id: str):
                         win_rate = round((wins / total_closed) * 100, 1)
                         gross_profits = sum([float(t.get('pnl', 0)) for t in closed_trades if float(t.get('pnl', 0)) > 0])
                         gross_losses = abs(sum([float(t.get('pnl', 0)) for t in closed_trades if float(t.get('pnl', 0)) < 0]))
-                        profit_factor = round(gross_profits / gross_losses, 2) if gross_losses > 0 else round(gross_profits, 2) if gross_profits > 0 else 1.0
+                        profit_factor = round(gross_profits / gross_losses, 2) if gross_losses > 0 else (round(gross_profits, 2) if gross_profits > 0 else 1.0)
                     else:
                         win_rate, profit_factor = 0.0, 1.0
 
@@ -940,34 +924,53 @@ async def live_neural_heartbeat(user_id: str):
                     bot["profitFactor"] = profit_factor
 
                     await emit_status(user_id, {
-                        "status": "running", "currentBalance": bot["currentBalance"], "exposure": bot["exposure"],
-                        "activePositions": bot['positions'], "unrealizedPnl": bot["unrealizedPnl"], "tradeMarkers": bot['trade_history'], 
-                        "candles": bot["candles"], "currentConfidence": bot["currentConfidence"], "signalsMap": bot["signalsMap"],
-                        "initialCapital": start_capital, "aiRegimeTitle": bot["aiRegimeTitle"], "aiRegimeDesc": bot["aiRegimeDesc"],
-                        "aiDeployedGear": bot["aiDeployedGear"], "winRate": bot["winRate"], "profitFactor": bot["profitFactor"]
+                        "status": "running",
+                        "currentBalance": bot["currentBalance"],
+                        "exposure": bot["exposure"],
+                        "activePositions": bot['positions'],
+                        "unrealizedPnl": bot["unrealizedPnl"],
+                        "tradeMarkers": bot['trade_history'],
+                        "candles": bot["candles"],
+                        "currentConfidence": bot["currentConfidence"],
+                        "signalsMap": bot["signalsMap"],
+                        "initialCapital": start_capital,
+                        "aiRegimeTitle": bot["aiRegimeTitle"],
+                        "aiRegimeDesc": bot["aiRegimeDesc"],
+                        "aiDeployedGear": bot["aiDeployedGear"],
+                        "winRate": bot["winRate"],
+                        "profitFactor": bot["profitFactor"]
                     })
-                    bot["equityCurve"].append({"time": datetime.now().isoformat(), "balance": round(current_equity, 2), "confidence": int(score * 100)})
+                    bot["equityCurve"].append({
+                        "time": datetime.now().isoformat(),
+                        "balance": round(current_equity, 2),
+                        "confidence": int(score * 100)
+                    })
                     if len(bot["equityCurve"]) > 300: bot["equityCurve"].pop(0)
                     last_ui_update = now_ts
 
                 # ------------------------------------------------------------
-                # TIER 6: REJECTION CONSOLE REGISTRY FIELD LOGGER
+                # TIER 6: REJECTION LOGGER
                 # ------------------------------------------------------------
                 if sig != 0 and not all_filters_pass:
                     reasons = []
+                    if not time_gate_passed:
+                        elapsed = (current_time - datetime.fromisoformat(bot['last_trade_time'])).total_seconds() / 60 if bot.get('last_trade_time') else 0
+                        reasons.append(f"time gate ({elapsed:.0f}/{min_gap_seconds/60:.0f} min)")
                     if not is_short_allowed: reasons.append("Spot mode cannot short sell")
-                    if not is_volatility_safe: reasons.append(f"ATR Volatility too high ({atr_pct:.1f}%)")
-                    if is_circuit_breaker_tripped: reasons.append("Daily Circuit Breaker Tripped")
+                    if not is_volatility_safe:
+                        if atr_pct < min_atr_pct: reasons.append(f"ATR {atr_pct:.2f}% too flat (min {min_atr_pct}%)")
+                        else: reasons.append(f"ATR {atr_pct:.1f}% too high (max {max_atr_pct}%)")
+                    if is_circuit_breaker_tripped: reasons.append("Daily drawdown limit hit")
                     if not is_trend_aligned: reasons.append("Trend misaligned with 200 EMA")
-                    if not adx_trending: reasons.append(f"ADX Momentum too low ({current_adx:.0f})")
-                    if not volume_confirmed: reasons.append(f"Volume weak ({vol_ratio:.2f}x)")
-                    if not adaptive_gate: reasons.append(f"AI Veto (Confidence {int(score*100)}% < Required {int(adaptive_threshold*100)}%)")
-                    if not market_gate_passed: reasons.append("Signal Guard active (Waiting for strategy to reset to Neutral)")
-                    if not reasons: reasons.append("Execution lock (Pre-flight safety check failed to clear)")
+                    if not adx_trending: reasons.append(f"ADX {current_adx:.0f} below minimum {float(config.get('minAdx', 20.0)):.0f}")
+                    if not volume_confirmed: reasons.append(f"Volume {vol_ratio:.2f}x below minimum {float(config.get('minVolRatio', 0.8)):.1f}x")
+                    if not adaptive_gate: reasons.append(f"AI {int(score*100)}% below threshold {int(adaptive_threshold*100)}%")
+                    if not market_gate_passed: reasons.append("Waiting for signal reset to neutral")
+                    if not reasons: reasons.append("Pre-flight check failed")
                     await emit_log(user_id, f"⛔ ENTRY BLOCKED: {', '.join(reasons)}")
 
                 # ------------------------------------------------------------
-                # TIER 7: LIVE TRANSACTION DISPATCH (ENTRY OPERATIONS)
+                # TIER 7: ENTRY DISPATCH
                 # ------------------------------------------------------------
                 if len(bot['positions']) < max_p and all_filters_pass:
                     if (sig == 1 and climb_satisfied) or (sig == -1 and climb_satisfied):
@@ -988,16 +991,26 @@ async def live_neural_heartbeat(user_id: str):
                                 }) as user_exchange:
                                     side = "buy" if sig == 1 else "sell"
                                     order_params = {'leverage': leverage_val} if use_margin else {}
+                                    await emit_log(user_id, f"🔗 ROUTING {side.upper()} TO {target_exchange.upper()}...")
                                     await user_exchange.load_markets()
                                     formatted_size = float(user_exchange.amount_to_precision(symbol, size_in_crypto))
                                     if formatted_size <= 0: raise Exception("Order size too small")
-                                    
                                     order = await user_exchange.create_market_order(symbol, side, formatted_size, params=order_params)
                                     actual_entry_price = order.get('average') or order.get('price') or current_price
                                     safe_size = order.get('filled') or formatted_size
                             except Exception as ex_err:
+                                bot["aiRegimeTitle"] = "Entry Guarded"
+                                bot["aiRegimeDesc"] = f"Exchange error: {str(ex_err)}. Resetting caching state flags."
+                                await emit_status(user_id, {
+                                    "status": "running", "currentBalance": bot["currentBalance"], "exposure": bot["exposure"],
+                                    "activePositions": bot['positions'], "unrealizedPnl": bot["unrealizedPnl"], "tradeMarkers": bot['trade_history'], 
+                                    "candles": bot["candles"], "currentConfidence": bot["currentConfidence"], "signalsMap": bot["signalsMap"],
+                                    "initialCapital": start_capital, "aiRegimeTitle": bot["aiRegimeTitle"], "aiRegimeDesc": bot["aiRegimeDesc"],
+                                    "aiDeployedGear": bot["aiDeployedGear"], "winRate": bot["winRate"], "profitFactor": bot["profitFactor"]
+                                })
                                 await emit_log(user_id, f"❌ {target_exchange.upper()} ORDER FAILED: {str(ex_err)}")
-                                await asyncio.sleep(5); continue
+                                await asyncio.sleep(5)
+                                continue
                         else:
                             bot['balance'] -= (safe_size * actual_entry_price) * fee_rate
 
@@ -1006,18 +1019,22 @@ async def live_neural_heartbeat(user_id: str):
                         partial_tp = actual_entry_price + (current_atr * 1.5) if sig == 1 else actual_entry_price - (current_atr * 1.5)
 
                         bot['positions'].append({
-                            "symbol": symbol, "type": trade_type, "entry": actual_entry_price, "size": safe_size,
-                            "time": current_time.isoformat(), "entry_conf": score, "tp": tp_price_calc, "sl": sl_price_calc, "tsl": sl_price_calc,
-                            "partial_tp": partial_tp, "partial_taken": False, "atr_at_entry": round(current_atr, 4),
-                            "adx_at_entry": round(current_adx, 1), "vol_ratio_at_entry": round(vol_ratio, 2)
+                            "symbol": symbol, "type": trade_type,
+                            "entry": actual_entry_price, "size": safe_size,
+                            "time": current_time.isoformat(), "entry_conf": score,
+                            "tp": tp_price_calc, "sl": sl_price_calc, "tsl": sl_price_calc,
+                            "partial_tp": partial_tp, "partial_taken": False,
+                            "atr_at_entry": round(current_atr, 4),
+                            "adx_at_entry": round(current_adx, 1),
+                            "vol_ratio_at_entry": round(vol_ratio, 2)
                         })
                         bot['last_trade_time'] = current_time.isoformat()
                         rr = round(atr_tp_mult / atr_sl_mult, 1)
-                        await emit_log(user_id, f"🚀 ENTERED {trade_type.upper()} @ ${actual_entry_price:,.2f} | TP ${tp_price_calc:,.2f} | SL ${sl_price_calc:,.2f} | R:R {rr}")
+                        await emit_log(user_id, f"🚀 ENTERED {trade_type.upper()} @ ${actual_entry_price:,.2f} | TP ${tp_price_calc:,.2f} | SL ${sl_price_calc:,.2f} | R:R {rr} | ADX {current_adx:.0f}")
                         DatabaseHandler.save_state(user_id, bot)
 
                 # ------------------------------------------------------------
-                # TIER 8: MANAGEMENT SLOTS & TRAILING FIRES (EXIT OPERATIONS)
+                # TIER 8: EXIT MONITORING (Partial TP + ATR Ratchet)
                 # ------------------------------------------------------------
                 for pos in bot['positions'][:]:
                     closed = False
@@ -1042,18 +1059,18 @@ async def live_neural_heartbeat(user_id: str):
                                         order = await user_exchange.create_market_order(symbol, "sell", fmt_size)
                                         partial_pnl = ((order.get('average') or current_price) - pos['entry']) * half_size
                                 except Exception as e:
-                                    await emit_log(user_id, f"⚠️ Partial exit failed: {e}")
+                                    await emit_log(user_id, f"⚠️ Partial long exit failed: {e}")
                             else:
                                 net_partial = partial_pnl - (half_size * current_price * fee_rate)
                                 bot['balance'] += net_partial
                                 partial_pnl = net_partial
-
                             pos['size'] = half_size
                             pos['partial_taken'] = True
                             pos['tsl'] = max(pos['tsl'], pos['entry'])
-                            await emit_log(user_id, f"💎 PARTIAL EXIT: Took 50% at ${current_price:,.2f} | Realized ${partial_pnl:.2f}")
+                            await emit_log(user_id, f"💎 PARTIAL LONG EXIT: 50% at ${current_price:,.2f} | Locked ${partial_pnl:.2f} | Stop → Breakeven")
                             bot['trade_history'].append({
-                                "type": "partial_exit", "side": pos['type'], "price": current_price, "pnl": round(partial_pnl, 2),
+                                "type": "partial_exit", "side": pos['type'],
+                                "price": current_price, "pnl": round(partial_pnl, 2),
                                 "time": int(time.time() * 1000)
                             })
                             DatabaseHandler.save_state(user_id, bot)
@@ -1062,15 +1079,34 @@ async def live_neural_heartbeat(user_id: str):
                         elif pos['type'] == 'short' and current_price <= pos.get('partial_tp', 0):
                             half_size = pos['size'] / 2.0
                             partial_pnl = (pos['entry'] - current_price) * half_size
-                            if not is_live_trading:
+                            if is_live_trading:
+                                try:
+                                    exchange_class = getattr(ccxt, target_exchange)
+                                    async with exchange_class({
+                                        'apiKey': api_keys.get('krakenKey', api_keys.get('apiKey')),
+                                        'secret': api_keys.get('krakenSecret', api_keys.get('secret')),
+                                        'enableRateLimit': True
+                                    }) as user_exchange:
+                                        await user_exchange.load_markets()
+                                        fmt_size = float(user_exchange.amount_to_precision(symbol, half_size))
+                                        order = await user_exchange.create_market_order(symbol, "buy", fmt_size)
+                                        partial_pnl = (pos['entry'] - (order.get('average') or current_price)) * half_size
+                                except Exception as e:
+                                    await emit_log(user_id, f"⚠️ Partial short exit failed: {e}")
+                            else:
                                 net_partial = partial_pnl - (half_size * current_price * fee_rate)
                                 bot['balance'] += net_partial
                                 partial_pnl = net_partial
-
                             pos['size'] = half_size
                             pos['partial_taken'] = True
                             pos['tsl'] = min(pos['tsl'], pos['entry'])
-                            await emit_log(user_id, f"💎 PARTIAL EXIT: Took 50% SHORT at ${current_price:,.2f} | Realized ${partial_pnl:.2f}")
+                            await emit_log(user_id, f"💎 PARTIAL SHORT EXIT: 50% at ${current_price:,.2f} | Locked ${partial_pnl:.2f} | Stop → Breakeven")
+                            bot['trade_history'].append({
+                                "type": "partial_exit", "side": pos['type'],
+                                "price": current_price, "pnl": round(partial_pnl, 2),
+                                "time": int(time.time() * 1000)
+                            })
+                            DatabaseHandler.save_state(user_id, bot)
                             continue
 
                     if pos['type'] == 'long':
@@ -1104,7 +1140,8 @@ async def live_neural_heartbeat(user_id: str):
                                     real_fiat = balance_data.get('USD', {}).get('free') or balance_data.get('USDC', {}).get('free')
                                     if real_fiat: bot['balance'] = float(real_fiat)
                             except Exception as ex_err:
-                                await emit_log(user_id, f"❌ EXIT FAILED: {str(ex_err)}"); continue
+                                await emit_log(user_id, f"❌ EXIT FAILED: {str(ex_err)}")
+                                continue
 
                         gross_pnl = (actual_close_price - pos['entry']) * pos['size'] if pos['type'] == 'long' else (pos['entry'] - actual_close_price) * pos['size']
                         net_pnl = gross_pnl - ((pos['size'] * actual_close_price) * fee_rate)
@@ -1112,8 +1149,9 @@ async def live_neural_heartbeat(user_id: str):
 
                         bot['positions'].remove(pos)
                         bot['trade_history'].append({
-                            "type": "exit", "side": pos['type'], "price": actual_close_price, "pnl": round(net_pnl, 2),
-                            "reason": exit_reason, "time": datetime.now(timezone.utc).isoformat()
+                            "type": "exit", "side": pos['type'],
+                            "price": actual_close_price, "pnl": round(net_pnl, 2),
+                            "reason": exit_reason, "time": int(time.time() * 1000)
                         })
                         await emit_log(user_id, f"💰 {exit_reason}: CLOSED {pos['type'].upper()} @ ${actual_close_price:,.2f} | Net PnL: ${round(net_pnl, 2)}")
                         DatabaseHandler.save_state(user_id, bot)
@@ -1127,6 +1165,7 @@ async def live_neural_heartbeat(user_id: str):
                 logger.error(f"❌ WS Stream Error: {e}"); await asyncio.sleep(5)
     finally:
         logger.info(f"🔌 Heartbeat loop terminated for {user_id}")
+
 
 # =============================================================
 # ENDPOINTS

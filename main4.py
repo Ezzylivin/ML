@@ -383,32 +383,57 @@ class DiagnosticLayer:
 # ============================================================
 # 🔮 PREDICTIVE REGIME OPTIMIZER
 # ============================================================
+# FIX (High): Regime debounce — strategy set now requires REGIME_DEBOUNCE_TICKS
+# consecutive ticks in a new zone before switching (5 × 0.5 s = 2.5 s stability window).
+# Prevents the strategy set from thrashing every tick when AI score hovers near a threshold.
 class PredictiveRegimeOptimizer:
+    REGIME_DEBOUNCE_TICKS = 5  # must be in new zone this many consecutive ticks to commit
+
     @staticmethod
-    def dynamically_tune_strategies(bot_config: Dict[str, Any], ai_score: float,
-                                     current_adx: float) -> List[Dict[str, Any]]:
-        if bot_config.get("comboConfig", {}).get("combinationRule") == "AND":
-            return bot_config.get("strategies", [])
+    def get_regime_key(ai_score: float, current_adx: float) -> str:
+        """Pure threshold logic — no debounce. Returns 'trend', 'bear', or 'range'."""
         if ai_score >= 0.68 or (ai_score > 0.55 and current_adx > 30):
+            return "trend"
+        elif ai_score <= 0.32 or (ai_score < 0.45 and current_adx > 30):
+            return "bear"
+        else:
+            return "range"
+
+    @staticmethod
+    def get_strategies_for_regime(regime: str) -> List[Dict[str, Any]]:
+        if regime == "trend":
             return [
                 {"code": "supertrend",    "params": {"st_atr": 10, "st_factor": 3.0}},
                 {"code": "pa_breakout",   "params": {"lookback": 20, "buffer": 0.01}},
                 {"code": "ema_cloud",     "params": {"fast_ema": 9, "slow_ema": 21}},
                 {"code": "sma_crossover", "params": {"fast_sma": 20, "slow_sma": 100}}
             ]
-        elif ai_score <= 0.32 or (ai_score < 0.45 and current_adx > 30):
+        elif regime == "bear":
             return [
                 {"code": "supertrend",     "params": {"st_atr": 10, "st_factor": 2.5}},
                 {"code": "atr_breakout",   "params": {"atr_length": 14, "multiplier": 1.5}},
                 {"code": "macd_crossover", "params": {"fast": 12, "slow": 26, "signal": 9}},
                 {"code": "vol_profile",    "params": {"vol_ma": 20, "threshold": 1.2}}
             ]
-        else:
+        else:  # range
             return [
                 {"code": "bb_fade",       "params": {"bb_period": 20, "bb_std": 2.0}},
                 {"code": "rsi_threshold", "params": {"rsi_length": 14, "oversold": 30, "overbought": 70}},
                 {"code": "stoch",         "params": {"k_period": 14, "d_period": 3}}
             ]
+
+    @staticmethod
+    def dynamically_tune_strategies(bot_config: Dict[str, Any], ai_score: float,
+                                     current_adx: float,
+                                     locked_regime: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        locked_regime: if provided, use that regime key directly (debounce-resolved from
+        caller). Falls back to live threshold logic if None (e.g. outside heartbeat context).
+        """
+        if bot_config.get("comboConfig", {}).get("combinationRule") == "AND":
+            return bot_config.get("strategies", [])
+        regime = locked_regime or PredictiveRegimeOptimizer.get_regime_key(ai_score, current_adx)
+        return PredictiveRegimeOptimizer.get_strategies_for_regime(regime)
 
 
 # ==========================================
@@ -417,6 +442,15 @@ class PredictiveRegimeOptimizer:
 class NeuralPredictor:
     @staticmethod
     def get_prediction(model_id: str, df: pd.DataFrame, symbol: str = "BTC-USD") -> float:
+        """
+        Output contract: returns P(next candle move is net-positive / long).
+        Expected range [0.0, 1.0] — 1.0 = strong bull, 0.0 = strong bear, 0.5 = neutral.
+
+        The short-direction gate uses (1.0 - conf) >= threshold, which is only mathematically
+        valid when this function returns a binary long-probability.  If the underlying
+        StackingPredictor is retrained with a different output type (regression, multi-class),
+        revise the gate_passed logic in StrategyBrain.calculate_signals accordingly.
+        """
         try:
             council = get_cached_predictor(symbol=symbol, timeframe="1h")
             # MERGED FIX (Doc7): prefer get_prediction_score when available
@@ -457,11 +491,25 @@ class StrategyBrain:
     @staticmethod
     def calculate_signals(df_raw: pd.DataFrame, df_ai: pd.DataFrame,
                           config: Dict[str, Any], l_thresh: float, s_thresh: float,
-                          symbol: str = "BTC-USD"):
+                          symbol: str = "BTC-USD",
+                          precomputed_conf: Optional[float] = None,
+                          live_price: Optional[float] = None):
+        """
+        FIX (High): precomputed_conf — caller passes the already-computed ML score so
+        NeuralPredictor is only called once per tick, preventing score divergence between
+        the regime selector and the gate check.
+
+        FIX (Medium): live_price — caller passes current_price separately so that df_raw
+        can be df_closed_history (indicator votes on confirmed candles only), while all
+        explicit price comparisons (vs EMA, ATR targets, BB bands) still use the live tick.
+        """
         active_thoughts, votes = [], 0
         signals_map   = {}
         strategies    = config.get('strategies', [])
-        current_price = df_raw['close'].iloc[-1]
+
+        # Use live_price for all current-price comparisons; df_raw supplies indicator history.
+        # When live_price is None (e.g. direct calls from tests), fall back to df_raw's last close.
+        current_price = live_price if live_price is not None else float(df_raw['close'].iloc[-1])
 
         ema20  = ta.ema(df_raw['close'], length=20).iloc[-1]
         ema50  = ta.ema(df_raw['close'], length=50).iloc[-1]   # reserved
@@ -516,6 +564,8 @@ class StrategyBrain:
                     raw_vote   = 1 if current_price >= high_lb else -1
                 elif code == "vol_profile":
                     v_ma  = ta.sma(df_raw['volume'], length=int(p.get('vol_ma', 20))).iloc[-1]
+                    # df_raw is df_closed_history when called from heartbeat, so .iloc[-1]
+                    # is the last COMPLETED candle's volume — no partial-candle bias here.
                     ratio = df_raw['volume'].iloc[-1] / (v_ma * float(p.get('threshold', 1.5)))
                     confidence = max(0.1, min(1.0, ratio))
                     raw_vote   = (1 if current_price > mid else -1) if ratio >= 1.0 else 0
@@ -542,12 +592,17 @@ class StrategyBrain:
         is_short = current_price < ema200
         ui_limit = (float(config.get('mlThresholdShort', 0.55)) if is_short
                     else float(config.get('mlThresholdLong', 0.55)))
-        conf = NeuralPredictor.get_prediction(config.get('mlModel', 'stacking'), df_ai, symbol=symbol)
+
+        # FIX (High): use pre-computed conf from caller — avoids a second ML call per tick
+        # and ensures the gate check uses the exact same score as the regime selector.
+        conf = precomputed_conf if precomputed_conf is not None else NeuralPredictor.get_prediction(
+            config.get('mlModel', 'stacking'), df_ai, symbol=symbol)
 
         if config.get('mlMode') == 'off':
             gate_passed = True
         else:
-            # MERGED FIX (Doc7): short direction needs inverted confidence gate
+            # MERGED FIX (Doc7): short direction needs inverted confidence gate.
+            # Relies on NeuralPredictor output contract: conf = P(long). See docstring.
             gate_passed = (conf >= ui_limit) if not is_short else ((1.0 - conf) >= ui_limit)
 
         rule      = config.get('comboConfig', {}).get('combinationRule', 'OR')
@@ -641,24 +696,61 @@ async def live_neural_heartbeat(user_id: str):
                     current_adx = 25.0
 
                 try:
-                    vol_ma    = float(ta.sma(df_raw['volume'], length=20).iloc[-1])
-                    vol_ratio = df_raw['volume'].iloc[-1] / vol_ma if vol_ma > 0 else 1.0
+                    vol_ma = float(ta.sma(df_raw['volume'], length=20).iloc[-1])
+                    # FIX (Critical): use the last CLOSED candle's volume (iloc[-2]) rather than
+                    # the current live candle (iloc[-1]).  The live candle's volume accumulates
+                    # from near-zero at candle open, which would block the volume_confirmed gate
+                    # for 30-40 min of every candle — the exact window breakouts matter most.
+                    vol_ratio = df_raw['volume'].iloc[-2] / vol_ma if vol_ma > 0 else 1.0
                 except Exception:
                     vol_ratio = 1.0
 
                 # ── TIER 2: AI COUNCIL ────────────────────────────────────────
+                # ML prediction called exactly ONCE per tick here; the result is passed
+                # into all downstream consumers (regime optimizer, strategy brain gate)
+                # so there is no risk of divergence between selector and gate check.
                 conf_score = NeuralPredictor.get_prediction(
                     config.get('mlModel', 'stacking'), df_ai, symbol=ticker_symbol)
 
+                # FIX (High): Regime debounce — only commit to a new strategy set after
+                # REGIME_DEBOUNCE_TICKS consecutive ticks in the new zone.
+                # bot['active_regime'] persists the locked regime across ticks.
+                # bot['regime_pending_ticks'] counts how long the desired regime has differed.
+                desired_regime = PredictiveRegimeOptimizer.get_regime_key(conf_score, current_adx)
+                if 'active_regime' not in bot:
+                    # First tick: commit immediately, no history to debounce against.
+                    bot['active_regime']        = desired_regime
+                    bot['regime_pending_ticks'] = 0
+                elif desired_regime != bot['active_regime']:
+                    bot['regime_pending_ticks'] = bot.get('regime_pending_ticks', 0) + 1
+                    if bot['regime_pending_ticks'] >= PredictiveRegimeOptimizer.REGIME_DEBOUNCE_TICKS:
+                        prev_regime             = bot['active_regime']
+                        bot['active_regime']    = desired_regime
+                        bot['regime_pending_ticks'] = 0
+                        await emit_log(user_id, f"🔄 REGIME SHIFT: {prev_regime.upper()} → {desired_regime.upper()}")
+                else:
+                    # Desired matches current — reset pending counter.
+                    bot['regime_pending_ticks'] = 0
+
                 active_strategies = (
-                    PredictiveRegimeOptimizer.dynamically_tune_strategies(config, conf_score, current_adx)
+                    PredictiveRegimeOptimizer.dynamically_tune_strategies(
+                        config, conf_score, current_adx,
+                        locked_regime=bot['active_regime'])
                     if config.get('mlMode') == 'on'
                     else config.get('strategies', strategies)
                 )
                 temp_config = {**config, 'strategies': active_strategies}
 
+                # FIX (Medium): Pass df_closed_history as df_raw so all indicator votes
+                # (RSI, MACD, SuperTrend, Stoch, etc.) are computed on confirmed candles only,
+                # eliminating mid-candle indicator drift.  live_price keeps explicit price
+                # comparisons (vs EMA200, ATR targets, BB bands) on the current tick.
+                # precomputed_conf passes the already-computed ML score to skip a second call.
                 sig, thoughts, nums, score, signals_map = StrategyBrain.calculate_signals(
-                    df_raw, df_ai, temp_config, 0.5, 0.5, symbol=ticker_symbol)
+                    df_closed_history, df_ai, temp_config, 0.5, 0.5,
+                    symbol=ticker_symbol,
+                    precomputed_conf=conf_score,
+                    live_price=current_price)
 
                 # ── TIER 3: PROP-MAPPING ──────────────────────────────────────
                 sentiment = "STRONG BUY" if score > 0.85 else "BUY" if score > 0.70 else "NEUTRAL"
@@ -797,9 +889,10 @@ async def live_neural_heartbeat(user_id: str):
                     latest_candles = await process_data_packet(df_raw, active_strategies)
 
                     if config.get('mlMode') == 'on':
-                        if conf_score >= 0.68 or (conf_score > 0.55 and current_adx > 30):
+                        active_regime = bot.get('active_regime', 'range')
+                        if active_regime == "trend":
                             deployed_gear = "Trend Armor (SuperTrend, PA Breakout, EMA Cloud, SMA Cross)"
-                        elif conf_score <= 0.32 or (conf_score < 0.45 and current_adx > 30):
+                        elif active_regime == "bear":
                             deployed_gear = "Capitulation Armor (SuperTrend, ATR Breakout, MACD Cross, Vol Profile)"
                         else:
                             deployed_gear = "Range Armor (Bollinger Bands, RSI Threshold, Stochastic)"
@@ -893,7 +986,9 @@ async def live_neural_heartbeat(user_id: str):
                     if (sig == 1 and climb_satisfied) or (sig == -1 and climb_satisfied):
                         trade_type     = "long" if sig == 1 else "short"
                         raw_risk       = config.get('riskPercentage') or config.get('risk_percentage') or 1.0
-                        size_in_fiat   = bot['balance'] * (float(raw_risk) / 100.0 / max_p)
+                        # FIX (Critical): size against current_equity (cash + unrealized P&L)
+                        # so gains compound while positions are open, not only after they close.
+                        size_in_fiat   = current_equity * (float(raw_risk) / 100.0 / max_p)
                         size_in_crypto = size_in_fiat / current_price
                         safe_size      = float(f"{size_in_crypto:.6f}")
                         actual_entry_price = current_price

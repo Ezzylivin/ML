@@ -1053,9 +1053,17 @@ async def live_neural_heartbeat(user_id: str):
                     live_price=current_price)
 
                 # ── TIER 3: PROP-MAPPING ──────────────────────────────────────
-                sentiment = "STRONG BUY" if score > 0.85 else "BUY" if score > 0.70 else "NEUTRAL"
-                if score < 0.20:   sentiment = "STRONG SELL"
-                elif score < 0.35: sentiment = "SELL"
+                # NeuralPredictor returns P(bull). In a bear market high conviction
+                # = low raw score, so invert once here.  Use effective_score for
+                # ALL downstream display and gate comparisons.  Raw `score` is kept
+                # only for StrategyBrain's own gate (already written with inversion)
+                # and for climb_satisfied (compares to stored entry_conf).
+                is_short_market = current_price < current_ema200
+                effective_score  = (1.0 - score) if is_short_market else score
+
+                sentiment = "STRONG BUY" if effective_score > 0.85 else "BUY" if effective_score > 0.70 else "NEUTRAL"
+                if effective_score < 0.20:   sentiment = "STRONG SELL"
+                elif effective_score < 0.35: sentiment = "SELL"
 
                 last_pos = bot['positions'][-1] if bot['positions'] else None
                 if last_pos:
@@ -1087,7 +1095,7 @@ async def live_neural_heartbeat(user_id: str):
                 ui_limit = (float(config.get('mlThresholdShort', 0.55))
                             if current_price < current_ema200
                             else float(config.get('mlThresholdLong', 0.55)))
-                waiting_msg = DiagnosticLayer.get_pending_conditions(df_raw, temp_config, score, ui_limit)
+                waiting_msg = DiagnosticLayer.get_pending_conditions(df_raw, temp_config, effective_score, ui_limit)
 
                 base_threshold = ui_limit
                 if current_adx > 30:   adaptive_threshold = max(0.45, base_threshold - 0.05)
@@ -1105,7 +1113,9 @@ async def live_neural_heartbeat(user_id: str):
                     if consecutive_losses == 3 and (datetime.now().timestamp() - last_log) >= 15:
                         await emit_log(user_id, f"⚠️ COLD STREAK: {consecutive_losses} losses — raising bar to {int(adaptive_threshold*100)}%")
 
-                adaptive_gate = score >= adaptive_threshold if config.get('mlMode') == 'on' else True
+                # FIX: effective_score is direction-aware — bear conviction (low P(bull))
+                # now correctly clears the adaptive threshold in short markets.
+                adaptive_gate = effective_score >= adaptive_threshold if config.get('mlMode') == 'on' else True
 
                 atr_pct    = (current_atr / current_price) * 100
                 min_atr_pct = float(config.get('minAtrPct', 0.3))
@@ -1201,18 +1211,18 @@ async def live_neural_heartbeat(user_id: str):
                     if votes_t > 0:  raw_sig = 1
                     elif votes_t < 0: raw_sig = -1
 
-                if raw_sig != 0 and score < ui_limit:
+                if raw_sig != 0 and effective_score < ui_limit:
                     last_veto_ts = (datetime.fromisoformat(bot["vetoed_signals"][-1]["time"]).timestamp()
                                     if bot["vetoed_signals"] else 0)
                     if (current_time.timestamp() - last_veto_ts) > 300:
                         bot["vetoed_signals"].append({
                             "time": current_time.isoformat(), "signal": "Long" if raw_sig == 1 else "Short",
-                            "conf_score": round(score, 4), "limit": round(ui_limit, 4), "price": current_price
+                            "conf_score": round(effective_score, 4), "limit": round(ui_limit, 4), "price": current_price
                         })
                         if len(bot["vetoed_signals"]) > 100: bot["vetoed_signals"].pop(0)
 
                 if len(bot['positions']) < int(config.get('maxPyramiding', 1)):
-                    hunting_summary = f"🏹 STALKING LEG {len(bot['positions'])+1}: {int(score*100)}% ({sentiment}) | {waiting_msg}"
+                    hunting_summary = f"🏹 STALKING LEG {len(bot['positions'])+1}: {int(effective_score*100)}% ({sentiment}) | {waiting_msg}"
                 else:
                     hunting_summary = "✅ PYRAMID FULL: Managing Exits"
                 targets_str = " | ".join([
@@ -1270,13 +1280,8 @@ async def live_neural_heartbeat(user_id: str):
                     # FIX: compute daily_profit for the MetricCard
                     daily_profit = round(current_equity - start_capital, 2)
 
-                    # FIX: NeuralPredictor output is P(bull) — a value near 0
-                    # means strong bear conviction, but displaying it raw shows
-                    # "5% confidence" during the bot's best short setups.
-                    # Invert for display when we are in a short market so the
-                    # confidence ring always shows directional conviction.
-                    is_short_market = current_price < current_ema200
-                    display_conf    = int((1.0 - score) * 100) if is_short_market else int(score * 100)
+                    # effective_score is already direction-aware (computed in Tier 3)
+                    display_conf = int(effective_score * 100)
 
                     bot.update({
                         "currentBalance":    round(current_equity, 2),
@@ -1379,7 +1384,7 @@ async def live_neural_heartbeat(user_id: str):
                     if not is_trend_aligned:       reasons.append("Trend misaligned with 200 EMA")
                     if not adx_trending:           reasons.append(f"ADX {current_adx:.0f} below min {float(config.get('minAdx', 20.0)):.0f}")
                     if not volume_confirmed:       reasons.append(f"Volume {vol_ratio:.2f}x below min {float(config.get('minVolRatio', 0.8)):.1f}x")
-                    if not adaptive_gate:          reasons.append(f"AI {int(score*100)}% below threshold {int(adaptive_threshold*100)}%")
+                    if not adaptive_gate:          reasons.append(f"AI {int(effective_score*100)}% below threshold {int(adaptive_threshold*100)}%")
                     if not market_gate_passed:     reasons.append("Waiting for signal reset")
                     if not reasons: reasons.append("Pre-flight check failed")
                     await emit_log(user_id, f"⛔ ENTRY BLOCKED: {', '.join(reasons)}")

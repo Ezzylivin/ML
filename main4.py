@@ -614,6 +614,290 @@ class StrategyBrain:
 
 
 # ============================================================================
+# 🎯 PRE-TRADE QUALITY SCORER
+# ============================================================================
+class TradeQualityScorer:
+    """
+    Synthesises market context, bot intelligence, and strategy alignment into
+    a single 0–100 entry quality score.
+
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │  Market Context  (35 pts) — trend stack, ATR regime, ADX, volume     │
+    │  Bot Intelligence (35 pts) — ML margin, confidence trend, track rec  │
+    │  Strategy Alignment (30 pts) — vote %, mean confidence, diversity    │
+    │                                                                      │
+    │  Entry approved only when composite ≥ MIN_ENTRY_SCORE (default 65)  │
+    └──────────────────────────────────────────────────────────────────────┘
+    """
+
+    MIN_ENTRY_SCORE = 65  # raise for more selectivity, lower for more activity
+
+    # Maps each strategy code to a broad analytical category.
+    # Category diversity in the agreeing votes is worth bonus points because
+    # three momentum strategies all agreeing is weaker evidence than a trend
+    # follower, a momentum signal, and a mean-reversion signal all aligning.
+    STRATEGY_CATEGORIES: Dict[str, str] = {
+        "supertrend":     "trend",
+        "sma_crossover":  "trend",
+        "ema_cloud":      "trend",
+        "pa_breakout":    "trend",
+        "macd_crossover": "momentum",
+        "atr_breakout":   "momentum",
+        "vol_profile":    "momentum",
+        "rsi_threshold":  "mean_rev",
+        "bb_fade":        "mean_rev",
+        "stoch":          "mean_rev",
+    }
+
+    # ── COMPONENT 1: MARKET CONTEXT ──────────────────────────────────────────
+    @staticmethod
+    def _score_market_context(df: pd.DataFrame, sig: int, current_price: float,
+                               current_atr: float, current_adx: float,
+                               vol_ratio: float) -> dict:
+        """
+        Scores the macro market backdrop — 35 points max.
+
+        EMA stack alignment : 15 pts   (4 EMAs stacked + ordered in direction)
+        ATR regime quality  :  8 pts   (volatility expanding healthily?)
+        ADX trend strength  :  7 pts   (market actually trending?)
+        Volume quality      :  5 pts   (volume backing the move?)
+        """
+        scores: Dict[str, int] = {}
+
+        # 1. EMA stack — proxies multi-timeframe alignment on the 1h feed
+        try:
+            ema20  = float(ta.ema(df['close'], length=20).iloc[-1])
+            ema50  = float(ta.ema(df['close'], length=50).iloc[-1])
+            ema100 = float(ta.ema(df['close'], length=100).iloc[-1])
+            ema200 = float(ta.ema(df['close'], length=200).iloc[-1])
+
+            if sig == 1:   # long — price should sit above all EMAs in order
+                levels  = [current_price > ema20, current_price > ema50,
+                           current_price > ema100, current_price > ema200]
+                ordered = ema20 > ema50 > ema100 > ema200
+            else:          # short — price should sit below all EMAs in order
+                levels  = [current_price < ema20, current_price < ema50,
+                           current_price < ema100, current_price < ema200]
+                ordered = ema20 < ema50 < ema100 < ema200
+
+            stack_count = sum(levels)
+            base_pts    = {4: 11, 3: 7, 2: 3, 1: 0, 0: 0}.get(stack_count, 0)
+            scores['ema_stack'] = min(15, base_pts + (4 if ordered else 0))
+        except Exception:
+            scores['ema_stack'] = 5  # neutral if indicators fail
+
+        # 2. ATR regime — ideal is mildly expanding (1.0–1.5× average)
+        try:
+            atr_series = ta.atr(df['high'], df['low'], df['close'], length=14)
+            atr_avg    = float(ta.sma(atr_series, length=20).iloc[-1])
+            atr_ratio  = current_atr / atr_avg if atr_avg > 0 else 1.0
+            if   1.0 <= atr_ratio <= 1.5: scores['atr_regime'] = 8
+            elif 0.7 <= atr_ratio <  1.0: scores['atr_regime'] = 5
+            elif 1.5 <  atr_ratio <= 2.0: scores['atr_regime'] = 4
+            elif atr_ratio > 2.0:         scores['atr_regime'] = 2
+            else:                         scores['atr_regime'] = 1
+        except Exception:
+            scores['atr_regime'] = 4
+
+        # 3. ADX strength
+        if   current_adx >= 40: scores['adx'] = 7
+        elif current_adx >= 30: scores['adx'] = 5
+        elif current_adx >= 22: scores['adx'] = 3
+        else:                   scores['adx'] = 1
+
+        # 4. Volume
+        if   vol_ratio >= 1.5: scores['volume'] = 5
+        elif vol_ratio >= 1.0: scores['volume'] = 3
+        elif vol_ratio >= 0.7: scores['volume'] = 2
+        else:                  scores['volume'] = 0
+
+        return {"total": sum(scores.values()), "max": 35, "breakdown": scores}
+
+    # ── COMPONENT 2: BOT INTELLIGENCE ────────────────────────────────────────
+    @staticmethod
+    def _score_bot_intelligence(bot: dict, ml_score: float, ui_limit: float) -> dict:
+        """
+        Scores the bot's internal conviction — 35 points max.
+
+        ML confidence margin  : 15 pts  (headroom above gate threshold)
+        Confidence trajectory : 10 pts  (is confidence genuinely rising?)
+        Recent trade record   : 10 pts  (win/loss context over last 6 trades)
+        """
+        scores: Dict[str, int] = {}
+
+        # 1. Confidence margin above the ML gate
+        margin = ml_score - ui_limit
+        if   margin >= 0.25: scores['ml_margin'] = 15
+        elif margin >= 0.15: scores['ml_margin'] = 11
+        elif margin >= 0.08: scores['ml_margin'] = 7
+        elif margin >= 0.02: scores['ml_margin'] = 3
+        else:                scores['ml_margin'] = 0
+
+        # 2. Confidence trajectory across recent equity-curve ticks
+        try:
+            curve = bot.get('equityCurve', [])[-8:]
+            confs = [p.get('confidence', 50) / 100.0 for p in curve]
+            if len(confs) >= 4:
+                half      = len(confs) // 2
+                early_avg = sum(confs[:half])  / half
+                late_avg  = sum(confs[half:])  / (len(confs) - half)
+                delta     = late_avg - early_avg
+                if   delta >= 0.12: scores['conf_trajectory'] = 10
+                elif delta >= 0.06: scores['conf_trajectory'] = 7
+                elif delta >= 0.01: scores['conf_trajectory'] = 4
+                elif delta >= -0.03: scores['conf_trajectory'] = 2
+                else:               scores['conf_trajectory'] = 0
+            else:
+                scores['conf_trajectory'] = 3  # insufficient history → neutral
+        except Exception:
+            scores['conf_trajectory'] = 3
+
+        # 3. Recent trade record (last 6 closed exits)
+        try:
+            exits = [t for t in bot.get('trade_history', [])
+                     if t.get('type') == 'exit'][-6:]
+            if exits:
+                wins     = sum(1 for t in exits if float(t.get('pnl', 0)) > 0)
+                rate     = wins / len(exits)
+                # Count current win streak
+                streak = 0
+                for t in reversed(exits):
+                    if float(t.get('pnl', 0)) > 0: streak += 1
+                    else: break
+                if   rate >= 0.67 or streak >= 3: scores['recent_perf'] = 10
+                elif rate >= 0.50:                scores['recent_perf'] = 7
+                elif rate >= 0.33:                scores['recent_perf'] = 4
+                else:                             scores['recent_perf'] = 1
+            else:
+                scores['recent_perf'] = 5  # first trade in session → neutral
+        except Exception:
+            scores['recent_perf'] = 5
+
+        return {"total": sum(scores.values()), "max": 35, "breakdown": scores}
+
+    # ── COMPONENT 3: STRATEGY ALIGNMENT ──────────────────────────────────────
+    @staticmethod
+    def _score_strategy_alignment(signals_map: dict, active_strategies: list,
+                                   sig: int) -> dict:
+        """
+        Scores the quality of strategy agreement — 30 points max.
+
+        Vote unanimity     : 12 pts  (% of strategies voting the right way)
+        Mean confidence    : 10 pts  (avg confidence of voting strategies)
+        Category diversity :  8 pts  (trend + momentum + mean-rev = strongest)
+        """
+        scores: Dict[str, int] = {}
+
+        if not active_strategies:
+            return {"total": 10, "max": 30,
+                    "breakdown": {"vote_unanimity": 4, "mean_confidence": 4, "diversity": 2}}
+
+        # 1. Vote unanimity
+        direction_agrees = []
+        for s in active_strategies:
+            conf = signals_map.get(s.get('code', ''), 0.5)
+            if sig == 1:   direction_agrees.append(conf > 0.5)
+            else:          direction_agrees.append(conf < 0.5)
+
+        pct = sum(direction_agrees) / len(direction_agrees) if direction_agrees else 0
+        if   pct >= 0.90: scores['vote_unanimity'] = 12
+        elif pct >= 0.75: scores['vote_unanimity'] = 9
+        elif pct >= 0.60: scores['vote_unanimity'] = 6
+        elif pct >= 0.51: scores['vote_unanimity'] = 3
+        else:             scores['vote_unanimity'] = 0
+
+        # 2. Mean confidence across all active strategies
+        conf_vals  = [signals_map.get(s.get('code', ''), 0.5) for s in active_strategies]
+        mean_conf  = sum(conf_vals) / len(conf_vals) if conf_vals else 0.5
+        if   mean_conf >= 0.80: scores['mean_confidence'] = 10
+        elif mean_conf >= 0.65: scores['mean_confidence'] = 7
+        elif mean_conf >= 0.50: scores['mean_confidence'] = 4
+        elif mean_conf >= 0.35: scores['mean_confidence'] = 2
+        else:                   scores['mean_confidence'] = 0
+
+        # 3. Category diversity — multi-family agreement is more robust
+        categories = {
+            TradeQualityScorer.STRATEGY_CATEGORIES.get(s.get('code', ''), 'other')
+            for s in active_strategies
+        }
+        if   len(categories) >= 3: scores['diversity'] = 8
+        elif len(categories) == 2: scores['diversity'] = 5
+        else:                      scores['diversity'] = 2  # single-family = fragile
+
+        return {"total": sum(scores.values()), "max": 30, "breakdown": scores}
+
+    # ── MASTER EVALUATION ─────────────────────────────────────────────────────
+    @classmethod
+    def evaluate(cls,
+                 df_raw:            pd.DataFrame,
+                 bot:               dict,
+                 ml_score:          float,
+                 ui_limit:          float,
+                 signals_map:       dict,
+                 active_strategies: list,
+                 sig:               int,
+                 current_price:     float,
+                 current_atr:       float,
+                 current_adx:       float,
+                 vol_ratio:         float) -> dict:
+        """
+        Master evaluation. Returns a verdict dict with full breakdown.
+
+        Keys:
+          approved        bool     — whether the trade clears the threshold
+          composite_score float    — 0–100 final score
+          market          dict     — market context sub-scores
+          bot             dict     — bot intelligence sub-scores
+          strategies      dict     — strategy alignment sub-scores
+          verdict         str      — one-line plain-English summary
+          log_line        str      — ready-to-emit_log formatted string
+        """
+        mkt   = cls._score_market_context(df_raw, sig, current_price,
+                                           current_atr, current_adx, vol_ratio)
+        intel = cls._score_bot_intelligence(bot, ml_score, ui_limit)
+        strat = cls._score_strategy_alignment(signals_map, active_strategies, sig)
+
+        composite = mkt['total'] + intel['total'] + strat['total']
+        approved  = composite >= cls.MIN_ENTRY_SCORE
+
+        if   composite >= 85: verdict = "ELITE SETUP — maximum multi-factor conviction"
+        elif composite >= 75: verdict = "HIGH QUALITY — strong cross-domain alignment"
+        elif composite >= 65: verdict = "ACCEPTABLE — threshold cleared, proceed"
+        elif composite >= 50: verdict = "MARGINAL — insufficient edge"
+        else:                 verdict = "POOR SETUP — multiple factors weak"
+
+        # Identify the weakest pillar for actionable rejection feedback
+        pillars = {
+            "market context":     mkt['total']   / mkt['max'],
+            "AI conviction":      intel['total'] / intel['max'],
+            "strategy alignment": strat['total'] / strat['max'],
+        }
+        weakest = min(pillars, key=pillars.get)
+
+        direction = "LONG" if sig == 1 else "SHORT"
+        status    = "✅ APPROVED" if approved else "❌ REJECTED"
+        log_line  = (
+            f"🎯 TRADE SCORER [{direction}] {status}: {composite:.0f}/100 "
+            f"(Mkt {mkt['total']}/{mkt['max']} · "
+            f"AI {intel['total']}/{intel['max']} · "
+            f"Strat {strat['total']}/{strat['max']}) "
+            f"— {verdict}"
+            + (f"  ↳ Weakest pillar: {weakest} "
+               f"({int(pillars[weakest]*100)}%)" if not approved else "")
+        )
+
+        return {
+            "approved":        approved,
+            "composite_score": composite,
+            "market":          mkt,
+            "bot":             intel,
+            "strategies":      strat,
+            "verdict":         verdict,
+            "log_line":        log_line,
+        }
+
+
+# ============================================================================
 # 🚀 CORE ENGINE HEARTBEAT
 # ============================================================================
 async def live_neural_heartbeat(user_id: str):
@@ -1010,6 +1294,7 @@ async def live_neural_heartbeat(user_id: str):
                         "aiDeployedGear":    bot["aiDeployedGear"],
                         "winRate":           bot["winRate"],
                         "profitFactor":      bot["profitFactor"],
+                        "lastTradeScore":    bot.get("lastTradeScore"),
                     })
 
                     logger.info(f"✅ emit_status dispatched for {user_id}")
@@ -1054,69 +1339,116 @@ async def live_neural_heartbeat(user_id: str):
                 # ── TIER 7: ENTRY DISPATCH ────────────────────────────────────
                 if len(bot['positions']) < max_p and all_filters_pass:
                     if (sig == 1 and climb_satisfied) or (sig == -1 and climb_satisfied):
-                        trade_type     = "long" if sig == 1 else "short"
-                        raw_risk       = config.get('riskPercentage') or config.get('risk_percentage') or 1.0
-                        size_in_fiat   = current_equity * (float(raw_risk) / 100.0 / max_p)
-                        size_in_crypto = size_in_fiat / current_price
-                        safe_size      = float(f"{size_in_crypto:.6f}")
-                        actual_entry_price = current_price
 
-                        if is_live_trading:
-                            try:
-                                exchange_class = getattr(ccxt, target_exchange)
-                                async with exchange_class({
-                                    'apiKey': api_keys.get('krakenKey', api_keys.get('apiKey')),
-                                    'secret': api_keys.get('krakenSecret', api_keys.get('secret')),
-                                    'enableRateLimit': True
-                                }) as user_exchange:
-                                    side         = "buy" if sig == 1 else "sell"
-                                    order_params = {'leverage': leverage_val} if use_margin else {}
-                                    await emit_log(user_id, f"🔗 ROUTING {side.upper()} TO {target_exchange.upper()}...")
-                                    await user_exchange.load_markets()
-                                    formatted_size = float(user_exchange.amount_to_precision(symbol, size_in_crypto))
-                                    if formatted_size <= 0: raise Exception("Order size too small")
-                                    order = await user_exchange.create_market_order(symbol, side, formatted_size, params=order_params)
-                                    actual_entry_price = order.get('average') or order.get('price') or current_price
-                                    safe_size          = order.get('filled') or formatted_size
-                            except Exception as ex_err:
-                                await emit_log(user_id, f"❌ {target_exchange.upper()} ORDER FAILED: {str(ex_err)}")
-                                await asyncio.sleep(5); continue
+                        # ── PRE-TRADE QUALITY SCORE ───────────────────────────
+                        # Runs AFTER all hard filters pass. Synthesises three
+                        # independent perspectives into a 0–100 composite score:
+                        #   • Market Context  (35 pts) — EMA stack, ATR regime,
+                        #                                ADX, volume
+                        #   • Bot Intelligence (35 pts) — ML margin above gate,
+                        #                                 confidence trajectory,
+                        #                                 recent win/loss record
+                        #   • Strategy Alignment (30 pts) — vote unanimity,
+                        #                                   mean confidence,
+                        #                                   category diversity
+                        # Trade only proceeds when composite ≥ MIN_ENTRY_SCORE.
+                        trade_quality = TradeQualityScorer.evaluate(
+                            df_raw            = df_raw,
+                            bot               = bot,
+                            ml_score          = score,
+                            ui_limit          = ui_limit,
+                            signals_map       = signals_map,
+                            active_strategies = active_strategies,
+                            sig               = sig,
+                            current_price     = current_price,
+                            current_atr       = current_atr,
+                            current_adx       = current_adx,
+                            vol_ratio         = vol_ratio,
+                        )
+
+                        # Always log the verdict so it appears in Neural Flow
+                        await emit_log(user_id, trade_quality['log_line'])
+
+                        # Store latest score on bot so frontend can display it
+                        bot['lastTradeScore'] = {
+                            "composite":  trade_quality['composite_score'],
+                            "approved":   trade_quality['approved'],
+                            "market":     trade_quality['market']['total'],
+                            "bot":        trade_quality['bot']['total'],
+                            "strategies": trade_quality['strategies']['total'],
+                            "verdict":    trade_quality['verdict'],
+                        }
+
+                        if not trade_quality['approved']:
+                            # Scorer rejected — log is already emitted above.
+                            # Skip entry but let Tier 8 exit monitoring run.
+                            pass
+
                         else:
-                            bot['balance'] -= (safe_size * actual_entry_price) * fee_rate
+                            # ── ORDER EXECUTION ───────────────────────────────
+                            # Only reached when composite score ≥ MIN_ENTRY_SCORE
+                            trade_type         = "long" if sig == 1 else "short"
+                            raw_risk           = config.get('riskPercentage') or config.get('risk_percentage') or 1.0
+                            size_in_fiat       = current_equity * (float(raw_risk) / 100.0 / max_p)
+                            size_in_crypto     = size_in_fiat / current_price
+                            safe_size          = float(f"{size_in_crypto:.6f}")
+                            actual_entry_price = current_price
 
-                        tp_price_calc = (actual_entry_price + current_atr * atr_tp_mult if sig == 1
-                                         else actual_entry_price - current_atr * atr_tp_mult)
-                        sl_price_calc = (actual_entry_price - current_atr * atr_sl_mult if sig == 1
-                                         else actual_entry_price + current_atr * atr_sl_mult)
-                        partial_tp    = (actual_entry_price + current_atr * 1.5 if sig == 1
-                                         else actual_entry_price - current_atr * 1.5)
+                            if is_live_trading:
+                                try:
+                                    exchange_class = getattr(ccxt, target_exchange)
+                                    async with exchange_class({
+                                        'apiKey': api_keys.get('krakenKey', api_keys.get('apiKey')),
+                                        'secret': api_keys.get('krakenSecret', api_keys.get('secret')),
+                                        'enableRateLimit': True
+                                    }) as user_exchange:
+                                        side         = "buy" if sig == 1 else "sell"
+                                        order_params = {'leverage': leverage_val} if use_margin else {}
+                                        await emit_log(user_id, f"🔗 ROUTING {side.upper()} TO {target_exchange.upper()}...")
+                                        await user_exchange.load_markets()
+                                        formatted_size = float(user_exchange.amount_to_precision(symbol, size_in_crypto))
+                                        if formatted_size <= 0: raise Exception("Order size too small")
+                                        order = await user_exchange.create_market_order(symbol, side, formatted_size, params=order_params)
+                                        actual_entry_price = order.get('average') or order.get('price') or current_price
+                                        safe_size          = order.get('filled') or formatted_size
+                                except Exception as ex_err:
+                                    await emit_log(user_id, f"❌ {target_exchange.upper()} ORDER FAILED: {str(ex_err)}")
+                                    await asyncio.sleep(5); continue
+                            else:
+                                bot['balance'] -= (safe_size * actual_entry_price) * fee_rate
 
-                        bot['positions'].append({
-                            "symbol":             symbol,
-                            "type":               trade_type,
-                            "entry":              actual_entry_price,
-                            "size":               safe_size,
-                            "time":               current_time.isoformat(),
-                            "entry_conf":         score,
-                            "tp":                 tp_price_calc,
-                            "sl":                 sl_price_calc,
-                            "tsl":                sl_price_calc,
-                            "partial_tp":         partial_tp,
-                            "partial_taken":      False,
-                            "atr_at_entry":       round(current_atr, 4),
-                            "adx_at_entry":       round(current_adx, 1),
-                            "vol_ratio_at_entry": round(vol_ratio, 2),
-                        })
-                        bot['last_trade_time'] = current_time.isoformat()
-                        # Store the confidence score at entry so the dynamic time gate
-                        # can measure improvement on the next trade opportunity.
-                        bot['last_trade_conf'] = score
-                        rr = round(atr_tp_mult / atr_sl_mult, 1)
-                        await emit_log(user_id,
-                                       f"🚀 ENTERED {trade_type.upper()} @ ${actual_entry_price:,.2f} | "
-                                       f"TP ${tp_price_calc:,.2f} | SL ${sl_price_calc:,.2f} | "
-                                       f"R:R {rr} | ADX {current_adx:.0f}")
-                        DatabaseHandler.save_state(user_id, bot)
+                            tp_price_calc = (actual_entry_price + current_atr * atr_tp_mult if sig == 1
+                                             else actual_entry_price - current_atr * atr_tp_mult)
+                            sl_price_calc = (actual_entry_price - current_atr * atr_sl_mult if sig == 1
+                                             else actual_entry_price + current_atr * atr_sl_mult)
+                            partial_tp    = (actual_entry_price + current_atr * 1.5 if sig == 1
+                                             else actual_entry_price - current_atr * 1.5)
+
+                            bot['positions'].append({
+                                "symbol":             symbol,
+                                "type":               trade_type,
+                                "entry":              actual_entry_price,
+                                "size":               safe_size,
+                                "time":               current_time.isoformat(),
+                                "entry_conf":         score,
+                                "entry_score":        trade_quality['composite_score'],
+                                "tp":                 tp_price_calc,
+                                "sl":                 sl_price_calc,
+                                "tsl":                sl_price_calc,
+                                "partial_tp":         partial_tp,
+                                "partial_taken":      False,
+                                "atr_at_entry":       round(current_atr, 4),
+                                "adx_at_entry":       round(current_adx, 1),
+                                "vol_ratio_at_entry": round(vol_ratio, 2),
+                            })
+                            bot['last_trade_time'] = current_time.isoformat()
+                            bot['last_trade_conf'] = score
+                            rr = round(atr_tp_mult / atr_sl_mult, 1)
+                            await emit_log(user_id,
+                                           f"🚀 ENTERED {trade_type.upper()} @ ${actual_entry_price:,.2f} | "
+                                           f"TP ${tp_price_calc:,.2f} | SL ${sl_price_calc:,.2f} | "
+                                           f"R:R {rr} | Score {trade_quality['composite_score']:.0f}/100 | ADX {current_adx:.0f}")
+                            DatabaseHandler.save_state(user_id, bot)
 
                 # ── TIER 8: EXIT MONITORING ───────────────────────────────────
                 for pos in bot['positions'][:]:
@@ -1433,6 +1765,7 @@ async def get_status(userId: str):
             "aiDeployedGear":    bot.get("aiDeployedGear", "Syncing Core Strategy Modules..."),
             "winRate":           bot.get("winRate",        0.0),
             "profitFactor":      bot.get("profitFactor",   1.0),
+            "lastTradeScore":    bot.get("lastTradeScore"),
         }
     return {"status": "inactive", "balance": 0}
 

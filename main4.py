@@ -30,7 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
 from contextlib import asynccontextmanager
-from fastapi.exceptions import RequestValidationError  # single import — duplicate removed (Doc7)
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
 import aiohttp
@@ -372,7 +372,8 @@ class DiagnosticLayer:
                 elif code == "vol_profile":
                     vol_ma = ta.sma(df['volume'], 20).iloc[-1]
                     pending.append(f"Vol Surge: {DiagnosticLayer.render_progress(df['volume'].iloc[-1], vol_ma * 1.5)}")
-            rule = config.get('comboConfig', {}).get('combinationRule', 'OR')
+            # FIX: use helper so hybridMode is honoured when comboConfig is absent/stale
+            rule = _get_combo_rule(config)
             if not pending:
                 return f"🔍 TARGETS ({rule}): Scanning Setup..."
             return f"🔍 TARGETS ({rule}): " + " | ".join(pending[:2])
@@ -383,15 +384,11 @@ class DiagnosticLayer:
 # ============================================================
 # 🔮 PREDICTIVE REGIME OPTIMIZER
 # ============================================================
-# FIX (High): Regime debounce — strategy set now requires REGIME_DEBOUNCE_TICKS
-# consecutive ticks in a new zone before switching (5 × 0.5 s = 2.5 s stability window).
-# Prevents the strategy set from thrashing every tick when AI score hovers near a threshold.
 class PredictiveRegimeOptimizer:
-    REGIME_DEBOUNCE_TICKS = 5  # must be in new zone this many consecutive ticks to commit
+    REGIME_DEBOUNCE_TICKS = 5
 
     @staticmethod
     def get_regime_key(ai_score: float, current_adx: float) -> str:
-        """Pure threshold logic — no debounce. Returns 'trend', 'bear', or 'range'."""
         if ai_score >= 0.68 or (ai_score > 0.55 and current_adx > 30):
             return "trend"
         elif ai_score <= 0.32 or (ai_score < 0.45 and current_adx > 30):
@@ -415,7 +412,7 @@ class PredictiveRegimeOptimizer:
                 {"code": "macd_crossover", "params": {"fast": 12, "slow": 26, "signal": 9}},
                 {"code": "vol_profile",    "params": {"vol_ma": 20, "threshold": 1.2}}
             ]
-        else:  # range
+        else:
             return [
                 {"code": "bb_fade",       "params": {"bb_period": 20, "bb_std": 2.0}},
                 {"code": "rsi_threshold", "params": {"rsi_length": 14, "oversold": 30, "overbought": 70}},
@@ -426,11 +423,8 @@ class PredictiveRegimeOptimizer:
     def dynamically_tune_strategies(bot_config: Dict[str, Any], ai_score: float,
                                      current_adx: float,
                                      locked_regime: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        locked_regime: if provided, use that regime key directly (debounce-resolved from
-        caller). Falls back to live threshold logic if None (e.g. outside heartbeat context).
-        """
-        if bot_config.get("comboConfig", {}).get("combinationRule") == "AND":
+        # FIX: use helper so hybridMode is honoured when comboConfig is absent/stale
+        if _get_combo_rule(bot_config) == "AND":
             return bot_config.get("strategies", [])
         regime = locked_regime or PredictiveRegimeOptimizer.get_regime_key(ai_score, current_adx)
         return PredictiveRegimeOptimizer.get_strategies_for_regime(regime)
@@ -445,15 +439,9 @@ class NeuralPredictor:
         """
         Output contract: returns P(next candle move is net-positive / long).
         Expected range [0.0, 1.0] — 1.0 = strong bull, 0.0 = strong bear, 0.5 = neutral.
-
-        The short-direction gate uses (1.0 - conf) >= threshold, which is only mathematically
-        valid when this function returns a binary long-probability.  If the underlying
-        StackingPredictor is retrained with a different output type (regression, multi-class),
-        revise the gate_passed logic in StrategyBrain.calculate_signals accordingly.
         """
         try:
             council = get_cached_predictor(symbol=symbol, timeframe="1h")
-            # MERGED FIX (Doc7): prefer get_prediction_score when available
             if hasattr(council, 'get_prediction_score'):
                 prediction = council.get_prediction_score(df)
             else:
@@ -462,6 +450,28 @@ class NeuralPredictor:
         except Exception as e:
             logger.error(f"🧠 Council Predictor Error: {e}")
             return 0.5
+
+
+# ============================================================
+# 🔧 COMBO RULE HELPER
+# ============================================================
+def _get_combo_rule(config: Dict[str, Any]) -> str:
+    """
+    Read the combination rule with a two-key fallback chain so a stale or
+    missing comboConfig never silently forces AND mode on a user who chose OR.
+
+    Priority:
+      1. config["comboConfig"]["combinationRule"]  — set explicitly by handleConfirmStart
+      2. config["hybridMode"]                      — top-level spread from formConfig
+      3. "OR"                                      — safe default
+    """
+    from_combo = config.get("comboConfig", {}).get("combinationRule")
+    if from_combo:
+        return from_combo
+    from_hybrid = config.get("hybridMode")
+    if from_hybrid:
+        return from_hybrid
+    return "OR"
 
 
 # ==========================================
@@ -494,25 +504,14 @@ class StrategyBrain:
                           symbol: str = "BTC-USD",
                           precomputed_conf: Optional[float] = None,
                           live_price: Optional[float] = None):
-        """
-        FIX (High): precomputed_conf — caller passes the already-computed ML score so
-        NeuralPredictor is only called once per tick, preventing score divergence between
-        the regime selector and the gate check.
-
-        FIX (Medium): live_price — caller passes current_price separately so that df_raw
-        can be df_closed_history (indicator votes on confirmed candles only), while all
-        explicit price comparisons (vs EMA, ATR targets, BB bands) still use the live tick.
-        """
         active_thoughts, votes = [], 0
         signals_map   = {}
         strategies    = config.get('strategies', [])
 
-        # Use live_price for all current-price comparisons; df_raw supplies indicator history.
-        # When live_price is None (e.g. direct calls from tests), fall back to df_raw's last close.
         current_price = live_price if live_price is not None else float(df_raw['close'].iloc[-1])
 
         ema20  = ta.ema(df_raw['close'], length=20).iloc[-1]
-        ema50  = ta.ema(df_raw['close'], length=50).iloc[-1]   # reserved
+        ema50  = ta.ema(df_raw['close'], length=50).iloc[-1]
         ema200 = ta.ema(df_raw['close'], length=200).iloc[-1]
         bb     = ta.bbands(df_raw['close'], length=20, std=2.0)
         lower, mid, upper = bb.iloc[-1, 0], bb.iloc[-1, 1], bb.iloc[-1, 2]
@@ -564,8 +563,6 @@ class StrategyBrain:
                     raw_vote   = 1 if current_price >= high_lb else -1
                 elif code == "vol_profile":
                     v_ma  = ta.sma(df_raw['volume'], length=int(p.get('vol_ma', 20))).iloc[-1]
-                    # df_raw is df_closed_history when called from heartbeat, so .iloc[-1]
-                    # is the last COMPLETED candle's volume — no partial-candle bias here.
                     ratio = df_raw['volume'].iloc[-1] / (v_ma * float(p.get('threshold', 1.5)))
                     confidence = max(0.1, min(1.0, ratio))
                     raw_vote   = (1 if current_price > mid else -1) if ratio >= 1.0 else 0
@@ -593,23 +590,20 @@ class StrategyBrain:
         ui_limit = (float(config.get('mlThresholdShort', 0.55)) if is_short
                     else float(config.get('mlThresholdLong', 0.55)))
 
-        # FIX (High): use pre-computed conf from caller — avoids a second ML call per tick
-        # and ensures the gate check uses the exact same score as the regime selector.
         conf = precomputed_conf if precomputed_conf is not None else NeuralPredictor.get_prediction(
             config.get('mlModel', 'stacking'), df_ai, symbol=symbol)
 
         if config.get('mlMode') == 'off':
             gate_passed = True
         else:
-            # MERGED FIX (Doc7): short direction needs inverted confidence gate.
-            # Relies on NeuralPredictor output contract: conf = P(long). See docstring.
             gate_passed = (conf >= ui_limit) if not is_short else ((1.0 - conf) >= ui_limit)
 
-        rule      = config.get('comboConfig', {}).get('combinationRule', 'OR')
+        # FIX: use helper so hybridMode is honoured when comboConfig is absent/stale
+        rule      = _get_combo_rule(config)
         final_sig = 0
         if gate_passed:
             if rule == "AND":
-                if votes >= len(strategies) and weighted_votes > 0:   final_sig = 1
+                if votes >= len(strategies) and weighted_votes > 0:    final_sig = 1
                 elif votes <= -len(strategies) and weighted_votes < 0: final_sig = -1
             else:
                 min_weighted = float(config.get('minWeightedSignal', 0.3))
@@ -620,7 +614,7 @@ class StrategyBrain:
 
 
 # ============================================================================
-# 🚀 CORE ENGINE HEARTBEAT — 8-TIER SYNCHRONIZED CALCULATION LOOP
+# 🚀 CORE ENGINE HEARTBEAT
 # ============================================================================
 async def live_neural_heartbeat(user_id: str):
     signal_has_reset = True
@@ -696,29 +690,17 @@ async def live_neural_heartbeat(user_id: str):
                     current_adx = 25.0
 
                 try:
-                    vol_ma = float(ta.sma(df_raw['volume'], length=20).iloc[-1])
-                    # FIX (Critical): use the last CLOSED candle's volume (iloc[-2]) rather than
-                    # the current live candle (iloc[-1]).  The live candle's volume accumulates
-                    # from near-zero at candle open, which would block the volume_confirmed gate
-                    # for 30-40 min of every candle — the exact window breakouts matter most.
+                    vol_ma    = float(ta.sma(df_raw['volume'], length=20).iloc[-1])
                     vol_ratio = df_raw['volume'].iloc[-2] / vol_ma if vol_ma > 0 else 1.0
                 except Exception:
                     vol_ratio = 1.0
 
                 # ── TIER 2: AI COUNCIL ────────────────────────────────────────
-                # ML prediction called exactly ONCE per tick here; the result is passed
-                # into all downstream consumers (regime optimizer, strategy brain gate)
-                # so there is no risk of divergence between selector and gate check.
                 conf_score = NeuralPredictor.get_prediction(
                     config.get('mlModel', 'stacking'), df_ai, symbol=ticker_symbol)
 
-                # FIX (High): Regime debounce — only commit to a new strategy set after
-                # REGIME_DEBOUNCE_TICKS consecutive ticks in the new zone.
-                # bot['active_regime'] persists the locked regime across ticks.
-                # bot['regime_pending_ticks'] counts how long the desired regime has differed.
                 desired_regime = PredictiveRegimeOptimizer.get_regime_key(conf_score, current_adx)
                 if 'active_regime' not in bot:
-                    # First tick: commit immediately, no history to debounce against.
                     bot['active_regime']        = desired_regime
                     bot['regime_pending_ticks'] = 0
                 elif desired_regime != bot['active_regime']:
@@ -729,7 +711,6 @@ async def live_neural_heartbeat(user_id: str):
                         bot['regime_pending_ticks'] = 0
                         await emit_log(user_id, f"🔄 REGIME SHIFT: {prev_regime.upper()} → {desired_regime.upper()}")
                 else:
-                    # Desired matches current — reset pending counter.
                     bot['regime_pending_ticks'] = 0
 
                 active_strategies = (
@@ -741,11 +722,6 @@ async def live_neural_heartbeat(user_id: str):
                 )
                 temp_config = {**config, 'strategies': active_strategies}
 
-                # FIX (Medium): Pass df_closed_history as df_raw so all indicator votes
-                # (RSI, MACD, SuperTrend, Stoch, etc.) are computed on confirmed candles only,
-                # eliminating mid-candle indicator drift.  live_price keeps explicit price
-                # comparisons (vs EMA200, ATR targets, BB bands) on the current tick.
-                # precomputed_conf passes the already-computed ML score to skip a second call.
                 sig, thoughts, nums, score, signals_map = StrategyBrain.calculate_signals(
                     df_closed_history, df_ai, temp_config, 0.5, 0.5,
                     symbol=ticker_symbol,
@@ -767,7 +743,6 @@ async def live_neural_heartbeat(user_id: str):
                 else:
                     climb_satisfied = True
 
-                # MERGED FIX (Doc7): simplified is_short_allowed
                 is_short_allowed = (sig != -1) or config.get('enable_shorting', False)
 
                 upnl = sum([
@@ -830,12 +805,56 @@ async def live_neural_heartbeat(user_id: str):
                     (sig == 0)
                 )
 
-                min_gap_seconds = float(config.get('minMinutesBetweenTrades', 60)) * 60
+                # ── DYNAMIC TIME GATE ────────────────────────────────────────
+                # Standard cooldown is 10 minutes.  The gate can be bypassed
+                # early once a 2-minute hard floor has elapsed AND the AI
+                # confidence has both improved since the last entry AND is
+                # trending upward over recent ticks — meaning the market is
+                # genuinely improving, not just bouncing off a local noise peak.
+                #
+                # Hard floor  → prevents re-hammering on fast reversals
+                # Normal gate → 10-minute default inter-trade spacing
+                # Surge path  → 2-min floor + conf ≥8 pts above last entry
+                #                + recent 3-tick trend rising ≥5 pts
+                MIN_COOLDOWN_SECS  = 2 * 60
+                STANDARD_GATE_SECS = float(config.get('minMinutesBetweenTrades', 10)) * 60
+
+                time_since_last = 0.0
+                if bot.get('last_trade_time'):
+                    try:
+                        time_since_last = (
+                            current_time - datetime.fromisoformat(bot['last_trade_time'])
+                        ).total_seconds()
+                    except Exception:
+                        time_since_last = STANDARD_GATE_SECS  # treat as expired
+
+                past_floor  = time_since_last >= MIN_COOLDOWN_SECS
+                past_normal = time_since_last >= STANDARD_GATE_SECS
+
+                # How much has confidence improved since the last trade entry?
+                conf_at_last_entry = float(bot.get('last_trade_conf', 0.0))
+                conf_improvement   = score - conf_at_last_entry  # positive = risen
+
+                # Is confidence trending up over the last 6 equity-curve points?
+                recent_curve  = bot.get('equityCurve', [])[-6:]
+                recent_confs  = [p.get('confidence', 50) / 100.0 for p in recent_curve]
+                if len(recent_confs) >= 4:
+                    half          = len(recent_confs) // 2
+                    earlier_avg   = sum(recent_confs[:half])  / half
+                    later_avg     = sum(recent_confs[half:])  / half
+                    conf_trending = (later_avg - earlier_avg) >= 0.05
+                else:
+                    conf_trending = False  # not enough history yet
+
+                # Gate passes when:
+                #   A) Normal: standard gap elapsed, OR
+                #   B) Surge:  2-min floor cleared + conf rose ≥8 pts + trend up
                 time_gate_passed = (
                     not bot.get('last_trade_time') or
-                    (current_time - datetime.fromisoformat(bot['last_trade_time'])
-                     ).total_seconds() >= min_gap_seconds
+                    past_normal or
+                    (past_floor and conf_improvement >= 0.08 and conf_trending)
                 )
+                min_gap_seconds = STANDARD_GATE_SECS  # kept for rejection logger
 
                 all_filters_pass = (
                     is_volatility_safe and not is_circuit_breaker_tripped and
@@ -849,9 +868,10 @@ async def live_neural_heartbeat(user_id: str):
 
                 raw_sig = 0
                 votes_t = sum([1 if signals_map.get(s['code'], 0) > 0.5 else -1 for s in active_strategies])
-                rule    = config.get('comboConfig', {}).get('combinationRule', 'OR')
+                # FIX: use helper so hybridMode is honoured when comboConfig is absent/stale
+                rule    = _get_combo_rule(config)
                 if rule == "AND":
-                    if votes_t >= len(active_strategies):  raw_sig = 1
+                    if votes_t >= len(active_strategies):    raw_sig = 1
                     elif votes_t <= -len(active_strategies): raw_sig = -1
                 else:
                     if votes_t > 0:  raw_sig = 1
@@ -881,7 +901,7 @@ async def live_neural_heartbeat(user_id: str):
                     await emit_log(user_id, combined_status)
                     last_log = now_ts
 
-                # ── TIER 5b: UI BROADCAST + REGIME ───────────────────────────
+                # ── TIER 5b: UI BROADCAST ─────────────────────────────────────
                 if (now_ts - last_ui_update) >= 10:
                     exposure_pct = (round((sum([p['entry'] * p['size'] for p in bot['positions']])
                                            / current_equity) * 100, 1)
@@ -914,14 +934,17 @@ async def live_neural_heartbeat(user_id: str):
 
                     closed_trades = [t for t in bot.get('trade_history', []) if t.get('type') == 'exit']
                     if closed_trades:
-                        wins         = len([t for t in closed_trades if float(t.get('pnl', 0)) > 0])
-                        win_rate     = round((wins / len(closed_trades)) * 100, 1)
-                        gross_profit = sum(float(t.get('pnl', 0)) for t in closed_trades if float(t.get('pnl', 0)) > 0)
-                        gross_loss   = abs(sum(float(t.get('pnl', 0)) for t in closed_trades if float(t.get('pnl', 0)) < 0))
+                        wins          = len([t for t in closed_trades if float(t.get('pnl', 0)) > 0])
+                        win_rate      = round((wins / len(closed_trades)) * 100, 1)
+                        gross_profit  = sum(float(t.get('pnl', 0)) for t in closed_trades if float(t.get('pnl', 0)) > 0)
+                        gross_loss    = abs(sum(float(t.get('pnl', 0)) for t in closed_trades if float(t.get('pnl', 0)) < 0))
                         profit_factor = (round(gross_profit / gross_loss, 2) if gross_loss > 0
                                          else (round(gross_profit, 2) if gross_profit > 0 else 1.0))
                     else:
                         win_rate, profit_factor = 0.0, 1.0
+
+                    # FIX: compute daily_profit for the MetricCard
+                    daily_profit = round(current_equity - start_capital, 2)
 
                     bot.update({
                         "currentBalance":    round(current_equity, 2),
@@ -935,17 +958,52 @@ async def live_neural_heartbeat(user_id: str):
                         "aiDeployedGear":    deployed_gear,
                         "winRate":           win_rate,
                         "profitFactor":      profit_factor,
+                        "dailyProfit":       daily_profit,
                     })
+
+                    # FIX: append equity curve point BEFORE emit so the payload
+                    # contains the up-to-date curve (previously appended after emit).
+                    bot["equityCurve"].append({
+                        "time":       datetime.now().isoformat(),
+                        "balance":    round(current_equity, 2),
+                        "confidence": int(score * 100)
+                    })
+                    if len(bot["equityCurve"]) > 300:
+                        bot["equityCurve"].pop(0)
+
+                    # FIX: diagnostic log so you can confirm emit_status is actually reached.
+                    # Remove or set to DEBUG once charts are confirmed working.
+                    logger.info(
+                        f"📡 emit_status → {user_id} | "
+                        f"balance=${bot['currentBalance']:.2f} | "
+                        f"conf={bot['currentConfidence']}% | "
+                        f"signals={list(signals_map.keys())} | "
+                        f"equity_pts={len(bot['equityCurve'])}"
+                    )
+
+                    # FIX: emit_status payload now includes equityCurve, dailyProfit,
+                    # startedAt, and tradeHistory — previously missing keys that caused
+                    # the equity/confidence area charts to stay blank until the frontend
+                    # accumulated 2+ events from its own local curve builder.
                     await emit_status(user_id, {
                         "status":            "running",
                         "currentBalance":    bot["currentBalance"],
+                        "currentConfidence": bot["currentConfidence"],
+                        "signalsMap":        bot["signalsMap"],
+                        # FIX: equityCurve was never emitted via socket — charts built
+                        # locally were blank until 2+ events arrived (min ~20 s).
+                        "equityCurve":       bot["equityCurve"],
+                        # FIX: dailyProfit was absent — MetricCard showed 0 on every reconnect.
+                        "dailyProfit":       bot["dailyProfit"],
+                        # FIX: startedAt was absent — uptime timer reset on reconnect.
+                        "startedAt":         bot.get("startedAt"),
                         "exposure":          bot["exposure"],
                         "activePositions":   bot['positions'],
                         "unrealizedPnl":     bot["unrealizedPnl"],
+                        # FIX: send under both keys so the frontend fallback chain always hits.
+                        "tradeHistory":      bot['trade_history'],
                         "tradeMarkers":      bot['trade_history'],
                         "candles":           bot["candles"],
-                        "currentConfidence": bot["currentConfidence"],
-                        "signalsMap":        bot["signalsMap"],
                         "initialCapital":    start_capital,
                         "aiRegimeTitle":     bot["aiRegimeTitle"],
                         "aiRegimeDesc":      bot["aiRegimeDesc"],
@@ -953,21 +1011,33 @@ async def live_neural_heartbeat(user_id: str):
                         "winRate":           bot["winRate"],
                         "profitFactor":      bot["profitFactor"],
                     })
-                    bot["equityCurve"].append({
-                        "time": datetime.now().isoformat(),
-                        "balance": round(current_equity, 2),
-                        "confidence": int(score * 100)
-                    })
-                    if len(bot["equityCurve"]) > 300: bot["equityCurve"].pop(0)
+
+                    logger.info(f"✅ emit_status dispatched for {user_id}")
                     last_ui_update = now_ts
 
                 # ── TIER 6: REJECTION LOGGER ──────────────────────────────────
                 if sig != 0 and not all_filters_pass:
                     reasons = []
                     if not time_gate_passed:
-                        elapsed = ((current_time - datetime.fromisoformat(bot['last_trade_time'])
-                                    ).total_seconds() / 60 if bot.get('last_trade_time') else 0)
-                        reasons.append(f"time gate ({elapsed:.0f}/{min_gap_seconds/60:.0f} min)")
+                        elapsed_min    = time_since_last / 60
+                        normal_min     = STANDARD_GATE_SECS / 60
+                        floor_min      = MIN_COOLDOWN_SECS  / 60
+                        surge_eligible = past_floor and conf_improvement >= 0.08
+                        if not past_floor:
+                            reasons.append(
+                                f"hard floor ({elapsed_min:.0f}/{floor_min:.0f} min)"
+                            )
+                        elif not surge_eligible:
+                            reasons.append(
+                                f"time gate ({elapsed_min:.0f}/{normal_min:.0f} min, "
+                                f"conf Δ{int(conf_improvement*100):+}% — need +8% surge to bypass)"
+                            )
+                        else:
+                            # Floor cleared and conf rose, but trend not yet up
+                            reasons.append(
+                                f"time gate ({elapsed_min:.0f}/{normal_min:.0f} min, "
+                                f"conf Δ{int(conf_improvement*100):+}% but trend still flat)"
+                            )
                     if not is_short_allowed: reasons.append("Spot mode cannot short sell")
                     if not is_volatility_safe:
                         if atr_pct < min_atr_pct: reasons.append(f"ATR {atr_pct:.2f}% too flat (min {min_atr_pct}%)")
@@ -986,8 +1056,6 @@ async def live_neural_heartbeat(user_id: str):
                     if (sig == 1 and climb_satisfied) or (sig == -1 and climb_satisfied):
                         trade_type     = "long" if sig == 1 else "short"
                         raw_risk       = config.get('riskPercentage') or config.get('risk_percentage') or 1.0
-                        # FIX (Critical): size against current_equity (cash + unrealized P&L)
-                        # so gains compound while positions are open, not only after they close.
                         size_in_fiat   = current_equity * (float(raw_risk) / 100.0 / max_p)
                         size_in_crypto = size_in_fiat / current_price
                         safe_size      = float(f"{size_in_crypto:.6f}")
@@ -1024,22 +1092,25 @@ async def live_neural_heartbeat(user_id: str):
                                          else actual_entry_price - current_atr * 1.5)
 
                         bot['positions'].append({
-                            "symbol":            symbol,
-                            "type":              trade_type,
-                            "entry":             actual_entry_price,
-                            "size":              safe_size,
-                            "time":              current_time.isoformat(),
-                            "entry_conf":        score,
-                            "tp":                tp_price_calc,
-                            "sl":                sl_price_calc,
-                            "tsl":               sl_price_calc,
-                            "partial_tp":        partial_tp,
-                            "partial_taken":     False,
-                            "atr_at_entry":      round(current_atr, 4),   # stable trailing distance (Doc7)
-                            "adx_at_entry":      round(current_adx, 1),
+                            "symbol":             symbol,
+                            "type":               trade_type,
+                            "entry":              actual_entry_price,
+                            "size":               safe_size,
+                            "time":               current_time.isoformat(),
+                            "entry_conf":         score,
+                            "tp":                 tp_price_calc,
+                            "sl":                 sl_price_calc,
+                            "tsl":                sl_price_calc,
+                            "partial_tp":         partial_tp,
+                            "partial_taken":      False,
+                            "atr_at_entry":       round(current_atr, 4),
+                            "adx_at_entry":       round(current_adx, 1),
                             "vol_ratio_at_entry": round(vol_ratio, 2),
                         })
                         bot['last_trade_time'] = current_time.isoformat()
+                        # Store the confidence score at entry so the dynamic time gate
+                        # can measure improvement on the next trade opportunity.
+                        bot['last_trade_conf'] = score
                         rr = round(atr_tp_mult / atr_sl_mult, 1)
                         await emit_log(user_id,
                                        f"🚀 ENTERED {trade_type.upper()} @ ${actual_entry_price:,.2f} | "
@@ -1051,13 +1122,9 @@ async def live_neural_heartbeat(user_id: str):
                 for pos in bot['positions'][:]:
                     closed      = False
                     exit_reason = ""
-                    pos_atr     = pos.get('atr_at_entry', current_atr)  # stable ATR (Doc7)
+                    pos_atr     = pos.get('atr_at_entry', current_atr)
                     trail_dist  = pos_atr * atr_sl_mult
 
-                    # MERGED FIX (Doc7):
-                    #   - guard with enablePartialExit config flag
-                    #   - default partial_taken to False (Doc8 had True — silently skipped all exits)
-                    #   - NO continue after partial exit (TSL must ratchet same tick)
                     if config.get('enablePartialExit', False) and not pos.get('partial_taken', False):
 
                         if pos['type'] == 'long' and current_price >= pos.get('partial_tp', float('inf')):
@@ -1087,7 +1154,6 @@ async def live_neural_heartbeat(user_id: str):
                             await emit_log(user_id, f"💎 PARTIAL LONG EXIT: 50% at ${current_price:,.2f} | Locked ${partial_pnl:.2f} | Stop → Breakeven")
                             bot['trade_history'].append({"type": "partial_exit", "side": pos['type'], "price": current_price, "pnl": round(partial_pnl, 2), "time": int(time.time() * 1000)})
                             DatabaseHandler.save_state(user_id, bot)
-                            # NO continue — TSL ratchets this tick
 
                         elif pos['type'] == 'short' and current_price <= pos.get('partial_tp', float('-inf')):
                             half_size   = pos['size'] / 2.0
@@ -1116,7 +1182,6 @@ async def live_neural_heartbeat(user_id: str):
                             await emit_log(user_id, f"💎 PARTIAL SHORT EXIT: 50% at ${current_price:,.2f} | Locked ${partial_pnl:.2f} | Stop → Breakeven")
                             bot['trade_history'].append({"type": "partial_exit", "side": pos['type'], "price": current_price, "pnl": round(partial_pnl, 2), "time": int(time.time() * 1000)})
                             DatabaseHandler.save_state(user_id, bot)
-                            # NO continue — TSL ratchets this tick
 
                     # Trailing stop ratchet
                     if pos['type'] == 'long':
@@ -1146,7 +1211,6 @@ async def live_neural_heartbeat(user_id: str):
                                     fmt_size = float(user_exchange.amount_to_precision(symbol, pos['size']))
                                     order = await user_exchange.create_market_order(symbol, close_side, fmt_size, params=order_params)
                                     actual_close_price = order.get('average') or order.get('price') or current_price
-                                    # Sync real balance from exchange
                                     balance_data = await user_exchange.fetch_balance()
                                     real_fiat = balance_data.get('USD', {}).get('free') or balance_data.get('USDC', {}).get('free')
                                     if real_fiat: bot['balance'] = float(real_fiat)
@@ -1160,11 +1224,10 @@ async def live_neural_heartbeat(user_id: str):
                         if not is_live_trading: bot['balance'] += net_pnl
 
                         bot['positions'].remove(pos)
-                        # MERGED FIX (Doc7): include `entry` field in exit record
                         bot['trade_history'].append({
                             "type":   "exit",
                             "side":   pos['type'],
-                            "entry":  pos['entry'],       # ← restored from Doc7
+                            "entry":  pos['entry'],
                             "price":  actual_close_price,
                             "pnl":    round(net_pnl, 2),
                             "reason": exit_reason,
@@ -1182,7 +1245,7 @@ async def live_neural_heartbeat(user_id: str):
                 await asyncio.sleep(0.5)
 
             except Exception as e:
-                logger.error(f"❌ WS Stream Error: {e}")
+                logger.error(f"❌ WS Stream Error: {e}", exc_info=True)
                 await asyncio.sleep(5)
     finally:
         logger.info(f"🔌 Heartbeat loop terminated for {user_id}")
@@ -1254,8 +1317,12 @@ async def start_bot(data: BotStartRequest):
 
     DatabaseHandler.save_state(user_id, ACTIVE_BOTS[user_id])
     await emit_status(user_id, {
-        "status": "running", "currentBalance": ACTIVE_BOTS[user_id]["balance"],
-        "candles": processed_candles, "startedAt": ACTIVE_BOTS[user_id]["startedAt"],
+        "status":     "running",
+        "currentBalance": ACTIVE_BOTS[user_id]["balance"],
+        "candles":    processed_candles,
+        "startedAt":  ACTIVE_BOTS[user_id]["startedAt"],
+        "equityCurve": ACTIVE_BOTS[user_id]["equityCurve"],
+        "initialCapital": ui_capital,
     })
     loop = asyncio.get_event_loop()
     task = loop.create_task(live_neural_heartbeat(user_id))
@@ -1355,7 +1422,12 @@ async def get_status(userId: str):
             "config":            bot.get("config"),
             "candles":           bot.get("candles", []),
             "trade_history":     bot.get('trade_history', []),
+            "tradeHistory":      bot.get('trade_history', []),
             "tradeMarkers":      bot.get('trade_history', []),
+            "dailyProfit":       bot.get("dailyProfit", 0),
+            "initialCapital":    (bot.get("config", {}).get("capitalAllocation") or
+                                  bot.get("config", {}).get("initialBalance") or
+                                  bot.get("balance", 0)),
             "aiRegimeTitle":     bot.get("aiRegimeTitle",  "Mean-Reverting Consolidation"),
             "aiRegimeDesc":      bot.get("aiRegimeDesc",   "Sideways Range"),
             "aiDeployedGear":    bot.get("aiDeployedGear", "Syncing Core Strategy Modules..."),

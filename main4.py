@@ -441,14 +441,25 @@ class NeuralPredictor:
         Expected range [0.0, 1.0] — 1.0 = strong bull, 0.0 = strong bear, 0.5 = neutral.
         """
         try:
-            council = get_cached_predictor(symbol=symbol, timeframe="1h")
+            council    = get_cached_predictor(symbol=symbol, timeframe="1h")
             if hasattr(council, 'get_prediction_score'):
                 prediction = council.get_prediction_score(df)
             else:
                 prediction = council.predict_direction(df)
-            return float(prediction)
+            val = float(prediction)
+            # If the model always returns exactly 0.5 the predictor is likely
+            # failing silently (missing model file, NaN features, wrong input
+            # shape).  Log a warning so it shows up distinctly in Render logs.
+            if val == 0.5:
+                logger.warning(
+                    "🧠 Predictor returned exactly 0.5 — possible silent failure "
+                    "(check model path, feature columns, and NaN inputs)"
+                )
+            return val
         except Exception as e:
-            logger.error(f"🧠 Council Predictor Error: {e}")
+            # exc_info=True attaches the full traceback so the root cause
+            # (missing file, shape mismatch, etc.) is visible in logs.
+            logger.error(f"🧠 Council Predictor Error: {e}", exc_info=True)
             return 0.5
 
 
@@ -535,7 +546,10 @@ class StrategyBrain:
                     f   = ta.sma(df_raw['close'], length=int(p.get('fast_sma', 50))).iloc[-1]
                     s   = ta.sma(df_raw['close'], length=int(p.get('slow_sma', 200))).iloc[-1]
                     gap = abs(f - s) / s
-                    confidence = 1.0 if f > s else max(0.1, min(0.95, 1.0 - (gap * 50)))
+                    # FIX: symmetric — larger crossover gap = stronger conviction
+                    # regardless of direction.  Prior code gave long=1.0 always
+                    # while large bear gaps produced near-zero short confidence.
+                    confidence = max(0.1, min(1.0, 0.5 + gap * 25))
                     raw_vote   = 1 if f > s else -1
                 elif code == "macd_crossover":
                     macd      = ta.macd(df_raw['close'], fast=int(p.get('fast', 12))).iloc[-1]
@@ -545,21 +559,45 @@ class StrategyBrain:
                 elif code == "supertrend":
                     st_data = ta.supertrend(df_raw['high'], df_raw['low'], df_raw['close']).iloc[-1]
                     dist    = abs(current_price - st_data[0]) / current_price
-                    confidence = 1.0 if st_data[1] == 1 else max(0.1, min(0.95, 1.0 - (dist * 20)))
+                    # FIX: symmetric — further from the SuperTrend line = stronger signal.
+                    # Prior code gave long=1.0 but shrank bear confidence as the
+                    # distance grew, so deep downtrends showed minimum conviction.
+                    confidence = max(0.1, min(1.0, 0.5 + dist * 10))
                     raw_vote   = 1 if st_data[1] == 1 else -1
                 elif code == "bb_fade":
-                    confidence = max(0.1, min(1.0, pr / 100.0))
-                    if current_price < lower:   raw_vote = 1
-                    elif current_price > upper: raw_vote = -1
+                    # FIX: prior code used pr/100 which goes negative when price
+                    # is below the lower band — the strongest long signal got
+                    # confidence clamped to 0.1 (minimum).  Now confidence scales
+                    # with how far price has broken outside the relevant band edge.
+                    band_width = max(upper - lower, current_price * 0.001)
+                    if current_price < lower:
+                        raw_vote   = 1
+                        excess     = (lower - current_price) / band_width
+                        confidence = max(0.1, min(1.0, 0.5 + excess * 2))
+                    elif current_price > upper:
+                        raw_vote   = -1
+                        excess     = (current_price - upper) / band_width
+                        confidence = max(0.1, min(1.0, 0.5 + excess * 2))
+                    else:
+                        raw_vote   = 0
+                        confidence = max(0.1, min(0.4, abs(pr - 50) / 125))
                 elif code == "atr_breakout":
                     atr    = ta.atr(df_raw['high'], df_raw['low'], df_raw['close']).iloc[-1]
                     target = ema20 + (atr * float(p.get('multiplier', 1.5)))
-                    confidence = max(0.1, min(1.0, current_price / target))
+                    # FIX: prior code used price/target which gave confidence > 1
+                    # only for longs and < 1 for shorts — making bears near target
+                    # appear confident while bears far below it looked weak.
+                    dist_pct   = abs(current_price - target) / target
+                    confidence = max(0.1, min(1.0, 0.5 + dist_pct * 5))
                     raw_vote   = 1 if current_price > target else -1
                 elif code == "pa_breakout":
                     lb      = int(p.get('lookback', 20))
                     high_lb = df_raw['high'].tail(lb).max()
-                    confidence = max(0.1, min(1.0, current_price / high_lb))
+                    # FIX: prior code used price/high_lb — approaching the high
+                    # from below gave high confidence for the SHORT vote while
+                    # being far below it (stronger bear) gave low confidence.
+                    dist_pct   = abs(current_price - high_lb) / high_lb
+                    confidence = max(0.1, min(1.0, 0.5 + dist_pct * 5))
                     raw_vote   = 1 if current_price >= high_lb else -1
                 elif code == "vol_profile":
                     v_ma  = ta.sma(df_raw['volume'], length=int(p.get('vol_ma', 20))).iloc[-1]
@@ -576,7 +614,9 @@ class StrategyBrain:
                     f_ema = ta.ema(df_raw['close'], length=int(p.get('fast_ema', 9))).iloc[-1]
                     s_ema = ta.ema(df_raw['close'], length=int(p.get('slow_ema', 21))).iloc[-1]
                     gap   = abs(f_ema - s_ema) / s_ema
-                    confidence = 1.0 if f_ema > s_ema else max(0.1, min(0.95, 1.0 - (gap * 100)))
+                    # FIX: symmetric — larger cloud gap = stronger conviction.
+                    # Prior code: long=1.0 always; bear gaps reduced short confidence.
+                    confidence = max(0.1, min(1.0, 0.5 + gap * 50))
                     raw_vote   = 1 if f_ema > s_ema else -1
                 else:
                     confidence = 0.5
@@ -1230,11 +1270,19 @@ async def live_neural_heartbeat(user_id: str):
                     # FIX: compute daily_profit for the MetricCard
                     daily_profit = round(current_equity - start_capital, 2)
 
+                    # FIX: NeuralPredictor output is P(bull) — a value near 0
+                    # means strong bear conviction, but displaying it raw shows
+                    # "5% confidence" during the bot's best short setups.
+                    # Invert for display when we are in a short market so the
+                    # confidence ring always shows directional conviction.
+                    is_short_market = current_price < current_ema200
+                    display_conf    = int((1.0 - score) * 100) if is_short_market else int(score * 100)
+
                     bot.update({
                         "currentBalance":    round(current_equity, 2),
                         "unrealizedPnl":     round(upnl, 2),
                         "exposure":          exposure_pct,
-                        "currentConfidence": int(score * 100),
+                        "currentConfidence": display_conf,
                         "signalsMap":        signals_map,
                         "candles":           latest_candles,
                         "aiRegimeTitle":     regime_title,
@@ -1250,7 +1298,7 @@ async def live_neural_heartbeat(user_id: str):
                     bot["equityCurve"].append({
                         "time":       datetime.now().isoformat(),
                         "balance":    round(current_equity, 2),
-                        "confidence": int(score * 100)
+                        "confidence": display_conf   # direction-aware (inverted for shorts)
                     })
                     if len(bot["equityCurve"]) > 300:
                         bot["equityCurve"].pop(0)

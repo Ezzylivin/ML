@@ -3,6 +3,7 @@
 
 import requests
 import os
+import asyncio
 
 # 🟢 CONFIG: Point this to your Node.js Backend
 # If running locally, use http://localhost:10000 (or whatever port server.js uses)
@@ -37,10 +38,12 @@ def broadcast(user_id, event_type, data):
         pass
 
 # 🟢 HELPER 1: Send a Log Message (The "Thinking" Stream)
-def emit_log(user_id, message):
-    broadcast(user_id, "bot_log", message)
+# async so callers can `await emit_log(...)`; the blocking HTTP POST runs in a
+# worker thread so it never stalls the async trading loop.
+async def emit_log(user_id, message):
+    await asyncio.to_thread(broadcast, user_id, "bot_log", message)
 
 # 🟢 HELPER 2: Send a Status/Balance Update
-def emit_status(user_id, status_data):
+async def emit_status(user_id, status_data):
     # status_data should be a dict like: {'status': 'running', 'currentBalance': 500.0}
-    broadcast(user_id, "bot_status_update", status_data)
+    await asyncio.to_thread(broadcast, user_id, "bot_status_update", status_data)

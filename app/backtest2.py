@@ -245,11 +245,11 @@ class Backtester:
                     if signal == 1 and self.params.get('trade_direction') != 'SHORT':
                         position = 'long'
                         entry_price = row['close']
-                        trades.append({'type': 'buy', 'price': entry_price, 'time': str(row.name)})
+                        trades.append({'type': 'buy', 'price': entry_price, 'time': str(row.name), 'balance': round(balance, 2)})
                     elif signal == -1 and self.params.get('trade_direction') != 'LONG':
                         position = 'short'
                         entry_price = row['close']
-                        trades.append({'type': 'sell', 'price': entry_price, 'time': str(row.name)})
+                        trades.append({'type': 'sell', 'price': entry_price, 'time': str(row.name), 'balance': round(balance, 2)})
                 
                 elif position == 'long' and signal == -1:
                     balance *= (1 + (row['close'] - entry_price)/entry_price)
@@ -266,7 +266,9 @@ class Backtester:
             # 🟢 STEP 3: PREPARE FINAL STRUCTURE FOR NODE.JS
             # We must include 'candleData' and 'metrics' as top-level keys
             chart_df = df.reset_index().rename(columns={'index': 'time', 'datetime': 'time', 'timestamp': 'time'})
-            chart_df['time'] = chart_df['time'].astype(str)
+            # Emit candle time as Unix seconds (what the frontend chart expects).
+            # Previously sent as an ISO string, which the chart parsed as epoch 0 (1970).
+            chart_df['time'] = (pd.to_datetime(chart_df['time']).astype('int64') // 10**9)
             candle_data = chart_df[['time', 'open', 'high', 'low', 'close']].to_dict('records')
 
             roi = ((balance - self.initial_balance) / self.initial_balance) * 100

@@ -245,4 +245,3 @@ class Backtester:
             import traceback
             traceback.print_exc()
             return {"status": "failed", "error": str(e), "metrics": {"roi": -100}}
-(venv) root@intelligent-mendel:~/Project/ML# 

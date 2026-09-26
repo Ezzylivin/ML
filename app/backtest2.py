@@ -79,6 +79,45 @@ class RawModelAdapter:
             logger.error(f"Prediction Error: {e}")
             return 0.5
 
+    def predict_direction_batch(self, df):
+        """Vectorized predict: one buy-probability per row, in a single
+        predict_proba call. Each row's prediction uses only that row's features
+        (same as predict_direction on an expanding slice), so this is
+        mathematically identical to the per-bar loop but O(n) instead of O(n^2)."""
+        try:
+            frame = df.copy()
+            if self.feature_names:
+                available = list(frame.columns)
+                missing = [f for f in self.feature_names if f not in available]
+                if missing:
+                    our_bbl = next((c for c in available if c.startswith("BBL")), None)
+                    our_bbu = next((c for c in available if c.startswith("BBU")), None)
+                    model_bbl = next((f for f in missing if f.startswith("BBL")), None)
+                    model_bbu = next((f for f in missing if f.startswith("BBU")), None)
+                    if our_bbl and model_bbl:
+                        frame.rename(columns={our_bbl: model_bbl}, inplace=True)
+                    if our_bbu and model_bbu:
+                        frame.rename(columns={our_bbu: model_bbu}, inplace=True)
+                final_missing = [f for f in self.feature_names if f not in frame.columns]
+                if final_missing:
+                    return np.full(len(df), 0.5)
+                X = frame[self.feature_names]
+            else:
+                cols_to_exclude = ['datetime', 'timestamp', 'time', 'date', 'target']
+                X = frame.drop(columns=[c for c in cols_to_exclude if c in frame.columns], errors='ignore')
+
+            if self.scaler:
+                X = self.scaler.transform(X)
+
+            if hasattr(self.model, "predict_proba"):
+                proba = self.model.predict_proba(X)
+                col = 2 if proba.shape[1] == 3 else 1
+                return proba[:, col]
+            return np.asarray(self.model.predict(X), dtype=float)
+        except Exception as e:
+            logger.error(f"Batch Prediction Error: {e}")
+            return np.full(len(df), 0.5)
+
 class Backtester:
     def __init__(self, config: dict):
         self.config = config # Keep original for reference
@@ -152,9 +191,9 @@ class Backtester:
             
         return df.dropna()
 
-    def run(self):
+    async def run(self):
         try:
-            df = self.load_data()
+            df = await self.load_data()
             df = self.calculate_indicators(df)
             
             if len(df) < 10:
@@ -166,18 +205,22 @@ class Backtester:
                 if payload:
                     ml_model = RawModelAdapter(payload)
 
+            # Batch all ML inference up front: one predict_proba over the whole
+            # frame instead of one call per bar on an expanding slice (O(n) vs O(n^2)).
+            ml_probs = ml_model.predict_direction_batch(df) if ml_model else None
+
             balance = self.initial_balance
             position = None
             trades = []
+            equity_curve = []
 
             for i in range(len(df)):
                 row = df.iloc[i]
-                df_slice = df.iloc[:i+1]
-                
+
                 # 1. Regime Detection
                 regime = "TREND"
-                if ml_model:
-                    buy_prob = ml_model.predict_direction(df_slice)
+                if ml_probs is not None:
+                    buy_prob = ml_probs[i]
                     # Use confidence interval
                     if abs(buy_prob - 0.5) * 2 < self.ml_conf_threshold:
                         regime = "RANGE"
@@ -212,13 +255,13 @@ class Backtester:
                     balance *= (1 + (row['close'] - entry_price)/entry_price)
                     position = None
                     trades.append({'type': 'close_long', 'price': row['close'], 'time': str(row.name), 'balance': balance})
+                    equity_curve.append({"time": str(row.name), "balance": round(balance, 2)})
 
                 elif position == 'short' and signal == 1:
                     balance *= (1 + (entry_price - row['close'])/entry_price)
                     position = None
                     trades.append({'type': 'close_short', 'price': row['close'], 'time': str(row.name), 'balance': balance})
-
-                    equity_curve.append({"time": current_time, "balance": round(balance, 2)})
+                    equity_curve.append({"time": str(row.name), "balance": round(balance, 2)})
 
             # 🟢 STEP 3: PREPARE FINAL STRUCTURE FOR NODE.JS
             # We must include 'candleData' and 'metrics' as top-level keys

@@ -1,4 +1,4 @@
-absl-py==2.3.1
+﻿absl-py==2.3.1
 aiodns==3.5.0
 aiofiles==25.1.0
 aiohappyeyeballs==2.6.1
@@ -258,4 +258,3 @@ yarl==1.22.0
 yfinance==0.2.66
 zope.event==6.1
 zope.interface==8.1.1
-(venv) root@intelligent-mendel:~/Project/ML# 

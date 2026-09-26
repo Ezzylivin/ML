@@ -38,4 +38,3 @@ def emit_log(user_id, message):
 def emit_status(user_id, status_data):
     # status_data should be a dict like: {'status': 'running', 'currentBalance': 500.0}
     broadcast(user_id, "bot_status_update", status_data)
-(venv) root@intelligent-mendel:~/Project/ML# 

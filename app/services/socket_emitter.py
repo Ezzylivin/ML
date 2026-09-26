@@ -7,7 +7,11 @@ import os
 # 🟢 CONFIG: Point this to your Node.js Backend
 # If running locally, use http://localhost:10000 (or whatever port server.js uses)
 # If deployed, use your Render URL
-NODE_BACKEND_URL = os.getenv("NODE_BACKEND_URL", "https://neov6backend.onrender.com") 
+NODE_BACKEND_URL = os.getenv("NODE_BACKEND_URL", "https://neov6backend.onrender.com")
+
+# 🔐 Shared secret for the server-to-server /api/internal/broadcast call.
+# Must match INTERNAL_API_KEY on the Node backend.
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
 
 def broadcast(user_id, event_type, data):
     """
@@ -23,9 +27,11 @@ def broadcast(user_id, event_type, data):
         "data": data
     }
 
+    headers = {"x-internal-key": INTERNAL_API_KEY} if INTERNAL_API_KEY else {}
+
     try:
         # Timeout is fast so the trading bot doesn't hang waiting for the UI
-        requests.post(url, json=payload, timeout=0.5)
+        requests.post(url, json=payload, headers=headers, timeout=0.5)
     except Exception as e:
         # Silent fail is preferred here so trading isn't interrupted by UI lag
         pass

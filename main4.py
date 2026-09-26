@@ -78,6 +78,25 @@ def get_cached_predictor(symbol: str, timeframe: str = "1h") -> StackingPredicto
 # ==========================================
 # 🗄️ DATABASE HANDLER
 # ==========================================
+# ------------------------------------------------------------------
+# 🔐 SECRET REDACTION
+# ------------------------------------------------------------------
+# Exchange credentials arrive inside the bot config and must stay in
+# memory only (ACTIVE_BOTS) for order placement. They must never be
+# written to disk, echoed in responses, or logged.
+_SECRET_KEYS = {
+    "api_keys", "apiKey", "secret", "passphrase",
+    "krakenKey", "krakenSecret", "coinbaseKey", "coinbaseSecret",
+}
+
+
+def _redact_secrets(config):
+    """Return a shallow copy of a config dict with secret fields removed."""
+    if not isinstance(config, dict):
+        return config
+    return {k: v for k, v in config.items() if k not in _SECRET_KEYS}
+
+
 class DatabaseHandler:
     DB_FILE = "bot_state.db"
 
@@ -104,7 +123,7 @@ class DatabaseHandler:
                      (user_id, config, balance, positions, trade_history, equity_curve, logs, status, last_update)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                   (user_id,
-                   json.dumps(bot_data['config']),
+                   json.dumps(_redact_secrets(bot_data['config'])),
                    bot_data['balance'],
                    json.dumps(bot_data['positions']),
                    json.dumps(bot_data['trade_history']),
@@ -213,14 +232,25 @@ async def lifespan(app: FastAPI):
         DatabaseHandler.save_state(user_id, bot)
 
 app = FastAPI(title="NEO-V25.14 Sovereign Engine", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+
+# CORS: restrict to an explicit allowlist. Set ALLOWED_ORIGINS in the
+# environment (comma-separated) for production; defaults to local dev.
+# A wildcard "*" with allow_credentials=True is invalid and unsafe.
+ALLOWED_ORIGINS = [
+    o.strip() for o in os.getenv(
+        "ALLOWED_ORIGINS",
+        "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173",
+    ).split(",") if o.strip()
+]
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc):
-    print(f"❌ DATA ERROR: {exc.errors()}")
-    print(f"❌ RECEIVED BODY: {exc.body}")
-    return JSONResponse(status_code=422, content={"detail": exc.errors(), "body": exc.body})
+    # Do NOT echo or print exc.body — request bodies can contain exchange
+    # API keys/secrets. Log only the validation errors (field + type).
+    logger.warning(f"❌ Request validation error on {request.url.path}: {exc.errors()}")
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 # ==========================================
 # HISTORICAL DATA MANAGEMENT LAYER

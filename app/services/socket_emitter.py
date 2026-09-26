@@ -4,15 +4,9 @@
 import requests
 import os
 import asyncio
+import logging
 
-# 🟢 CONFIG: Point this to your Node.js Backend
-# If running locally, use http://localhost:10000 (or whatever port server.js uses)
-# If deployed, use your Render URL
-NODE_BACKEND_URL = os.getenv("NODE_BACKEND_URL", "https://neov6backend.onrender.com")
-
-# 🔐 Shared secret for the server-to-server /api/internal/broadcast call.
-# Must match INTERNAL_API_KEY on the Node backend.
-INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
+logger = logging.getLogger("SocketEmitter")
 
 def broadcast(user_id, event_type, data):
     """
@@ -21,20 +15,32 @@ def broadcast(user_id, event_type, data):
     if not user_id:
         return
 
-    url = f"{NODE_BACKEND_URL}/api/internal/broadcast"
+    # Read config at CALL TIME (not import time) so it reflects the loaded
+    # environment regardless of import order / when .env is loaded.
+    node_backend_url = os.getenv("NODE_BACKEND_URL", "https://neov6backend.onrender.com")
+    internal_api_key = os.getenv("INTERNAL_API_KEY", "")
+
+    url = f"{node_backend_url}/api/internal/broadcast"
     payload = {
         "userId": user_id,
         "type": event_type, # 'bot_log' or 'bot_status_update'
         "data": data
     }
 
-    headers = {"x-internal-key": INTERNAL_API_KEY} if INTERNAL_API_KEY else {}
+    headers = {"x-internal-key": internal_api_key} if internal_api_key else {}
 
     try:
         # Timeout is fast so the trading bot doesn't hang waiting for the UI
-        requests.post(url, json=payload, headers=headers, timeout=0.5)
-    except Exception as e:
-        # Silent fail is preferred here so trading isn't interrupted by UI lag
+        resp = requests.post(url, json=payload, headers=headers, timeout=0.5)
+        if resp.status_code != 200:
+            # Surface delivery failures (e.g. 401 = INTERNAL_API_KEY mismatch)
+            # so this is diagnosable instead of silently swallowed.
+            logger.warning(
+                f"⚠️ broadcast to backend rejected: HTTP {resp.status_code} "
+                f"(check INTERNAL_API_KEY matches between ML and backend)"
+            )
+    except Exception:
+        # Network errors are non-fatal so trading isn't interrupted by UI lag
         pass
 
 # 🟢 HELPER 1: Send a Log Message (The "Thinking" Stream)

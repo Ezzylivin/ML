@@ -362,7 +362,11 @@ class DiagnosticLayer:
         strategies = config.get('strategies', [])
         try:
             current_price = float(df['close'].iloc[-1])
-            if conf < ui_limit:
+            # Only surface the AI veto when the neural gate is actually active.
+            # In Bypass (mlMode == 'off') the gate is open (see StrategyBrain:
+            # gate_passed = True), so showing "AI VETO" is misleading — fall
+            # through to the pending-conditions view instead.
+            if config.get('mlMode') != 'off' and conf < ui_limit:
                 return f"🛑 AI VETO: Needs {int(ui_limit*100)}% (At {int(conf*100)}%)"
             pending = []
             for strat in strategies:

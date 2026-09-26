@@ -1152,8 +1152,12 @@ async def live_neural_heartbeat(user_id: str):
                 adaptive_gate = effective_score >= adaptive_threshold if config.get('mlMode') == 'on' else True
 
                 atr_pct    = (current_atr / current_price) * 100
-                min_atr_pct = float(config.get('minAtrPct', 0.3))
-                max_atr_pct = float(config.get('maxAtrPct', 3.0))
+                # Loosened volatility band: lower ATR floor (0.3 -> 0.1) and higher
+                # ceiling (3.0 -> 5.0) so quieter/hotter markets aren't filtered out.
+                # NOTE: looser = more trades in marginal conditions; validate in a
+                # backtest before trusting live.
+                min_atr_pct = float(config.get('minAtrPct', 0.1))
+                max_atr_pct = float(config.get('maxAtrPct', 5.0))
                 is_volatility_safe = min_atr_pct <= atr_pct <= max_atr_pct
 
                 is_circuit_breaker_tripped = (

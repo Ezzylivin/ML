@@ -12,27 +12,24 @@ if "/root/Project/ML" not in sys.path:
 
 import asyncio
 import logging
-import joblib
 import json
-import re
-import aiofiles
 import sqlite3
 import numpy as np
 import pandas as pd
 import time
 import pandas_ta as ta
 import ccxt.async_support as ccxt
-import ccxt.pro as ccxtpro
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any, List, Union
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 import uvicorn
 from contextlib import asynccontextmanager
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse
 import aiohttp
 from app.verify.engineer_and_train import apply_mega_features
 
@@ -44,13 +41,14 @@ from app.services.socket_emitter import emit_log, emit_status
 # ============================================================
 from app.config2 import (
     MODEL_DIR,
-    MODEL_STORAGE_DIR,
     RESULTS_DIR,
     DEFAULT_TAKER_FEE,
     KRAKEN_TAKER_FEE,
     FEATURE_COLUMNS,
 )
 from app.predictors.stacking_predictor import StackingPredictor
+from app.predictors.model_factory import clear_model_cache
+from app.services import trade_recorder
 
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -73,6 +71,27 @@ def get_cached_predictor(symbol: str, timeframe: str = "1h") -> StackingPredicto
         _PREDICTOR_CACHE[cache_key] = StackingPredictor(symbol=symbol, timeframe=timeframe)
         logger.info(f"🧠 Cached predictor for {cache_key}")
     return _PREDICTOR_CACHE[cache_key]
+
+
+# ============================================================
+# 🔁 MODEL HOT-RELOAD (paired with retrain_and_promote.py)
+# ============================================================
+RELOAD_SENTINEL = os.path.join(MODEL_DIR, ".reload")
+
+def _maybe_hot_reload(state: dict):
+    """If the retrainer promoted new models, drop cached models so the council
+    reloads fresh weights on the next prediction. Cheap file-stat per call."""
+    try:
+        if not os.path.exists(RELOAD_SENTINEL):
+            return
+        mtime = os.path.getmtime(RELOAD_SENTINEL)
+        if state.get('_last_reload_mtime') != mtime:
+            state['_last_reload_mtime'] = mtime
+            clear_model_cache()
+            _PREDICTOR_CACHE.clear()
+            logger.info("🔁 Hot-reload: promoted models detected — model caches cleared.")
+    except Exception as e:
+        logger.warning(f"hot-reload check failed: {e}")
 
 
 # ==========================================
@@ -164,6 +183,7 @@ class DatabaseHandler:
         return None
 
 DatabaseHandler.init_db()
+trade_recorder.init_ledger()
 
 # --- REQUEST MODELS ---
 class BotStartRequest(BaseModel):
@@ -244,6 +264,23 @@ ALLOWED_ORIGINS = [
 ]
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
+
+# ============================================================
+# 🔐 ENGINE API KEY (shared secret with the Node backend)
+# ============================================================
+# When ENGINE_API_KEY is set, every /api/* call (except /api/health) must carry a
+# matching X-Internal-Key header. Unset = disabled (default), so this is safe to
+# deploy now; set it on BOTH this engine and the Node backend to lock down :8000.
+ENGINE_API_KEY = os.getenv("ENGINE_API_KEY", "")
+
+@app.middleware("http")
+async def _require_internal_key(request, call_next):
+    if ENGINE_API_KEY:
+        p = request.url.path
+        if p.startswith("/api/") and p != "/api/health":
+            if request.headers.get("x-internal-key") != ENGINE_API_KEY:
+                return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+    return await call_next(request)
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc):
@@ -349,7 +386,9 @@ class DiagnosticLayer:
     @staticmethod
     def render_progress(current, target, reverse=False):
         try:
-            pct = (target / current) if not reverse else (current / target)
+            # progress = how far `current` has advanced toward `target`.
+            # (reverse kept for signature compatibility; all callers want this.)
+            pct = (current / target) if target else 0.0
             pct = min(1.0, max(0.0, pct))
             filled = int(pct * 10)
             bar = "┃" + "█" * filled + "░" * (10 - filled) + "┃"
@@ -550,13 +589,13 @@ class StrategyBrain:
                           precomputed_conf: Optional[float] = None,
                           live_price: Optional[float] = None):
         active_thoughts, votes = [], 0
-        signals_map   = {}
-        strategies    = config.get('strategies', [])
+        signals_map    = {}
+        directions_map = {}
+        strategies     = config.get('strategies', [])
 
         current_price = live_price if live_price is not None else float(df_raw['close'].iloc[-1])
 
         ema20  = ta.ema(df_raw['close'], length=20).iloc[-1]
-        ema50  = ta.ema(df_raw['close'], length=50).iloc[-1]
         ema200 = ta.ema(df_raw['close'], length=200).iloc[-1]
         bb     = ta.bbands(df_raw['close'], length=20, std=2.0)
         lower, mid, upper = bb.iloc[-1, 0], bb.iloc[-1, 1], bb.iloc[-1, 2]
@@ -654,11 +693,13 @@ class StrategyBrain:
                     raw_vote   = 1 if f_ema > s_ema else -1
                 else:
                     confidence = 0.5
-                signals_map[code]  = confidence
+                signals_map[code]    = confidence
+                directions_map[code] = raw_vote
                 votes             += raw_vote
                 weighted_votes    += raw_vote * confidence
             except Exception:
-                signals_map[code] = 0.0
+                signals_map[code]    = 0.0
+                directions_map[code] = 0
 
         is_short = current_price < ema200
         ui_limit = (float(config.get('mlThresholdShort', 0.55)) if is_short
@@ -684,7 +725,7 @@ class StrategyBrain:
                 if votes > 0  and weighted_votes >= min_weighted:  final_sig = 1
                 elif votes < 0 and weighted_votes <= -min_weighted: final_sig = -1
 
-        return final_sig, active_thoughts, {}, conf, signals_map
+        return final_sig, active_thoughts, directions_map, conf, signals_map
 
 
 # ============================================================================
@@ -852,36 +893,38 @@ class TradeQualityScorer:
     # ── COMPONENT 3: STRATEGY ALIGNMENT ──────────────────────────────────────
     @staticmethod
     def _score_strategy_alignment(signals_map: dict, active_strategies: list,
-                                   sig: int) -> dict:
+                                   sig: int, directions_map: Optional[dict] = None) -> dict:
         """
         Scores the quality of strategy agreement — 30 points max.
 
-        Vote unanimity     : 12 pts  (% of strategies voting the right way)
-        Mean confidence    : 10 pts  (avg confidence of voting strategies)
+        Vote unanimity     : 12 pts  (% of strategies whose DIRECTION matches)
+        Mean confidence    : 10 pts  (avg confidence of the agreeing strategies)
         Category diversity :  8 pts  (trend + momentum + mean-rev = strongest)
+
+        NOTE: signals_map holds confidence MAGNITUDE (0.1-1.0); the buy/sell
+        direction lives in directions_map (+1/-1/0). Agreement must be measured
+        with directions_map, not by thresholding magnitude at 0.5.
         """
+        directions_map = directions_map or {}
         scores: Dict[str, int] = {}
 
         if not active_strategies:
             return {"total": 10, "max": 30,
                     "breakdown": {"vote_unanimity": 4, "mean_confidence": 4, "diversity": 2}}
 
-        # 1. Vote unanimity
-        direction_agrees = []
-        for s in active_strategies:
-            conf = signals_map.get(s.get('code', ''), 0.5)
-            if sig == 1:   direction_agrees.append(conf > 0.5)
-            else:          direction_agrees.append(conf < 0.5)
-
-        pct = sum(direction_agrees) / len(direction_agrees) if direction_agrees else 0
+        # 1. Vote unanimity - strategies whose signed vote matches the trade
+        agreeing = [s for s in active_strategies
+                    if directions_map.get(s.get('code', ''), 0) == sig and sig != 0]
+        pct = len(agreeing) / len(active_strategies) if active_strategies else 0
         if   pct >= 0.90: scores['vote_unanimity'] = 12
         elif pct >= 0.75: scores['vote_unanimity'] = 9
         elif pct >= 0.60: scores['vote_unanimity'] = 6
         elif pct >= 0.51: scores['vote_unanimity'] = 3
         else:             scores['vote_unanimity'] = 0
 
-        # 2. Mean confidence across all active strategies
-        conf_vals  = [signals_map.get(s.get('code', ''), 0.5) for s in active_strategies]
+        # 2. Mean confidence across the AGREEING strategies (fallback: all)
+        basis      = agreeing if agreeing else active_strategies
+        conf_vals  = [signals_map.get(s.get('code', ''), 0.5) for s in basis]
         mean_conf  = sum(conf_vals) / len(conf_vals) if conf_vals else 0.5
         if   mean_conf >= 0.80: scores['mean_confidence'] = 10
         elif mean_conf >= 0.65: scores['mean_confidence'] = 7
@@ -889,10 +932,10 @@ class TradeQualityScorer:
         elif mean_conf >= 0.35: scores['mean_confidence'] = 2
         else:                   scores['mean_confidence'] = 0
 
-        # 3. Category diversity — multi-family agreement is more robust
+        # 3. Category diversity - among the AGREEING strategies
         categories = {
             TradeQualityScorer.STRATEGY_CATEGORIES.get(s.get('code', ''), 'other')
-            for s in active_strategies
+            for s in (agreeing if agreeing else active_strategies)
         }
         if   len(categories) >= 3: scores['diversity'] = 8
         elif len(categories) == 2: scores['diversity'] = 5
@@ -913,7 +956,9 @@ class TradeQualityScorer:
                  current_price:     float,
                  current_atr:       float,
                  current_adx:       float,
-                 vol_ratio:         float) -> dict:
+                 vol_ratio:         float,
+                 directions_map:    Optional[dict] = None,
+                 min_score:         Optional[float] = None) -> dict:
         """
         Master evaluation. Returns a verdict dict with full breakdown.
 
@@ -929,10 +974,11 @@ class TradeQualityScorer:
         mkt   = cls._score_market_context(df_raw, sig, current_price,
                                            current_atr, current_adx, vol_ratio)
         intel = cls._score_bot_intelligence(bot, ml_score, ui_limit)
-        strat = cls._score_strategy_alignment(signals_map, active_strategies, sig)
+        strat = cls._score_strategy_alignment(signals_map, active_strategies, sig, directions_map)
 
         composite = mkt['total'] + intel['total'] + strat['total']
-        approved  = composite >= cls.MIN_ENTRY_SCORE
+        _min = cls.MIN_ENTRY_SCORE if min_score is None else float(min_score)
+        approved  = composite >= _min
 
         if   composite >= 85: verdict = "ELITE SETUP — maximum multi-factor conviction"
         elif composite >= 75: verdict = "HIGH QUALITY — strong cross-domain alignment"
@@ -978,6 +1024,12 @@ async def live_neural_heartbeat(user_id: str):
     signal_has_reset = True
     last_log         = 0
     last_ui_update   = 0
+    # Persistent public-data exchange + market-data cache (perf refactor)
+    read_exchange     = None
+    read_exchange_id  = None
+    last_candle_fetch = 0.0
+    last_diag         = 0.0
+    feed_cache: Dict[str, Any] = {}
 
     if user_id in ACTIVE_BOTS:
         if "equityCurve" not in ACTIVE_BOTS[user_id]:
@@ -1018,40 +1070,83 @@ async def live_neural_heartbeat(user_id: str):
 
             try:
                 current_time = datetime.now(timezone.utc)
+                _maybe_hot_reload(feed_cache)
 
                 # ── TIER 1: MARKET FEED ──────────────────────────────────────
-                ohlcv_raw = await fetch_live_candles_ccxt(
-                    config['symbol'], config.get('timeframe', '1h'), 500,
-                    exchange_id=target_exchange)
-                if not ohlcv_raw:
-                    await emit_log(user_id, f"⚠️ {target_exchange.upper()} Feed Unstable - Retrying...")
-                    await asyncio.sleep(5); continue
+                # Perf: reuse ONE public-data exchange across ticks, refetch
+                # OHLCV + closed-candle features only every candle_refresh_secs,
+                # and pull the lightweight ticker every tick so exits stay live.
+                now_mono            = time.monotonic()
+                candle_refresh_secs = float(config.get('candleRefreshSecs', 20))
 
-                exchange_class = getattr(ccxt, target_exchange)
-                async with exchange_class({'enableRateLimit': True}) as ex:
-                    ticker        = await ex.fetch_ticker(ticker_symbol.replace('-', '/'))
+                if read_exchange is None or read_exchange_id != target_exchange:
+                    if read_exchange is not None:
+                        try: await read_exchange.close()
+                        except Exception: pass
+                    read_exchange     = getattr(ccxt, target_exchange)({'enableRateLimit': True})
+                    read_exchange_id  = target_exchange
+                    last_candle_fetch = 0.0
+
+                if (now_mono - last_candle_fetch) >= candle_refresh_secs or 'ohlcv_raw' not in feed_cache:
+                    try:
+                        _ohlcv = await read_exchange.fetch_ohlcv(
+                            ticker_symbol.replace('-', '/'),
+                            config.get('timeframe', '1h'), limit=500)
+                    except Exception:
+                        await emit_log(user_id, f"⚠️ {target_exchange.upper()} Feed Unstable - Retrying...")
+                        await asyncio.sleep(5); continue
+                    if not _ohlcv:
+                        await emit_log(user_id, f"⚠️ {target_exchange.upper()} Feed Empty - Retrying...")
+                        await asyncio.sleep(5); continue
+                    feed_cache['ohlcv_raw'] = [
+                        {"time": int(c[0] / 1000), "open": c[1], "high": c[2], "low": c[3],
+                         "close": c[4], "volume": c[5] if len(c) > 5 else 0}
+                        for c in _ohlcv
+                    ]
+                    last_candle_fetch = now_mono
+
+                # Live ticker every tick (cheap) for entry/exit responsiveness
+                try:
+                    ticker        = await read_exchange.fetch_ticker(ticker_symbol.replace('-', '/'))
                     current_price = float(ticker['last'])
+                except Exception:
+                    await emit_log(user_id, f"⚠️ {target_exchange.upper()} Ticker Unstable - Retrying...")
+                    await asyncio.sleep(2); continue
 
+                # Copy cached candles, patch the live price onto the forming bar
+                ohlcv_raw = [dict(c) for c in feed_cache['ohlcv_raw']]
                 ohlcv_raw[-1]['close'] = current_price
-                df_raw            = pd.DataFrame(ohlcv_raw)
-                df_closed_history = df_raw.iloc[:-1].copy()
-                df_ai, _          = await asyncio.to_thread(apply_mega_features, df_closed_history)
+                df_raw = pd.DataFrame(ohlcv_raw)
 
-                current_ema200 = float(ta.ema(df_raw['close'], length=200).iloc[-1])
-                current_atr    = float(ta.atr(df_raw['high'], df_raw['low'], df_raw['close'], length=14).iloc[-1])
-                atr_tp_mult    = float(params.get('atr_tp_mult', config.get('atrTpMultiplier', 3.0)))
-                atr_sl_mult    = float(params.get('atr_sl_mult', config.get('atrSlMultiplier', 1.5)))
+                atr_tp_mult = float(params.get('atr_tp_mult', config.get('atrTpMultiplier', 3.0)))
+                atr_sl_mult = float(params.get('atr_sl_mult', config.get('atrSlMultiplier', 1.5)))
 
-                try:
-                    current_adx = float(ta.adx(df_raw['high'], df_raw['low'], df_raw['close'], length=14).iloc[-1, 0])
-                except Exception:
-                    current_adx = 25.0
+                # Recompute closed-candle features/indicators only on candle refresh
+                if feed_cache.get('feature_stamp') != last_candle_fetch:
+                    _dch    = df_raw.iloc[:-1].copy()
+                    _dai, _ = await asyncio.to_thread(apply_mega_features, _dch)
+                    feed_cache['df_closed_history'] = _dch
+                    feed_cache['df_ai']             = _dai
+                    feed_cache['current_ema200']    = float(ta.ema(df_raw['close'], length=200).iloc[-1])
+                    feed_cache['current_atr']       = float(ta.atr(df_raw['high'], df_raw['low'], df_raw['close'], length=14).iloc[-1])
+                    try:
+                        feed_cache['current_adx'] = float(ta.adx(df_raw['high'], df_raw['low'], df_raw['close'], length=14).iloc[-1, 0])
+                    except Exception:
+                        feed_cache['current_adx'] = 25.0
+                    try:
+                        _volc = _dch['volume']
+                        _vma  = float(ta.sma(_volc, length=20).iloc[-1])
+                        feed_cache['vol_ratio'] = float(_volc.iloc[-1]) / _vma if _vma > 0 else 1.0
+                    except Exception:
+                        feed_cache['vol_ratio'] = 1.0
+                    feed_cache['feature_stamp'] = last_candle_fetch
 
-                try:
-                    vol_ma    = float(ta.sma(df_raw['volume'], length=20).iloc[-1])
-                    vol_ratio = df_raw['volume'].iloc[-2] / vol_ma if vol_ma > 0 else 1.0
-                except Exception:
-                    vol_ratio = 1.0
+                df_closed_history = feed_cache['df_closed_history']
+                df_ai             = feed_cache['df_ai']
+                current_ema200    = feed_cache['current_ema200']
+                current_atr       = feed_cache['current_atr']
+                current_adx       = feed_cache['current_adx']
+                vol_ratio         = feed_cache['vol_ratio']
 
                 # ── TIER 2: AI COUNCIL ────────────────────────────────────────
                 conf_score = NeuralPredictor.get_prediction(
@@ -1105,7 +1200,15 @@ async def live_neural_heartbeat(user_id: str):
                         (last_pos['type'] == 'long'  and current_price > last_pos['entry']) or
                         (last_pos['type'] == 'short' and current_price < last_pos['entry'])
                     )
-                    climb_satisfied = score >= last_pos.get('entry_conf', 0) + 0.10 and pos_is_profitable
+                    # Direction-aware conviction climb. entry_conf is the raw
+                    # P(bull) at entry; for shorts, conviction rises as P(bull)
+                    # falls, so compare in effective (1 - p) space.
+                    _entry_conf = last_pos.get('entry_conf', 0)
+                    if last_pos['type'] == 'short':
+                        _conf_climb = (1.0 - score) >= (1.0 - _entry_conf) + 0.10
+                    else:
+                        _conf_climb = score >= _entry_conf + 0.10
+                    climb_satisfied = _conf_climb and pos_is_profitable
                 else:
                     climb_satisfied = True
 
@@ -1160,8 +1263,33 @@ async def live_neural_heartbeat(user_id: str):
                 max_atr_pct = float(config.get('maxAtrPct', 5.0))
                 is_volatility_safe = min_atr_pct <= atr_pct <= max_atr_pct
 
+                # Daily loss breaker with a real UTC-day reset; measured on
+                # equity (includes open-position PnL), not just realized balance.
+                _today = current_time.date().isoformat()
+                if bot.get('circuit_day') != _today:
+                    bot['circuit_day']      = _today
+                    bot['day_start_equity'] = current_equity
+                _day_anchor = float(bot.get('day_start_equity', start_capital))
                 is_circuit_breaker_tripped = (
-                    bot['balance'] <= start_capital * (1.0 - float(config.get('maxDailyLoss', 5.0)) / 100.0))
+                    current_equity <= _day_anchor * (1.0 - float(config.get('maxDailyLoss', 5.0)) / 100.0))
+
+                # Max-drawdown breaker: session equity peak-to-trough guard.
+                bot['peak_equity'] = max(float(bot.get('peak_equity', current_equity)), current_equity)
+                _dd_limit = float(config.get('maxDrawdown', 100.0))
+                is_drawdown_tripped = current_equity <= bot['peak_equity'] * (1.0 - _dd_limit / 100.0)
+
+                # Daily trade cap (maxTradesPerDay was previously ignored).
+                if bot.get('trade_day') != _today:
+                    bot['trade_day']    = _today
+                    bot['trades_today'] = 0
+                _max_trades = int(config.get('maxTradesPerDay', 10000))
+                under_daily_trade_cap = int(bot.get('trades_today', 0)) < _max_trades
+
+                # Minimum agreeing votes (minVotesRequired was previously ignored).
+                _required_votes = int(config.get('minVotesRequired', 1))
+                agreeing_votes = (sum(1 for s in active_strategies
+                                      if nums.get(s.get('code'), 0) == sig) if sig != 0 else 0)
+                enough_votes = (sig == 0) or (agreeing_votes >= _required_votes)
 
                 if len(bot['positions']) == 0 and sig == 0: signal_has_reset = True
                 elif len(bot['positions']) > 0:             signal_has_reset = False
@@ -1171,11 +1299,14 @@ async def live_neural_heartbeat(user_id: str):
                 except: adx_trending = True
 
                 volume_confirmed = vol_ratio >= float(config.get('minVolRatio', 0.8))
-                is_trend_aligned = (
-                    (sig == 1 and current_price > current_ema200) or
-                    (sig == -1 and current_price < current_ema200) or
-                    (sig == 0)
-                )
+                if config.get('requireTrendAlignment', True):
+                    is_trend_aligned = (
+                        (sig == 1 and current_price > current_ema200) or
+                        (sig == -1 and current_price < current_ema200) or
+                        (sig == 0)
+                    )
+                else:
+                    is_trend_aligned = True
 
                 # ── DYNAMIC TIME GATE ────────────────────────────────────────
                 # Standard cooldown is 10 minutes.  The gate can be bypassed
@@ -1226,20 +1357,37 @@ async def live_neural_heartbeat(user_id: str):
                     past_normal or
                     (past_floor and conf_improvement >= 0.08 and conf_trending)
                 )
-                min_gap_seconds = STANDARD_GATE_SECS  # kept for rejection logger
 
                 all_filters_pass = (
                     is_volatility_safe and not is_circuit_breaker_tripped and
+                    not is_drawdown_tripped and under_daily_trade_cap and enough_votes and
                     is_trend_aligned and adx_trending and volume_confirmed and
                     adaptive_gate and market_gate_passed and is_short_allowed and time_gate_passed
                 )
+
+                # STDOUT decision diagnostic (emit_log goes to the Node UI, not
+                # stdout, so mirror the gate state here for server-side debugging).
+                if (datetime.now().timestamp() - last_diag) >= 15:
+                    logger.info(
+                        f"🔎 DECIDE {user_id} | sig={sig} eff={effective_score:.2f} "
+                        f"filters_pass={all_filters_pass} pos={len(bot['positions'])} || "
+                        f"vol_safe={is_volatility_safe} cb={is_circuit_breaker_tripped} "
+                        f"dd={is_drawdown_tripped} cap_ok={under_daily_trade_cap} "
+                        f"votes_ok={enough_votes}({agreeing_votes}/{_required_votes}) "
+                        f"trend_ok={is_trend_aligned} adx_ok={adx_trending} "
+                        f"vol_ok={volume_confirmed} ai_gate={adaptive_gate} "
+                        f"mkt_gate={market_gate_passed} short_ok={is_short_allowed} "
+                        f"time_gate={time_gate_passed}"
+                    )
+                    last_diag = datetime.now().timestamp()
 
                 # ── TIER 5: TELEMETRY + VETO TRACKER ─────────────────────────
                 if "vetoed_signals" not in bot:
                     bot["vetoed_signals"] = []
 
                 raw_sig = 0
-                votes_t = sum([1 if signals_map.get(s['code'], 0) > 0.5 else -1 for s in active_strategies])
+                # Use signed per-strategy directions (nums), not confidence magnitude.
+                votes_t = sum(nums.get(s['code'], 0) for s in active_strategies)
                 # FIX: use helper so hybridMode is honoured when comboConfig is absent/stale
                 rule    = _get_combo_rule(config)
                 if rule == "AND":
@@ -1419,6 +1567,9 @@ async def live_neural_heartbeat(user_id: str):
                         if atr_pct < min_atr_pct: reasons.append(f"ATR {atr_pct:.2f}% too flat (min {min_atr_pct}%)")
                         else:                     reasons.append(f"ATR {atr_pct:.1f}% too high (max {max_atr_pct}%)")
                     if is_circuit_breaker_tripped: reasons.append("Daily drawdown limit hit")
+                    if is_drawdown_tripped:        reasons.append(f"Max drawdown {_dd_limit:.0f}% from peak")
+                    if not under_daily_trade_cap:  reasons.append(f"Daily trade cap {bot.get('trades_today',0)}/{_max_trades}")
+                    if not enough_votes:           reasons.append(f"Votes {agreeing_votes}/{_required_votes} agree")
                     if not is_trend_aligned:       reasons.append("Trend misaligned with 200 EMA")
                     if not adx_trending:           reasons.append(f"ADX {current_adx:.0f} below min {float(config.get('minAdx', 20.0)):.0f}")
                     if not volume_confirmed:       reasons.append(f"Volume {vol_ratio:.2f}x below min {float(config.get('minVolRatio', 0.8)):.1f}x")
@@ -1449,12 +1600,14 @@ async def live_neural_heartbeat(user_id: str):
                             ml_score          = score,
                             ui_limit          = ui_limit,
                             signals_map       = signals_map,
+                            directions_map    = nums,
                             active_strategies = active_strategies,
                             sig               = sig,
                             current_price     = current_price,
                             current_atr       = current_atr,
                             current_adx       = current_adx,
                             vol_ratio         = vol_ratio,
+                            min_score         = float(config.get('minEntryScore', TradeQualityScorer.MIN_ENTRY_SCORE)),
                         )
 
                         # Always log the verdict so it appears in Neural Flow
@@ -1479,8 +1632,15 @@ async def live_neural_heartbeat(user_id: str):
                             # ── ORDER EXECUTION ───────────────────────────────
                             # Only reached when composite score ≥ MIN_ENTRY_SCORE
                             trade_type         = "long" if sig == 1 else "short"
-                            raw_risk           = config.get('riskPercentage') or config.get('risk_percentage') or 1.0
-                            size_in_fiat       = current_equity * (float(raw_risk) / 100.0 / max_p)
+                            raw_risk           = float(config.get('riskPercentage') or config.get('risk_percentage') or 1.0)
+                            # Guardrail: clamp per-trade risk; never allocate more
+                            # than available equity to a single leg.
+                            raw_risk           = min(raw_risk, float(config.get('maxRiskPerTradePct', 100.0)))
+                            if is_live_trading and (raw_risk / max_p) >= 50 and not bot.get('_risk_warned'):
+                                await emit_log(user_id, f"⚠️ HIGH RISK: each leg ≈ {raw_risk/max_p:.0f}% of equity. Consider lowering riskPercentage.")
+                                bot['_risk_warned'] = True
+                            size_in_fiat       = current_equity * (raw_risk / 100.0 / max_p)
+                            size_in_fiat       = min(size_in_fiat, current_equity)
                             size_in_crypto     = size_in_fiat / current_price
                             safe_size          = float(f"{size_in_crypto:.6f}")
                             actual_entry_price = current_price
@@ -1515,6 +1675,12 @@ async def live_neural_heartbeat(user_id: str):
                             partial_tp    = (actual_entry_price + current_atr * 1.5 if sig == 1
                                              else actual_entry_price - current_atr * 1.5)
 
+                            try:
+                                _feat_row = df_ai.iloc[-1]
+                                entry_features = {c: float(_feat_row[c]) for c in FEATURE_COLUMNS
+                                                  if c in df_ai.columns and pd.notna(_feat_row[c])}
+                            except Exception:
+                                entry_features = {}
                             bot['positions'].append({
                                 "symbol":             symbol,
                                 "type":               trade_type,
@@ -1531,9 +1697,11 @@ async def live_neural_heartbeat(user_id: str):
                                 "atr_at_entry":       round(current_atr, 4),
                                 "adx_at_entry":       round(current_adx, 1),
                                 "vol_ratio_at_entry": round(vol_ratio, 2),
+                                "entry_features":     entry_features,
                             })
                             bot['last_trade_time'] = current_time.isoformat()
                             bot['last_trade_conf'] = score
+                            bot['trades_today'] = int(bot.get('trades_today', 0)) + 1
                             rr = round(atr_tp_mult / atr_sl_mult, 1)
                             await emit_log(user_id,
                                            f"🚀 ENTERED {trade_type.upper()} @ ${actual_entry_price:,.2f} | "
@@ -1656,6 +1824,22 @@ async def live_neural_heartbeat(user_id: str):
                             "reason": exit_reason,
                             "time":   int(time.time() * 1000)
                         })
+                        try:
+                            _entry_dt = datetime.fromisoformat(pos['time'])
+                            _hold = (current_time - _entry_dt).total_seconds()
+                        except Exception:
+                            _hold = None
+                        trade_recorder.record_exit(
+                            user_id=user_id, symbol=config['symbol'],
+                            timeframe=config.get('timeframe', '1h'),
+                            direction=pos['type'],
+                            mode=('live' if is_live_trading else 'paper'),
+                            entry_price=pos['entry'], exit_price=actual_close_price,
+                            size=pos['size'], pnl=round(net_pnl, 2), reason=exit_reason,
+                            entry_conf=pos.get('entry_conf'), composite=pos.get('entry_score'),
+                            adx_at_entry=pos.get('adx_at_entry'), atr_at_entry=pos.get('atr_at_entry'),
+                            vol_ratio=pos.get('vol_ratio_at_entry'),
+                            features=pos.get('entry_features'), hold_secs=_hold)
                         await emit_log(user_id,
                                        f"💰 {exit_reason}: CLOSED {pos['type'].upper()} @ "
                                        f"${actual_close_price:,.2f} | Net PnL: ${round(net_pnl, 2):+}")
@@ -1671,6 +1855,11 @@ async def live_neural_heartbeat(user_id: str):
                 logger.error(f"❌ WS Stream Error: {e}", exc_info=True)
                 await asyncio.sleep(5)
     finally:
+        if read_exchange is not None:
+            try:
+                await read_exchange.close()
+            except Exception:
+                pass
         logger.info(f"🔌 Heartbeat loop terminated for {user_id}")
 
 
@@ -1720,7 +1909,23 @@ async def start_bot(data: BotStartRequest):
         processed_candles = await process_data_packet(df_init, data.config.get('strategies', []))
 
     saved_state = DatabaseHandler.load_state(user_id)
-    if saved_state:
+    resume = bool(data.config.get('resumeOpenPositions', True))
+    if saved_state and resume and saved_state.get('positions'):
+        # RELIABILITY: recover open positions across a restart instead of
+        # orphaning them. The engine resumes managing their TP/SL/TSL; balance
+        # and history carry over. Use /api/bot/reset for a clean slate.
+        ACTIVE_BOTS[user_id] = saved_state
+        _recovered = saved_state.get('positions', [])
+        _bal = float(saved_state.get('balance', ui_capital))
+        ACTIVE_BOTS[user_id].update({
+            "status": "running", "config": data.config, "balance": _bal,
+            "startedAt": datetime.now(timezone.utc).isoformat(), "logs": [],
+        })
+        ACTIVE_BOTS[user_id].setdefault(
+            "equityCurve",
+            [{"time": datetime.now().isoformat(), "balance": _bal, "confidence": 50}])
+        await emit_log(user_id, f"♻️ RECOVERED {len(_recovered)} open position(s); balance ${_bal:,.2f} — resuming management.")
+    elif saved_state:
         ACTIVE_BOTS[user_id] = saved_state
         ACTIVE_BOTS[user_id].update({
             "status": "running", "config": data.config, "balance": ui_capital,
@@ -1869,6 +2074,42 @@ async def reset_bot(data: BotStopRequest):
         DatabaseHandler.save_state(data.userId, ACTIVE_BOTS[data.userId])
         return {"status": "reset"}
     return {"status": "not_found"}
+
+
+# =============================================================
+# HEALTH CHECK
+# =============================================================
+@app.get("/api/health")
+async def health():
+    return {
+        "status": "ok",
+        "time": datetime.now(timezone.utc).isoformat(),
+        "active_bots": len(ACTIVE_BOTS),
+        "running_tasks": len(TASK_REGISTRY),
+        "ledger": trade_recorder.stats(),
+    }
+
+
+# =============================================================
+# TRADE LEARNING LEDGER — API + DASHBOARD
+# =============================================================
+@app.get("/api/ledger/stats")
+async def ledger_stats(recent: int = 25, user_id: Optional[str] = None):
+    """Aggregated view of closed trades. Pass user_id to scope to one bot/user;
+    omit for the global view. (The Node backend passes the authenticated user.)"""
+    return trade_recorder.summary(recent_limit=recent, user_id=user_id)
+
+
+@app.get("/ledger", response_class=HTMLResponse)
+async def ledger_dashboard():
+    """Self-contained dashboard for the trade-learning ledger. Served from this
+    origin so it can read /api/ledger/stats directly."""
+    try:
+        _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ledger_dashboard.html")
+        with open(_p, "r", encoding="utf-8") as _f:
+            return HTMLResponse(_f.read())
+    except Exception as e:
+        return HTMLResponse(f"<h1>Ledger dashboard unavailable</h1><pre>{e}</pre>", status_code=500)
 
 
 if __name__ == "__main__":

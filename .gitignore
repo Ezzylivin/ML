@@ -2,6 +2,31 @@ __pycache__/
 *.pyc
 *.pyo
 .env
+.env.*
 *.egg-info/
 .venv/
 venv/
+
+# --- secrets / keys (NEVER commit) ---
+*.pem
+*.key
+*.crt
+*.p12
+
+# --- local state / databases ---
+*.db
+*.sqlite
+*.sqlite3
+
+# --- logs & binary artifacts ---
+*.log
+*.png
+*.jpg
+
+# --- unrelated data dumps (not part of the app) ---
+philly_*.csv
+
+# --- large regenerable data / model artifacts (optional: keep repo light) ---
+# data/
+# models/
+# cache/

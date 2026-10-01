@@ -8,7 +8,7 @@ import tensorflow as tf
 # 🔧 FIX #1: Import from config2 and use existing functions
 # ============================================================
 from app.config2 import DATA_DIR, MODEL_STORAGE_DIR, FEATURE_COLUMNS
-from app.verify.engineer_and_train import apply_mega_features, create_strategic_labels
+from app.verify.engineer_and_train import apply_mega_features, create_atr_labels
 
 # 🟢 STABILITY: Disable GPU and noise
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
@@ -40,7 +40,7 @@ def train_transformer(symbol):
             return False
 
         # 2. Strategic Labeling (matches expert training)
-        df['target'] = create_strategic_labels(df, look_forward=24, tp=1.0, sl=1.0)
+        df['target'] = create_atr_labels(df, look_forward=24, tp_atr=3.0, sl_atr=1.5)  # FIX #4: align to bot exits
         
         # 3. Sequence Generation
         lookback = 50

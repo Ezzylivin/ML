@@ -1,0 +1,396 @@
+import asyncio
+import logging
+import os
+import json
+import re
+import aiofiles  
+from datetime import datetime
+from contextlib import asynccontextmanager
+from typing import Optional, Dict, Any, List
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import uvicorn
+import pandas as pd
+import pandas_ta as ta
+import numpy as np
+
+# 🟢 IMPORT FROM OLD LOCATION (Preserves your original atomic backtest logic)
+from app.backtest2 import Backtester 
+from app.config2 import MODEL_DIR
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("API")
+
+# --- 1. DATA MODELS ---
+
+class BacktestRequest(BaseModel):
+    symbol: str
+    timeframe: str
+    startDate: str
+    endDate: str
+    initialBalance: float = 1000.0
+    riskPercentage: float = 1.0
+    mlModel: Optional[str] = None
+    trend_strategy: Optional[str] = "atr_breakout"
+    range_strategy: Optional[str] = "bollinger_reversal"
+    ml_confidence_threshold: Optional[float] = 0.10
+    trade_direction: Optional[str] = "BOTH"
+    params: Optional[Dict[str, Any]] = {}
+
+class StrategyConfig(BaseModel):
+    code: str
+    params: Dict[str, Any]
+
+class ComboRequest(BaseModel):
+    symbol: str
+    timeframe: str
+    startDate: str
+    endDate: str
+    initialBalance: float
+    strategies: List[StrategyConfig]
+    combinationRule: str = "OR" # "OR" (Majority) or "AND" (Unanimous)
+    risk_percentage: float = 1.0
+    # Risk params (Optionally at root)
+    take_profit: Optional[float] = 0.06
+    stop_loss: Optional[float] = 0.03
+    trailing_stop: Optional[float] = 0.02
+    # Frontend Metadata (Passed but processed manually)
+    mlMode: Optional[str] = None 
+    advanced_filters: Optional[Dict] = {}
+    params: Optional[Dict[str, Any]] = {} # React sends risk settings here
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- 2. HELPER FUNCTIONS ---
+
+def load_data_robust(symbol, timeframe):
+    # Adjust paths to match your server structure
+    possible_paths = [
+        f"data/{symbol.replace('/', '-')}-{timeframe}.csv",
+        f"Project/ML/data/{symbol.replace('/', '-')}-{timeframe}.csv",
+        f"{symbol.replace('/', '-')}-{timeframe}.csv"
+    ]
+    
+    file_path = None
+    for p in possible_paths:
+        if os.path.exists(p):
+            file_path = p
+            break
+            
+    if not file_path:
+        logger.error(f"❌ File not found. Searched: {possible_paths}")
+        return None
+
+    try:
+        df = pd.read_csv(file_path)
+        # Smart Date Parsing (Handle ms vs s vs string)
+        time_col = next((c for c in df.columns if c.lower() in ['timestamp', 'time', 'date']), None)
+        
+        if time_col:
+            first_val = df[time_col].iloc[0]
+            # Numeric (Unix Timestamp) Handling
+            if isinstance(first_val, (int, float, np.number)):
+                # If > 100 Billion, it's Milliseconds (e.g. 1600000000000)
+                unit = 'ms' if first_val > 1e11 else 's'
+                df[time_col] = pd.to_datetime(df[time_col], unit=unit, utc=True)
+            # String Handling
+            else:
+                df[time_col] = pd.to_datetime(df[time_col], utc=True, errors='coerce')
+            
+            df.rename(columns={time_col: 'timestamp'}, inplace=True)
+            df.set_index('timestamp', inplace=True)
+            df.columns = [c.lower() for c in df.columns]
+            df.sort_index(inplace=True)
+            
+            # Remove duplicate indices just in case
+            df = df[~df.index.duplicated(keep='first')]
+            return df
+            
+    except Exception as e:
+        logger.error(f"Data Load Error: {e}")
+    return None
+
+def calculate_strategy_signal(df, code, params):
+    close = df['close']
+    high = df['high']
+    low = df['low']
+    signal = pd.Series(0, index=df.index)
+    
+    try:
+        if code == "rsi_threshold":
+            rsi = ta.rsi(close, length=int(params.get('rsi_length', 14)))
+            signal[rsi < params.get('oversold', 30)] = 1
+            signal[rsi > params.get('overbought', 70)] = -1
+            
+        elif code == "sma_crossover":
+            fast = ta.sma(close, length=int(params.get('fast_sma', 50)))
+            slow = ta.sma(close, length=int(params.get('slow_sma', 200)))
+            signal[fast > slow] = 1
+            signal[fast < slow] = -1
+            
+        elif code == "bollinger_bands" or code == "bb_fade":
+            bb = ta.bbands(close, length=int(params.get('bb_period', 20)), std=float(params.get('bb_std', 2.0)))
+            if bb is not None:
+                lower = bb.iloc[:, 0]
+                upper = bb.iloc[:, 2]
+                signal[close < lower] = 1
+                signal[close > upper] = -1
+
+        elif code == "atr_breakout":
+            atr = ta.atr(high, low, close, length=int(params.get('atr_length', 14)))
+            mult = float(params.get('multiplier', 1.5))
+            sma = ta.sma(close, length=20)
+            signal[close > (sma + atr * mult)] = 1
+            signal[close < (sma - atr * mult)] = -1
+
+        elif code == "macd_crossover":
+            macd = ta.macd(close, fast=int(params.get('fast', 12)), slow=int(params.get('slow', 26)), signal=int(params.get('signal', 9)))
+            if macd is not None:
+                macd_line = macd.iloc[:, 0]
+                sig_line = macd.iloc[:, 2]
+                signal[macd_line > sig_line] = 1
+                signal[macd_line < sig_line] = -1
+        
+        elif code == "stoch":
+            stoch = ta.stoch(high, low, close, k=int(params.get('k_period', 14)), d=int(params.get('d_period', 3)))
+            if stoch is not None:
+                k, d = stoch.iloc[:, 0], stoch.iloc[:, 1]
+                # Bullish Cross in Oversold
+                signal[(k > d) & (k < 30)] = 1
+                # Bearish Cross in Overbought
+                signal[(k < d) & (k > 70)] = -1
+        
+        # Add other strategies (obv, etc) if needed matching your frontend config
+
+    except Exception as e:
+        logger.error(f"Strategy Error ({code}): {e}")
+    
+    return signal.fillna(0)
+
+# --- 3. ROUTES ---
+
+@app.post('/api/backtest/run')
+async def run_backtest(request: BacktestRequest):
+    """
+    Original endpoint for Atomic/Single strategy backtests.
+    """
+    try:
+        config = request.dict()
+        bot = Backtester(config)
+        result = bot.run()
+        return JSONResponse(content=result)
+    except Exception as e:
+        logger.error(f"Atomic API Error: {e}")
+        return JSONResponse(content={"status": "failed", "error": str(e)}, status_code=500)
+
+@app.post('/api/backtest/combo')
+async def run_combo_backtest(req: ComboRequest):
+    """
+    Hybrid/Combo Engine with Advanced Risk Logic
+    """
+    try:
+        logger.info(f"🔥 COMBO Request: {len(req.strategies)} strategies on {req.symbol}")
+        
+        # 1. Load Data
+        df = load_data_robust(req.symbol, req.timeframe)
+        if df is None:
+            raise HTTPException(status_code=404, detail=f"Data file not found for {req.symbol}")
+            
+        # Filter Date Range
+        try:
+            df = df.loc[req.startDate:req.endDate]
+            if df.empty: raise Exception("No data in date range")
+        except:
+            pass # Fallback to using available data if filtering fails
+
+        # 2. Calculate Signals
+        signals_list = []
+        for strat in req.strategies:
+            sig_series = calculate_strategy_signal(df, strat.code, strat.params)
+            signals_list.append(sig_series)
+        
+        if not signals_list:
+            return {"status": "error", "message": "No strategies executed"}
+
+        # 3. Vote Logic (AND/OR)
+        sig_df = pd.concat(signals_list, axis=1).fillna(0)
+        vote_sum = sig_df.sum(axis=1)
+        
+        final_signal = pd.Series(0, index=df.index)
+        
+        if req.combinationRule == "AND": # Unanimous
+            n = len(req.strategies)
+            final_signal[vote_sum == n] = 1
+            final_signal[vote_sum == -n] = -1
+        else: # OR (Majority)
+            final_signal[vote_sum > 0] = 1
+            final_signal[vote_sum < 0] = -1
+
+        # 4. EVENT-DRIVEN SIMULATION (With High/Low Checks)
+        balance = req.initialBalance
+        position = 0 # 0=Flat, 1=Long, -1=Short
+        entry_price = 0.0
+        best_price = 0.0
+        equity_curve = []
+        trades_log = []
+        
+        # Prepare arrays for speed
+        prices = df['close'].values
+        highs = df['high'].values
+        lows = df['low'].values
+        times = df.index
+        sigs = final_signal.values
+        
+        comm = 0.0006 
+        
+        # 🛡️ RISK PARSING (THE FIX) 🛡️
+        # We grab from 'params' first because React puts the advanced fields there.
+        p_dict = req.params or {}
+        
+        raw_tp = p_dict.get('take_profit', req.take_profit)
+        raw_sl = p_dict.get('stop_loss', req.stop_loss)
+        raw_ts = p_dict.get('trailing_stop', req.trailing_stop)
+        
+        # Fallback to model fields if params was empty, then to defaults
+        if raw_tp is None: raw_tp = 0.06
+        if raw_sl is None: raw_sl = 0.03
+        if raw_ts is None: raw_ts = 0.02
+        
+        # Auto-Correct: If user entered "13", convert to "0.13"
+        tp_pct = raw_tp / 100 if raw_tp > 1.0 else raw_tp
+        sl_pct = raw_sl / 100 if raw_sl > 1.0 else raw_sl
+        ts_pct = raw_ts / 100 if raw_ts > 1.0 else raw_ts
+
+        logger.info(f"🛡️ Risk CORRECTLY Loaded: TP={tp_pct}, SL={sl_pct}, TS={ts_pct}")
+        
+        for i in range(1, len(prices)):
+            price = prices[i]
+            high = highs[i]
+            low = lows[i]
+            date = str(times[i])
+            signal = sigs[i-1] 
+            
+            # --- CHECK EXITS (Priority #1) ---
+            if position == 1: # LONG
+                if high > best_price: best_price = high
+                
+                stop_price = entry_price * (1 - sl_pct)
+                take_price = entry_price * (1 + tp_pct)
+                trail_price = best_price * (1 - ts_pct) if ts_pct > 0 else 0
+                
+                exit_reason = None
+                exit_p = price
+                
+                # Check Wicks
+                if low <= stop_price: 
+                    exit_reason = "SL"
+                    exit_p = stop_price
+                elif ts_pct > 0 and low <= trail_price:
+                    exit_reason = "Trail"
+                    exit_p = trail_price
+                elif high >= take_price:
+                    exit_reason = "TP"
+                    exit_p = take_price
+                
+                if exit_reason:
+                    pnl_pct = (exit_p - entry_price) / entry_price
+                    balance *= (1 + pnl_pct - comm)
+                    trades_log.append({"type": "close_long", "price": exit_p, "time": date, "balance": balance, "reason": exit_reason})
+                    position = 0
+
+            elif position == -1: # SHORT
+                if low < best_price: best_price = low
+                
+                stop_price = entry_price * (1 + sl_pct)
+                take_price = entry_price * (1 - tp_pct)
+                trail_price = best_price * (1 + ts_pct) if ts_pct > 0 else 9999999
+                
+                exit_reason = None
+                exit_p = price
+                
+                if high >= stop_price:
+                    exit_reason = "SL"
+                    exit_p = stop_price
+                elif ts_pct > 0 and high >= trail_price:
+                    exit_reason = "Trail"
+                    exit_p = trail_price
+                elif low <= take_price:
+                    exit_reason = "TP"
+                    exit_p = take_price
+                    
+                if exit_reason:
+                    pnl_pct = (entry_price - exit_p) / entry_price
+                    balance *= (1 + pnl_pct - comm)
+                    trades_log.append({"type": "close_short", "price": exit_p, "time": date, "balance": balance, "reason": exit_reason})
+                    position = 0
+            
+            # --- CHECK ENTRIES (Priority #2) ---
+            if position == 0:
+                if signal == 1:
+                    position = 1
+                    entry_price = price
+                    best_price = price
+                    balance *= (1 - comm)
+                    trades_log.append({"type": "buy", "price": price, "time": date})
+                elif signal == -1:
+                    position = -1
+                    entry_price = price
+                    best_price = price
+                    balance *= (1 - comm)
+                    trades_log.append({"type": "sell", "price": price, "time": date})
+            
+            # --- FLIP POSITION ---
+            elif position == 1 and signal == -1:
+                pnl_pct = (price - entry_price) / entry_price
+                balance *= (1 + pnl_pct - comm)
+                trades_log.append({"type": "flip_to_short", "price": price, "time": date, "balance": balance, "reason": "Signal Flip"})
+                position = -1
+                entry_price = price
+                best_price = price
+                balance *= (1 - comm)
+                
+            elif position == -1 and signal == 1:
+                pnl_pct = (entry_price - price) / entry_price
+                balance *= (1 + pnl_pct - comm)
+                trades_log.append({"type": "flip_to_long", "price": price, "time": date, "balance": balance, "reason": "Signal Flip"})
+                position = 1
+                entry_price = price
+                best_price = price
+                balance *= (1 - comm)
+
+            equity_curve.append({"time": date, "balance": balance})
+
+        # Calculate Final ROI
+        roi = ((balance - req.initialBalance) / req.initialBalance) * 100
+        
+        return {
+            "status": "completed",
+            "metrics": {
+                "final_balance": balance,
+                "roi": roi,
+                "total_trades": len(trades_log)
+            },
+            "equityCurve": equity_curve,
+            "trades": trades_log
+        }
+
+    except Exception as e:
+        logger.error(f"Combo API Error: {e}")
+        return JSONResponse(content={"status": "failed", "error": str(e)}, status_code=500)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)

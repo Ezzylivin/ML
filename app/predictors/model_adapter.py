@@ -51,6 +51,21 @@ class RawModelAdapter:
             self.feature_names = self.default_features
             self.is_meta_model = False
 
+        # FIX #15: sibling judge trainers (create_judge.py, create_judges.py,
+        # repairJudge.py) save the stacking judge WITHOUT the is_meta_model flag.
+        # That made the judge fall through to the 25-feature tree path with
+        # input_data=None -> None[features] TypeError -> silent 0.5, while
+        # "Full Council assembled" still logged. Detect a judge by its input
+        # width: the stacking judge is the only model trained on exactly 3
+        # features (the expert probability vector).
+        if not self.is_meta_model and self.model is not None:
+            try:
+                if int(getattr(self.model, 'n_features_in_', 0)) == 3:
+                    self.is_meta_model = True
+                    logger.info("⚖️ Judge auto-detected as meta-model (3 inputs); flag was missing.")
+            except Exception:
+                pass
+
         # Pre-warm Keras models to avoid first-call latency
         if hasattr(self.model, "input_shape") and not self.is_meta_model:
             try:
@@ -74,8 +89,13 @@ class RawModelAdapter:
         try:
             # META-MODEL PATH: Judge uses expert scores, ignores raw data
             if self.is_meta_model and council_probs is not None:
-                X = np.array([council_probs]) 
-                return float(self.model.predict_proba(X)[0][1])
+                X = np.array([council_probs])
+                # FIX #16: read the same predict_proba column the backtester does
+                # (col 2 for a 3-class model, else col 1) so live and backtest
+                # probabilities agree.
+                proba = self.model.predict_proba(X)
+                col   = 2 if proba.shape[1] == 3 else 1
+                return float(proba[0][col])
 
             is_numpy = isinstance(input_data, np.ndarray)
 
@@ -108,7 +128,11 @@ class RawModelAdapter:
                 last_row = input_data[self.feature_names].iloc[[-1]]
 
             if hasattr(self.model, "predict_proba"):
-                conf = float(self.model.predict_proba(last_row)[0][1])
+                # FIX #16: match the backtester's column selection (col 2 for
+                # 3-class models, else col 1) to keep live/backtest consistent.
+                proba = self.model.predict_proba(last_row)
+                col   = 2 if proba.shape[1] == 3 else 1
+                conf  = float(proba[0][col])
                 return min(0.99, max(0.01, conf))
             
             return float(self.model.predict(last_row)[0])

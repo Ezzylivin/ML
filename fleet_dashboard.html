@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>NeoV6 Fleet</title>
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#131b24; --panel2:#0f1620; --line:#1f2b38;
+    --txt:#e7eef6; --mut:#8aa0b4; --grn:#34d399; --red:#f87171; --amb:#fbbf24;
+    --blue:#60a5fa; --accent:#34d399;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+  .wrap{max-width:1040px;margin:0 auto;padding:20px 16px 60px}
+  h1{font-size:20px;margin:0 0 2px;letter-spacing:.3px}
+  .sub{color:var(--mut);font-size:12px;margin-bottom:18px}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:14px 0}
+  .stat{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px}
+  .stat .k{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+  .stat .v{font-size:22px;font-weight:600;margin-top:4px}
+  input{background:var(--panel2);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:8px 10px;font-size:13px}
+  input[type=number]{width:110px}
+  button{background:var(--accent);color:#04110b;border:0;border-radius:8px;padding:9px 14px;font-weight:600;cursor:pointer;font-size:13px}
+  button.ghost{background:transparent;color:var(--txt);border:1px solid var(--line)}
+  button.danger{background:var(--red);color:#1a0505}
+  button:disabled{opacity:.5;cursor:default}
+  table{width:100%;border-collapse:collapse;margin-top:8px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);font-size:13px}
+  th{color:var(--mut);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+  .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600}
+  .pos{color:var(--grn)} .neg{color:var(--red)} .mut{color:var(--mut)}
+  .badge-on{background:rgba(52,211,153,.15);color:var(--grn)}
+  .badge-off{background:rgba(248,113,113,.15);color:var(--red)}
+  .badge-neu{background:rgba(148,163,184,.15);color:var(--mut)}
+  .long{color:var(--grn)} .short{color:var(--red)}
+  .hd{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px}
+  .hd h2{font-size:14px;margin:0}
+  .muted{color:var(--mut);font-size:12px}
+  .sep{height:1px;background:var(--line);margin:16px 0}
+  .err{color:var(--red);font-size:12px;margin-top:8px;min-height:16px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🚢 NeoV6 Fleet</h1>
+  <div class="sub">Validated long + daily-short roster with trend_ride exits, macro-regime tilt, and a portfolio risk cap. Paper mode.</div>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <div class="muted">Session / userId</div>
+        <input id="uid" placeholder="your-user-id" style="width:220px" />
+      </div>
+      <div>
+        <div class="muted">Symbols (csv)</div>
+        <input id="syms" value="BTC-USD,ETH-USD,SOL-USD" style="width:220px" />
+      </div>
+      <div>
+        <div class="muted">Capital / bot</div>
+        <input id="cap" type="number" value="1000" />
+      </div>
+      <div>
+        <div class="muted">Fleet max DD %</div>
+        <input id="dd" type="number" value="20" />
+      </div>
+      <div style="align-self:flex-end;display:flex;gap:8px">
+        <button id="startBtn">Start fleet</button>
+        <button id="stopBtn" class="danger">Stop</button>
+        <button id="refreshBtn" class="ghost">Refresh</button>
+      </div>
+    </div>
+    <div class="err" id="err"></div>
+  </div>
+
+  <div class="grid">
+    <div class="stat"><div class="k">Bots</div><div class="v" id="s_bots">–</div></div>
+    <div class="stat"><div class="k">Combined balance</div><div class="v" id="s_bal">–</div></div>
+    <div class="stat"><div class="k">Open positions</div><div class="v" id="s_pos">–</div></div>
+    <div class="stat"><div class="k">Macro regime</div><div class="v"><span id="s_regime" class="pill badge-neu">–</span></div></div>
+    <div class="stat"><div class="k">Drift check</div><div class="v"><span id="s_drift" class="pill badge-neu">–</span></div></div>
+  </div>
+
+  <div class="card">
+    <div class="hd"><h2>Roster</h2><span class="muted" id="regime_detail"></span></div>
+    <table>
+      <thead><tr><th>Symbol</th><th>Side</th><th>TF</th><th>Status</th><th>Balance</th><th>Open</th><th>Closed</th></tr></thead>
+      <tbody id="tbody"><tr><td colspan="7" class="mut">No fleet running. Enter a userId and Start.</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="sep"></div>
+  <div class="card">
+    <div class="hd"><h2>Drift vs validated profile</h2></div>
+    <div class="muted" id="drift_note">Needs ≥10 closed trades to judge. Baseline: ~26–40% win, profit factor 1.2–1.7.</div>
+    <div class="grid" style="margin-top:10px">
+      <div class="stat"><div class="k">Trades</div><div class="v" id="d_trades">–</div></div>
+      <div class="stat"><div class="k">Win rate</div><div class="v" id="d_wr">–</div></div>
+      <div class="stat"><div class="k">Profit factor</div><div class="v" id="d_pf">–</div></div>
+      <div class="stat"><div class="k">Net PnL</div><div class="v" id="d_net">–</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => (n===null||n===undefined||isNaN(n)) ? "–" : Number(n).toLocaleString(undefined,{maximumFractionDigits:2});
+const uidKey = "neo_fleet_uid";
+try { const v = localStorage.getItem(uidKey); if (v) $("uid").value = v; } catch {}
+
+function setErr(m){ $("err").textContent = m || ""; }
+
+async function jget(url){ const r = await fetch(url); if(!r.ok) throw new Error(await r.text()); return r.json(); }
+async function jpost(url, body){
+  const r = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body||{})});
+  if(!r.ok) throw new Error(await r.text()); return r.json();
+}
+
+function regimeBadge(state){
+  const el = $("s_regime");
+  el.textContent = (state||"neutral").replace("_"," ");
+  el.className = "pill " + (state==="risk_on"?"badge-on":state==="risk_off"?"badge-off":"badge-neu");
+}
+function driftBadge(status){
+  const el = $("s_drift");
+  el.textContent = status || "–";
+  el.className = "pill " + (status==="ON_TRACK"?"badge-on":status==="DRIFTING"?"badge-off":"badge-neu");
+}
+
+async function refresh(){
+  const uid = $("uid").value.trim();
+  if(!uid){ return; }
+  try{ localStorage.setItem(uidKey, uid); }catch{}
+  setErr("");
+  try{
+    const [st, rg, dr] = await Promise.all([
+      jget(`/api/fleet/status?userId=${encodeURIComponent(uid)}`),
+      jget(`/api/fleet/regime`),
+      jget(`/api/fleet/drift?userId=${encodeURIComponent(uid)}`),
+    ]);
+    $("s_bots").textContent = st.count ?? 0;
+    $("s_bal").textContent = "$"+fmt(st.total_balance);
+    $("s_pos").textContent = st.open_positions ?? 0;
+    regimeBadge(rg.state);
+    const d = rg.detail||{};
+    $("regime_detail").textContent = d.btc_price ? `BTC ${fmt(d.btc_price)} · ema50 ${fmt(d.ema50)} · ema200 ${fmt(d.ema200)}` : "";
+    driftBadge(dr.status);
+
+    const tb = $("tbody");
+    if(!st.bots || !st.bots.length){
+      tb.innerHTML = `<tr><td colspan="7" class="mut">No fleet running for "${uid}". Enter a userId and Start.</td></tr>`;
+    } else {
+      tb.innerHTML = st.bots.map(b=>{
+        const dir = (b.direction||"").toUpperCase();
+        const dcls = dir==="LONG"?"long":dir==="SHORT"?"short":"mut";
+        const bcls = (b.balance>=1000)?"pos":(b.balance<1000?"neg":"");
+        return `<tr>
+          <td>${b.symbol||"–"}</td>
+          <td class="${dcls}">${dir||"–"}</td>
+          <td class="mut">${b.timeframe||"–"}</td>
+          <td class="mut">${b.status||"–"}</td>
+          <td class="${bcls}">$${fmt(b.balance)}</td>
+          <td>${b.open_positions??0}</td>
+          <td class="mut">${b.trades??0}</td>
+        </tr>`;
+      }).join("");
+    }
+    $("d_trades").textContent = dr.trades ?? 0;
+    $("d_wr").textContent = (dr.win_rate!=null? dr.win_rate+"%" : "–");
+    $("d_pf").textContent = fmt(dr.profit_factor);
+    const net = dr.net_pnl||0;
+    const netEl = $("d_net"); netEl.textContent = (net>=0?"+$":"-$")+fmt(Math.abs(net));
+    netEl.className = "v " + (net>=0?"pos":"neg");
+    $("drift_note").textContent = dr.note || "";
+  }catch(e){ setErr("Refresh failed: "+e.message); }
+}
+
+$("startBtn").onclick = async ()=>{
+  const uid = $("uid").value.trim(); if(!uid){ setErr("Enter a userId first."); return; }
+  const symbols = $("syms").value.split(",").map(s=>s.trim()).filter(Boolean);
+  const body = { userId: uid, symbols, capitalEach: Number($("cap").value)||1000, fleetMaxDrawdownPct: Number($("dd").value)||20 };
+  $("startBtn").disabled = true; setErr("");
+  try{ const r = await jpost("/api/fleet/start", body); setErr(`Started ${r.count} bots.`); await refresh(); }
+  catch(e){ setErr("Start failed: "+e.message); }
+  finally{ $("startBtn").disabled = false; }
+};
+$("stopBtn").onclick = async ()=>{
+  const uid = $("uid").value.trim(); if(!uid) return;
+  if(!confirm(`Stop the entire fleet for "${uid}"?`)) return;
+  $("stopBtn").disabled = true;
+  try{ const r = await jpost("/api/fleet/stop", {userId: uid}); setErr(`Stopped ${r.count} bots.`); await refresh(); }
+  catch(e){ setErr("Stop failed: "+e.message); }
+  finally{ $("stopBtn").disabled = false; }
+};
+$("refreshBtn").onclick = refresh;
+$("uid").addEventListener("keydown", e=>{ if(e.key==="Enter") refresh(); });
+
+if($("uid").value.trim()) refresh();
+setInterval(()=>{ if($("uid").value.trim()) refresh(); }, 15000);
+</script>
+</body>
+</html>

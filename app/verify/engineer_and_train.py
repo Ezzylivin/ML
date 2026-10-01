@@ -100,6 +100,38 @@ def create_strategic_labels(df, look_forward=24, tp=1.0, sl=1.0):
     return pd.Series(labels, index=df.index)
 
 
+def create_atr_labels(df, look_forward=24, tp_atr=3.0, sl_atr=1.5):
+    """Forward TP/SL labeler aligned to the LIVE bot's ATR-based exits (long side):
+    entry = close, TP = entry + tp_atr*ATR, SL = entry - sl_atr*ATR. Label = 1 if
+    TP is hit before SL within look_forward bars, else 0 (SL-first or neither).
+
+    This makes every model (experts, transformer, judge) predict what the bot
+    ACTUALLY does — a 3:1.5 ATR trade — instead of a fixed symmetric 1%/1% move,
+    so the model's P(win) lines up with the trade the engine really takes.
+    """
+    closes = df['close'].values
+    highs  = df['high'].values
+    lows   = df['low'].values
+    atr    = df['atr'].values if 'atr' in df.columns else (closes * 0.01)
+    labels = np.zeros(len(df), dtype=int)
+    for i in range(len(df) - look_forward):
+        a = atr[i]
+        if not np.isfinite(a) or a <= 0:
+            continue
+        entry    = closes[i]
+        tp_price = entry + tp_atr * a
+        sl_price = entry - sl_atr * a
+        for j in range(i + 1, min(i + look_forward + 1, len(df))):
+            # Conservative: check the stop first if both are touched in a bar.
+            if lows[j] <= sl_price:
+                labels[i] = 0
+                break
+            if highs[j] >= tp_price:
+                labels[i] = 1
+                break
+    return pd.Series(labels, index=df.index)
+
+
 def train_all_symbols():
     """Train XGBoost and RandomForest experts for all symbols."""
     symbols = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "ADA-USD", "DOGE-USD", "SUI-USD", "PEPE-USD"]
@@ -123,8 +155,9 @@ def train_all_symbols():
                 print(f"  ⚠️ {symbol} ignored: Only {len(df)} rows left after indicators.")
                 continue
 
-            # Strategic labels (TP/SL based, not naive next-candle)
-            df['target'] = create_strategic_labels(df, look_forward=24, tp=1.0, sl=1.0)
+            # ATR-based labels aligned to the live bot's 3:1.5 ATR exits (FIX #4),
+            # so the experts predict the trade the engine actually takes.
+            df['target'] = create_atr_labels(df, look_forward=24, tp_atr=3.0, sl_atr=1.5)
 
             X = df[feats].values
             y = df['target'].values
@@ -199,7 +232,14 @@ def train_all_symbols():
             else:
                 print(" ✅")
 
-            print(f"  💾 Saved to: {save_path_xgb}")
+            # FIX #14: actually persist the RandomForest. Previously only XGBoost
+            # was dumped and save_path_rf was computed but never written, so any
+            # symbol without a stale RF file ran with 1/3 of the council dead
+            # (RandomForest silently returned a constant 0.5).
+            joblib.dump({"model": rf, "feature_names": feats}, save_path_rf)
+
+            print(f"  💾 Saved XGB → {save_path_xgb}")
+            print(f"  💾 Saved RF  → {save_path_rf}")
 
         except Exception as e:
             print(f"  ❌ {symbol} CRASH: {e}")

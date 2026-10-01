@@ -1,0 +1,46 @@
+{
+  "userId": "ledger-test",
+  "config": {
+    "symbol": "BTC-USD",
+    "timeframe": "1h",
+    "capitalAllocation": 1000,
+    "tradingMode": "paper",
+    "trading_mode": "paper",
+    "api_keys": {},
+    "enable_shorting": true,
+    "mlMode": "off",
+    "mlModel": "stacking",
+    "mlThresholdLong": 0.3,
+    "mlThresholdShort": 0.3,
+    "minEntryScore": 25,
+    "minAdx": 0,
+    "minVolRatio": 0,
+    "minAtrPct": 0,
+    "maxAtrPct": 100,
+    "minVotesRequired": 1,
+    "minWeightedSignal": 0.05,
+    "minMinutesBetweenTrades": 0,
+    "maxPyramiding": 1,
+    "maxTradesPerDay": 50,
+    "maxDailyLoss": 90,
+    "maxDrawdown": 90,
+    "riskPercentage": 5,
+    "candleRefreshSecs": 10,
+    "enablePartialExit": false,
+    "hybridMode": "OR",
+    "strategies": [
+      {
+        "code": "sma_crossover",
+        "params": {
+          "fast_sma": 20,
+          "slow_sma": 100
+        }
+      }
+    ],
+    "params": {
+      "atr_tp_mult": 0.02,
+      "atr_sl_mult": 0.02
+    },
+    "requireTrendAlignment": false
+  }
+}

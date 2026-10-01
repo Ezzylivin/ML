@@ -1,0 +1,817 @@
+# ============================================================
+#  Trading ML Server v22.0 (Full Realism Edition)
+#  PART 1/4 — Models, Config, Data Loading, Utilities
+# ============================================================
+
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import threading
+import time
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+
+import pandas_ta as ta
+
+# ============================================================
+#  GLOBAL INDICATOR CACHE (prevents recompute & column pollution)
+# ============================================================
+
+_indicator_cache = {}   # key: (symbol, timeframe, length...) → DataFrame
+
+def get_cached_df(key):
+    return _indicator_cache.get(key)
+
+def set_cached_df(key, df):
+    _indicator_cache[key] = df
+
+
+# ============================================================
+#  SAFE COLUMN FINDER
+#  Avoids matching "EMA_200" when searching "EMA_20"
+# ============================================================
+
+def find_col(df: pd.DataFrame, prefix: str) -> Optional[str]:
+    """
+    Safe prefix match for indicator columns.
+    """
+    cols = [c for c in df.columns if c.startswith(prefix)]
+    if len(cols) == 1:
+        return cols[0]
+    # Exact match first
+    for c in cols:
+        if c == prefix:
+            return c
+    return cols[0] if cols else None
+
+
+# ============================================================
+#  BACKTEST POSITION MODEL
+# ============================================================
+
+class Position:
+    def __init__(self, pos_type: str, entry_price: float, qty: float, entry_time):
+        self.pos_type = pos_type
+        self.entry_price = entry_price
+        self.qty = qty
+        self.entry_time = entry_time
+
+
+# ============================================================
+#  CONFIG MODELS — FIXED (no mutable defaults)
+# ============================================================
+
+class StrategyConfig(BaseModel):
+    type: str
+    params: Dict[str, Any] = Field(default_factory=dict)
+
+class BotConfig(BaseModel):
+    symbol: str
+    timeframe: str
+    interval_minutes: int
+    strategies: List[StrategyConfig]
+    regime: Optional[Dict[str, Any]] = None
+    params: Dict[str, Any] = Field(default_factory=dict)
+    slippage_pct: float = 0.0005
+    fee_pct: float = 0.0004
+
+class BacktestConfig(BaseModel):
+    symbol: str
+    timeframe: str
+    years: int = 1
+    strategies: List[StrategyConfig]
+    regime: Optional[Dict[str, Any]] = None
+    params: Dict[str, Any] = Field(default_factory=dict)
+    slippage_pct: float = 0.0005
+    fee_pct: float = 0.0004
+    initial_balance: float = 1000.0
+    allocation_pct: float = 1.0
+
+
+# ============================================================
+#  DATA LOADING — CLEANED & STABLE
+# ============================================================
+
+def load_efficient_data(symbol: str, timeframe: str, years: int = 1) -> pd.DataFrame:
+    """
+    Stable, timezone-safe, clean data loader.
+    """
+    period_map = {
+        "1m": "7d",  # yfinance limit
+        "5m": "60d",
+        "15m": "60d",
+        "30m": "60d",
+        "1h": "730d",
+        "4h": "730d",
+        "1d": f"{365 * years}d"
+    }
+
+    yf_interval = timeframe if timeframe != "4h" else "1h"
+
+    df = yf.download(
+        symbol,
+        interval=yf_interval,
+        period=period_map.get(timeframe, "365d"),
+        auto_adjust=False,
+        progress=False
+    )
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.reset_index().rename(
+        columns={
+            "Date": "timestamp",
+            "Datetime": "timestamp"
+        }
+    )
+
+    if df["timestamp"].dtype == "object":
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    elif df["timestamp"].dt.tz is None:
+        df["timestamp"] = df["timestamp"].dt.tz_localize("UTC")
+    else:
+        df["timestamp"] = df["timestamp"].dt.tz_convert("UTC")
+
+    df.rename(
+        columns={
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+            "Volume": "volume"
+        },
+        inplace=True
+    )
+
+    df = df[["timestamp", "open", "high", "low", "close", "volume"]].copy()
+    df.set_index("timestamp", inplace=True)
+
+    # Resample for 4h
+    if timeframe == "4h":
+        df = df.resample("4H").agg({
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum"
+        }).dropna()
+
+    return df
+
+
+# ============================================================
+#  UNIFIED INDICATOR ENGINE (NO POLLUTION)
+# ============================================================
+
+def compute_indicators(df: pd.DataFrame, config: BacktestConfig | BotConfig) -> pd.DataFrame:
+    """
+    Deterministic, cached, pollution-free indicator engine.
+    All indicators used by strategies or regime are computed here.
+    """
+
+    key = (config.symbol, config.timeframe, str(config.dict()))
+    cached = get_cached_df(key)
+    if cached is not None:
+        return cached.copy()
+
+    data = df.copy()
+
+    # ----- RSI -----
+    for s in config.strategies:
+        if s.type == "RSI":
+            rlen = s.params.get("length", 14)
+            data.ta.rsi(length=rlen, append=True)
+
+    # ----- MACD -----
+    for s in config.strategies:
+        if s.type == "MACD":
+            fast = s.params.get("fast", 12)
+            slow = s.params.get("slow", 26)
+            sig = s.params.get("signal", 9)
+            data.ta.macd(fast=fast, slow=slow, signal=sig, append=True)
+
+    # ----- SMA / MA CROSS -----
+    for s in config.strategies:
+        if s.type == "SMA":
+            length = s.params.get("length", 20)
+            data.ta.sma(length=length, append=True)
+        if s.type == "MA_Trend_Crossover":
+            f = s.params.get("fast_length", 20)
+            s_ = s.params.get("slow_length", 50)
+            data.ta.sma(length=f, append=True)
+            data.ta.sma(length=s_, append=True)
+
+    # ----- PSAR -----
+    for s in config.strategies:
+        if s.type == "PSAR":
+            af = s.params.get("af", 0.02)
+            max_af = s.params.get("max_af", 0.2)
+            data.ta.psar(af=af, max_af=max_af, append=True)
+
+    # ----- CCI -----
+    for s in config.strategies:
+        if s.type == "CCI":
+            length = s.params.get("length", 20)
+            data.ta.cci(length=length, append=True)
+
+    # ----- STOCH -----
+    for s in config.strategies:
+        if s.type == "Stochastic":
+            k = s.params.get("k", 14)
+            d = s.params.get("d", 3)
+            smooth = s.params.get("smooth_k", 3)
+            data.ta.stoch(k=k, d=d, smooth_k=smooth, append=True)
+
+    # ----- ATR (for some strategies) -----
+    for s in config.strategies:
+        if s.type in ["ADXSlope", "Engulfing", "BreakoutRetest"]:
+            length = s.params.get("atr_length", 14)
+            data.ta.atr(length=length, append=True)
+
+    # ----- ADX for regime -----
+    if config.regime is not None:
+        if config.regime.get("type") == "ADX":
+            length = config.regime.get("length", 14)
+            data.ta.adx(length=length, append=True)
+
+    set_cached_df(key, data)
+    return data.copy()
+
+
+# ============================================================
+#  SIGNAL PLACEHOLDER (actual strategy signals in Part 2)
+# ============================================================
+
+def generate_ta_signals(df: pd.DataFrame, config: BacktestConfig | BotConfig):
+    """
+    Part 2 will fill actual strategy logic.
+    Here we create the ta_signal column placeholder.
+    """
+    df = df.copy()
+    df["ta_signal"] = 0
+    return df
+
+# ============================================================
+#  PART 2/4 — STRATEGY SIGNAL ENGINE
+# ============================================================
+
+def generate_ta_signals(df: pd.DataFrame, config: BacktestConfig | BotConfig):
+    """
+    Generates ta_signal in a clean, deterministic, pollute-free way.
+    Works with all v22.0 strategies.
+    """
+    df = df.copy()
+    df["ta_signal"] = 0
+
+    for strat in config.strategies:
+        stype = strat.type
+        params = strat.params
+
+        if stype == "RSI":
+            df = _sig_rsi(df, params)
+
+        elif stype == "MACD":
+            df = _sig_macd(df, params)
+
+        elif stype == "SMA":
+            df = _sig_sma(df, params)
+
+        elif stype == "MA_Trend_Crossover":
+            df = _sig_ma_crossover(df, params)
+
+        elif stype == "PSAR":
+            df = _sig_psar(df, params)
+
+        elif stype == "CCI":
+            df = _sig_cci(df, params)
+
+        elif stype == "Stochastic":
+            df = _sig_stoch(df, params)
+
+        elif stype == "BreakoutRetest":
+            df = _sig_breakout_retest(df, params)
+
+        elif stype == "ADXSlope":
+            df = _sig_adx_slope(df, params)
+
+        elif stype == "Engulfing":
+            df = _sig_engulfing(df, params)
+
+        # You may add more strategies here
+
+    return df
+
+
+# ============================================================
+#  RSI STRATEGY
+# ============================================================
+
+def _sig_rsi(df, p):
+    length = p.get("length", 14)
+    os = p.get("oversold", 30)
+    ob = p.get("overbought", 70)
+
+    rsi_col = find_col(df, f"RSI_{length}")
+    if rsi_col is None:
+        return df
+
+    df.loc[df[rsi_col] < os, "ta_signal"] = 1
+    df.loc[df[rsi_col] > ob, "ta_signal"] = -1
+
+    return df
+
+
+# ============================================================
+#  MACD CROSSOVER
+# ============================================================
+
+def _sig_macd(df, p):
+    fast = p.get("fast", 12)
+    slow = p.get("slow", 26)
+    sig = p.get("signal", 9)
+
+    macd = find_col(df, f"MACD_{fast}_{slow}_{sig}")
+    macds = find_col(df, f"MACDs_{fast}_{slow}_{sig}")
+
+    if macd is None or macds is None:
+        return df
+
+    buy = (df[macd] > df[macds]) & (df[macd].shift(1) <= df[macds].shift(1))
+    sell = (df[macd] < df[macds]) & (df[macd].shift(1) >= df[macds].shift(1))
+
+    df.loc[buy, "ta_signal"] = 1
+    df.loc[sell, "ta_signal"] = -1
+
+    return df
+
+
+# ============================================================
+#  SIMPLE SMA SIGNAL (Price vs SMA)
+# ============================================================
+
+def _sig_sma(df, p):
+    length = p.get("length", 20)
+    sma = find_col(df, f"SMA_{length}")
+
+    if sma is None:
+        return df
+
+    df.loc[df["close"] > df[sma], "ta_signal"] = 1
+    df.loc[df["close"] < df[sma], "ta_signal"] = -1
+    return df
+
+
+# ============================================================
+#  SMA CROSSOVER
+# ============================================================
+
+def _sig_ma_crossover(df, p):
+    f = p.get("fast_length", 20)
+    s = p.get("slow_length", 50)
+
+    sma_f = find_col(df, f"SMA_{f}")
+    sma_s = find_col(df, f"SMA_{s}")
+
+    if sma_f is None or sma_s is None:
+        return df
+
+    buy = (df[sma_f] > df[sma_s]) & (df[sma_f].shift(1) <= df[sma_s].shift(1))
+    sell = (df[sma_f] < df[sma_s]) & (df[sma_f].shift(1) >= df[sma_s].shift(1))
+
+    df.loc[buy, "ta_signal"] = 1
+    df.loc[sell, "ta_signal"] = -1
+    return df
+
+
+# ============================================================
+#  PSAR TREND SIGNAL
+# ============================================================
+
+def _sig_psar(df, p):
+    psarl = find_col(df, "PSARl")
+    psars = find_col(df, "PSARs")
+
+    if psarl is None or psars is None:
+        return df
+
+    df.loc[df[psarl] > 0, "ta_signal"] = 1
+    df.loc[df[psars] > 0, "ta_signal"] = -1
+    return df
+
+
+# ============================================================
+#  CCI OVERSOLD/OVERBOUGHT
+# ============================================================
+
+def _sig_cci(df, p):
+    length = p.get("length", 20)
+    low_t = p.get("oversold", -100)
+    high_t = p.get("overbought", 100)
+
+    cci = find_col(df, f"CCI_{length}")
+    if cci is None:
+        return df
+
+    df.loc[df[cci] < low_t, "ta_signal"] = 1
+    df.loc[df[cci] > high_t, "ta_signal"] = -1
+    return df
+
+
+# ============================================================
+#  STOCHASTIC CROSSOVER
+# ============================================================
+
+def _sig_stoch(df, p):
+    k_col = find_col(df, "STOCHk")
+    d_col = find_col(df, "STOCHd")
+
+    if k_col is None or d_col is None:
+        return df
+
+    buy = (df[k_col] > df[d_col]) & (df[k_col].shift(1) <= df[d_col].shift(1)) & (df[k_col] < 20)
+    sell = (df[k_col] < df[d_col]) & (df[k_col].shift(1) >= df[d_col].shift(1)) & (df[k_col] > 80)
+
+    df.loc[buy, "ta_signal"] = 1
+    df.loc[sell, "ta_signal"] = -1
+    return df
+
+
+# ============================================================
+#  BREAKOUT / RETEST (ATR-based)
+# ============================================================
+
+def _sig_breakout_retest(df, p):
+    atr_len = p.get("atr_length", 14)
+    mult = p.get("atr_mult", 2.0)
+
+    atr = find_col(df, f"ATR_{atr_len}")
+    if atr is None:
+        return df
+
+    # EMA baseline
+    df["ema20"] = df["close"].ewm(span=20).mean()
+
+    upper = df["ema20"] + df[atr] * mult
+    lower = df["ema20"] - df[atr] * mult
+
+    df.loc[df["close"] > upper, "ta_signal"] = 1
+    df.loc[df["close"] < lower, "ta_signal"] = -1
+    return df
+
+
+# ============================================================
+#  ADX SLOPE TREND DETECTOR
+# ============================================================
+
+def _sig_adx_slope(df, p):
+    length = p.get("length", 14)
+    slope = p.get("slope", 0.1)
+
+    adx = find_col(df, f"ADX_{length}")
+    if adx is None:
+        return df
+
+    df["adx_slope"] = df[adx].diff()
+
+    df.loc[df["adx_slope"] > slope, "ta_signal"] = 1
+    df.loc[df["adx_slope"] < -slope, "ta_signal"] = -1
+    return df
+
+
+# ============================================================
+#  ENGULFING CANDLE PATTERN
+# ============================================================
+
+def _sig_engulfing(df, p):
+    body_prev = abs(df["close"].shift(1) - df["open"].shift(1))
+    body_now = abs(df["close"] - df["open"])
+
+    # Bullish engulfing
+    bull = (
+        (df["close"].shift(1) < df["open"].shift(1)) &
+        (df["close"] > df["open"]) &
+        (body_now > body_prev)
+    )
+
+    # Bearish engulfing
+    bear = (
+        (df["close"].shift(1) > df["open"].shift(1)) &
+        (df["close"] < df["open"]) &
+        (body_now > body_prev)
+    )
+
+    df.loc[bull, "ta_signal"] = 1
+    df.loc[bear, "ta_signal"] = -1
+    return df
+# ============================================================
+#  PART 3/4 — UNIFIED TRADE ENGINE (LONG & SHORT)
+# ============================================================
+
+class Position:
+    """
+    A unified position object used for both the backtester and the live bot.
+    Tracks all PnL, slippage, value, timestamps, side, and fees.
+    """
+    def __init__(self, side: str, entry_price: float, capital: float, fee_pct: float, slippage_pct: float):
+        self.side = side                      # "long" or "short"
+        self.entry_price = entry_price
+        self.capital = capital                # allocated capital
+        self.fee_pct = fee_pct
+        self.slippage_pct = slippage_pct
+
+        # Qty purchased (abstract units)
+        # For longs: qty = capital / entry_price
+        # For shorts: uses same sizing logic
+        self.qty = capital / entry_price
+
+        # Entry fee
+        self.entry_fee = capital * fee_pct
+
+        self.entry_time = None
+        self.exit_time = None
+
+    # ---------------------------------------------------------
+    def exit(self, exit_price: float):
+        """
+        Returns a dictionary with trade outcome:
+        - total profit/loss after slippage and fees
+        - updated balance impact
+        """
+        # Apply exit slippage:
+        if self.side == "long":
+            exit_price *= (1 - self.slippage_pct)
+            pnl_value = (exit_price - self.entry_price) * self.qty
+
+        else:  # short
+            exit_price *= (1 + self.slippage_pct)
+            pnl_value = (self.entry_price - exit_price) * self.qty
+
+        # Value *before* exit fee:
+        gross_value = self.capital + pnl_value
+
+        # Exit fee is taken on the traded amount
+        exit_fee = gross_value * self.fee_pct
+
+        net_profit = pnl_value - self.entry_fee - exit_fee
+
+        return {
+            "side": self.side,
+            "entryPrice": self.entry_price,
+            "exitPrice": exit_price,
+            "qty": self.qty,
+            "entryFee": self.entry_fee,
+            "exitFee": exit_fee,
+            "profit": net_profit
+        }
+
+
+# ============================================================
+#  UNIFIED EXECUTION ENGINE (USED BY BOT + BACKTEST)
+# ============================================================
+
+class ExecutionEngine:
+    def __init__(self, capital: float, fee_pct: float, slippage_pct: float):
+        self.initial_capital = capital
+        self.balance = capital
+        self.fee_pct = fee_pct
+        self.slippage_pct = slippage_pct
+
+        self.position: Position | None = None
+        self.trades = []
+
+    # ---------------------------------------------------------
+    def enter(self, side: str, price: float, timestamp):
+        if self.position is not None:
+            return  # ignore invalid entry
+
+        # Apply entry slippage:
+        if side == "long":
+            entry_price = price * (1 + self.slippage_pct)
+        else:
+            entry_price = price * (1 - self.slippage_pct)
+
+        self.position = Position(side, entry_price, self.balance, self.fee_pct, self.slippage_pct)
+        self.position.entry_time = timestamp
+
+    # ---------------------------------------------------------
+    def exit(self, price: float, timestamp):
+        if self.position is None:
+            return
+
+        result = self.position.exit(price)
+        result["entryTime"] = self.position.entry_time
+        result["exitTime"] = timestamp
+
+        self.balance += result["profit"]
+        self.trades.append(result)
+
+        self.position = None
+
+    # ---------------------------------------------------------
+    def force_close_last(self, last_price: float, timestamp):
+        """Ensures unrealized positions are included at the end of the backtest."""
+        if self.position is not None:
+            self.exit(last_price, timestamp)
+
+
+# ============================================================
+#  UNIFIED BACKTEST ENGINE
+# ============================================================
+
+def run_backtest(df: pd.DataFrame, config: BacktestConfig):
+    if df.empty:
+        return {"error": "No data"}
+
+    # Unified execution engine
+    exe = ExecutionEngine(
+        capital=config.initialBalance,
+        fee_pct=float(config.fee),
+        slippage_pct=float(SLIPPAGE_PCT),
+    )
+
+    equity_curve = []
+    last_time = None
+
+    # Loop through candles
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        sig = row["ta_signal"]
+        price = float(row["close"])
+        timestamp = row.name
+        last_time = timestamp
+
+        # Record equity curve:
+        equity_curve.append({
+            "timestamp": timestamp.isoformat(),
+            "balance": exe.balance
+        })
+
+        # Trading logic:
+        if exe.position is None:
+            # ENTRY
+            if sig == 1:
+                exe.enter("long", price, timestamp)
+            elif sig == -1:
+                exe.enter("short", price, timestamp)
+
+        else:
+            # EXIT
+            if exe.position.side == "long" and sig == -1:
+                exe.exit(price, timestamp)
+            elif exe.position.side == "short" and sig == 1:
+                exe.exit(price, timestamp)
+
+    # Close last open position:
+    if last_time is not None:
+        exe.force_close_last(df["close"].iloc[-1], last_time)
+
+    # ---------------------------------------------------------
+    # METRICS
+    # ---------------------------------------------------------
+
+    final_balance = exe.balance
+    total_return = ((final_balance - config.initialBalance) / config.initialBalance * 100)
+
+    wins = [t for t in exe.trades if t["profit"] > 0]
+    losses = [t for t in exec_trades := exe.trades if t["profit"] < 0]
+
+    # Drawdown
+    max_dd = 0
+    peak = exe.initial_capital
+    for e in equity_curve:
+        b = e["balance"]
+        peak = max(peak, b)
+        dd = (peak - b) / peak * 100
+        max_dd = max(max_dd, dd)
+
+    results = {
+        "metrics": {
+            "totalReturn": total_return,
+            "finalBalance": final_balance,
+            "totalTrades": len(exe.trades),
+            "winningTrades": len(wins),
+            "losingTrades": len(losses),
+            "winRate": (len(wins) / len(exe.trades) * 100) if exe.trades else 0,
+            "maxDrawdown": max_dd,
+        },
+        "tradeBreakdown": exe.trades,
+        "equityCurve": equity_curve,
+        "candleData": df[["open", "high", "low", "close", "volume"]].reset_index().to_dict("records"),
+    }
+
+    return convert_numpy_types(results)
+# ============================================================
+#  PART 4/4 — PAPER TRADING BOT + API ENDPOINTS
+# ============================================================
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import uvicorn
+
+# ------------------------------------------------------------
+# CONFIG & GLOBAL ENGINE
+# ------------------------------------------------------------
+class PaperTradeConfig:
+    initialBalance: float = 10000
+    fee_pct: float = 0.0005
+    slippage_pct: float = 0.0002
+
+engine = ExecutionEngine(
+    capital=PaperTradeConfig.initialBalance,
+    fee_pct=PaperTradeConfig.fee_pct,
+    slippage_pct=PaperTradeConfig.slippage_pct
+)
+
+# ------------------------------------------------------------
+# FASTAPI SERVER
+# ------------------------------------------------------------
+app = FastAPI(title="TradingML Server v22.0")
+
+# ------------------------------------------------------------
+# REQUEST MODELS
+# ------------------------------------------------------------
+class TradeRequest(BaseModel):
+    action: str  # "buy" or "sell"
+    price: float
+    timestamp: str
+
+class BacktestRequest(BaseModel):
+    data: list  # list of {"open":, "high":, "low":, "close":, "volume":, "ta_signal":}
+    initialBalance: float = 10000
+    fee: float = 0.0005
+
+# ------------------------------------------------------------
+# API ENDPOINTS
+# ------------------------------------------------------------
+
+@app.get("/")
+def root():
+    return {"status": "TradingML Server v22.0 online"}
+
+# -------------------------
+# Paper Trade Entry
+# -------------------------
+@app.post("/trade")
+def paper_trade(req: TradeRequest):
+    ts = pd.to_datetime(req.timestamp)
+    if req.action.lower() == "buy":
+        engine.enter("long", req.price, ts)
+    elif req.action.lower() == "sell":
+        engine.enter("short", req.price, ts)
+    else:
+        raise HTTPException(status_code=400, detail="Invalid action")
+
+    return {"status": "trade entered", "balance": engine.balance}
+
+# -------------------------
+# Paper Trade Exit
+# -------------------------
+@app.post("/exit")
+def paper_exit(req: TradeRequest):
+    ts = pd.to_datetime(req.timestamp)
+    engine.exit(req.price, ts)
+    return {"status": "position closed", "balance": engine.balance}
+
+# -------------------------
+# Run backtest endpoint
+# -------------------------
+@app.post("/backtest")
+def backtest(req: BacktestRequest):
+    df = pd.DataFrame(req.data)
+    df.index = pd.to_datetime(df.index) if df.index.dtype == "O" else df.index
+
+    config = BacktestConfig(
+        initialBalance=req.initialBalance,
+        fee=req.fee
+    )
+
+    results = run_backtest(df, config)
+    return results
+
+# ------------------------------------------------------------
+# LAST POSITION & METRICS
+# ------------------------------------------------------------
+@app.get("/status")
+def status():
+    pos = None
+    if engine.position:
+        pos = {
+            "side": engine.position.side,
+            "entryPrice": engine.position.entry_price,
+            "qty": engine.position.qty,
+            "entryTime": engine.position.entry_time
+        }
+    return {
+        "balance": engine.balance,
+        "openPosition": pos,
+        "totalTrades": len(engine.trades)
+    }
+
+# ------------------------------------------------------------
+# RUN SERVER (OPTIONAL)
+# ------------------------------------------------------------
+# if __name__ == "__main__":
+#     uvicorn.run(app, host="0.0.0.0", port=8000)

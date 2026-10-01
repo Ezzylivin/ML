@@ -1,0 +1,15 @@
+# Keep the build context small/fast. These are bind-mounted at runtime anyway,
+# so excluding them from the image build doesn't lose anything.
+.git
+__pycache__/
+**/__pycache__/
+*.pyc
+*.log
+*.csv
+no_table_*.png
+.venv/
+venv/
+node_modules/
+# state files are provided via the bind mount at runtime
+bot_state.db
+trading_state.db

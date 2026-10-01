@@ -1,0 +1,928 @@
+import threading
+import traceback
+import logging
+import os
+import json
+import re
+
+from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel, Field, ValidationError
+
+from .config import bots_collection, RESULTS_DIR
+from .live_bot import LiveExecutiveBot
+from .utils import recursive_clean, normalize_positions, generate_chart_markers
+
+# Initialize FastAPI
+app = FastAPI(title="Sovereign Executive v89.42")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# Global Variables
+active_live_bots = {}
+bots_lock = threading.Lock()
+logger = logging.getLogger("System")
+if logger.hasHandlers():
+    logger.handlers.clear()
+handler = logging.StreamHandler()
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Server Started.")
+
+
+# Health Check Route
+@app.get("/")
+def health_check():
+    return {"status": "online", "version": "89.42"}
+
+
+# Input validation models
+class StartBotRequest(BaseModel):
+    userId: str
+    symbol: str = Field(default="BTC-USD", pattern=r"^[A-Z]{2,5}-[A-Z]{2,5}$", description="Trading symbol")
+    strategies: list = Field(default=[], description="List of strategies for the bot")
+    initialBalance: float = Field(default=1000.0, description="Initial trading balance")
+
+
+class StopBotRequest(BaseModel):
+    userId: str = Field(..., description="Unique user ID for stopping the bot")
+
+
+@app.post('/api/bot/start')
+async def start_bot(request: StartBotRequest, bg: BackgroundTasks):
+    """Start a bot with specific configurations."""
+    try:
+        bot_id = f"{request.userId}_{request.symbol.replace('/', '-')}"
+        body = recursive_clean(request.dict())
+        body["botId"] = bot_id
+
+        # Use lock for thread-safety
+        with bots_lock:
+            if bot_id in active_live_bots:
+                return JSONResponse(content=jsonable_encoder({"status": "already_running", "botId": bot_id}))
+
+            bot = LiveExecutiveBot(body)
+            active_live_bots[bot_id] = bot
+            bg.add_task(bot.sync_and_trade)
+            logger.info(f"Bot started with botId: {bot_id}")
+
+        return {"status": "started", "botId": bot_id}
+    except ValidationError as ve:
+        logger.error(f"Validation error: {ve}")
+        return JSONResponse(content={"error": "Invalid parameters"}, status_code=422)
+    except Exception as e:
+        logger.error(f"Failed to start bot: {traceback.format_exc()}")
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+@app.post('/api/bot/stop')
+async def stop_bot(request: StopBotRequest):
+    """Stop a bot for a specific user ID."""
+    try:
+        target_id = request.userId
+        count = 0
+
+        # Thread-safe bot management
+        with bots_lock:
+            to_remove = []
+            for bid, bot in list(active_live_bots.items()):
+                if target_id in bid:
+                    bot.stop()
+                    to_remove.append(bid)
+                    count += 1
+            for bid in to_remove:
+                del active_live_bots[bid]
+
+        if count > 0:
+            logger.info(f"Successfully stopped {count} bot(s) for userId: {target_id}")
+            return {"status": "stopped", "count": count}
+        return {"status": "no_bots_found", "userId": target_id}
+    except Exception as e:
+        logger.error(f"Failed to stop bot: {traceback.format_exc()}")
+        return JSONResponse({"status": "error", "message": "Failed to stop bot"}, status_code=500)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[2025-12-22 23:55:05 +0000] [712433] [INFO] Starting gunicorn 23.0.0
+[2025-12-22 23:55:05 +0000] [712433] [INFO] Listening at: http://0.0.0.0:8000 (712433)
+[2025-12-22 23:55:05 +0000] [712433] [INFO] Using worker: uvicorn.workers.UvicornWorker
+[2025-12-22 23:55:05 +0000] [712434] [INFO] Booting worker with pid: 712434
+[2025-12-22 23:55:05 +0000] [712435] [INFO] Booting worker with pid: 712435
+[2025-12-22 23:55:07 +0000] [712434] [INFO] Started server process [712434]
+[2025-12-22 23:55:07 +0000] [712434] [INFO] Waiting for application startup.
+Server Started.
+[2025-12-22 23:55:07 +0000] [712434] [INFO] Application startup complete.
+[2025-12-22 23:55:07 +0000] [712435] [INFO] Started server process [712435]
+[2025-12-22 23:55:07 +0000] [712435] [INFO] Waiting for application startup.
+Server Started.
+[2025-12-22 23:55:07 +0000] [712435] [INFO] Application startup complete.
+WARNING:root:Unsupported type <class 'str'> in recursive_clean. Returning as is.
+WARNING:root:Unsupported type <class 'str'> in recursive_clean. Returning as is.
+WARNING:root:Unsupported type <class 'str'> in recursive_clean. Returning as is.
+WARNING:root:Unsupported type <class 'str'> in recursive_clean. Returning as is.
+WARNING:root:Unsupported type <class 'str'> in recursive_clean. Returning as is.
+WARNING:root:Unsupported type <class 'str'> in recursive_clean. Returning as is.
+Bot started with botId: 0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD
+INFO:System:Bot started with botId: 0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD
+Failed to fetch bot status: Traceback (most recent call last):
+  File "/root/Project/ML/app/api.py", line 150, in get_bot_status
+    return JSONResponse(content={"status": doc.get('status', 'stopped'), **doc})
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/lib/python3.12/site-packages/starlette/responses.py", line 190, in __init__
+    super().__init__(content, status_code, headers, media_type, background)
+  File "/root/venv/lib/python3.12/site-packages/starlette/responses.py", line 47, in __init__
+    self.body = self.render(content)
+                ^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/lib/python3.12/site-packages/starlette/responses.py", line 193, in render
+    return json.dumps(
+           ^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/__init__.py", line 238, in dumps
+    **kw).encode(obj)
+          ^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 200, in encode
+    chunks = self.iterencode(o, _one_shot=True)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 258, in iterencode
+    return _iterencode(o, 0)
+           ^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 180, in default
+    raise TypeError(f'Object of type {o.__class__.__name__} '
+TypeError: Object of type ObjectId is not JSON serializable
+
+ERROR:System:Failed to fetch bot status: Traceback (most recent call last):
+  File "/root/Project/ML/app/api.py", line 150, in get_bot_status
+    return JSONResponse(content={"status": doc.get('status', 'stopped'), **doc})
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/lib/python3.12/site-packages/starlette/responses.py", line 190, in __init__
+    super().__init__(content, status_code, headers, media_type, background)
+  File "/root/venv/lib/python3.12/site-packages/starlette/responses.py", line 47, in __init__
+    self.body = self.render(content)
+                ^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/lib/python3.12/site-packages/starlette/responses.py", line 193, in render
+    return json.dumps(
+           ^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/__init__.py", line 238, in dumps
+    **kw).encode(obj)
+          ^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 200, in encode
+    chunks = self.iterencode(o, _one_shot=True)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 258, in iterencode
+    return _iterencode(o, 0)
+           ^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 180, in default
+    raise TypeError(f'Object of type {o.__class__.__name__} '
+TypeError: Object of type ObjectId is not JSON serializable
+
+Failed to fetch bot status: Traceback (most recent call last):
+  File "/root/Project/ML/app/api.py", line 150, in get_bot_status
+    return JSONResponse(content={"status": doc.get('status', 'stopped'), **doc})
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/lib/python3.12/site-packages/starlette/responses.py", line 190, in __init__
+    super().__init__(content, status_code, headers, media_type, background)
+  File "/root/venv/lib/python3.12/site-packages/starlette/responses.py", line 47, in __init__
+    self.body = self.render(content)
+                ^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/lib/python3.12/site-packages/starlette/responses.py", line 193, in render
+    return json.dumps(
+           ^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/__init__.py", line 238, in dumps
+    **kw).encode(obj)
+          ^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 200, in encode
+    chunks = self.iterencode(o, _one_shot=True)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 258, in iterencode
+    return _iterencode(o, 0)
+           ^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 180, in default
+    raise TypeError(f'Object of type {o.__class__.__name__} '
+TypeError: Object of type ObjectId is not JSON serializable
+
+ERROR:System:Failed to fetch bot status: Traceback (most recent call last):
+  File "/root/Project/ML/app/api.py", line 150, in get_bot_status
+    return JSONResponse(content={"status": doc.get('status', 'stopped'), **doc})
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/lib/python3.12/site-packages/starlette/responses.py", line 190, in __init__
+    super().__init__(content, status_code, headers, media_type, background)
+  File "/root/venv/lib/python3.12/site-packages/starlette/responses.py", line 47, in __init__
+    self.body = self.render(content)
+                ^^^^^^^^^^^^^^^^^^^^
+  File "/root/venv/lib/python3.12/site-packages/starlette/responses.py", line 193, in render
+    return json.dumps(
+           ^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/__init__.py", line 238, in dumps
+    **kw).encode(obj)
+          ^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 200, in encode
+    chunks = self.iterencode(o, _one_shot=True)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 258, in iterencode
+    return _iterencode(o, 0)
+           ^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/json/encoder.py", line 180, in default
+    raise TypeError(f'Object of type {o.__class__.__name__} '
+TypeError: Object of type ObjectId is not JSON serializable
+
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+
+
+
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'Da
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+
+
+
+
+
+
+
+
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFra
+
+
+
+
+
+
+
+
+
+
+
+me' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+
+
+
+
+
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+
+
+
+
+
+
+
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+ERROR:0x1589DB9ef013Bb3394089191E5b76E49af1AacB4_BTC-USD:Error calculating indicators: 'DataFrame' object has no attribute 'ta'
+
+
+@app.get('/api/bot/logs')
+async def get_bot_logs(botId: str = None, userId: str = None, limit: int = 200):
+    """Retrieve bot logs with an optional limit."""
+    try:
+        lookup_id = botId or userId
+        if not lookup_id:
+            raise HTTPException(status_code=400, detail="Either botId or userId is required.")
+
+        doc = bots_collection.find_one({"botId": {"$regex": f"^{lookup_id}"}})
+        if doc and "logs" in doc:
+            sorted_logs = sorted(doc["logs"], key=lambda x: x["timestamp"], reverse=True)
+            return sorted_logs[:limit]
+
+        return JSONResponse(content=[], status_code=404)
+
+    except Exception as e:
+        logger.error(f"Failed to fetch bot logs: {traceback.format_exc()}")
+        return JSONResponse(content={"error": "Failed to fetch logs"}, status_code=500)
+
+
+@app.get("/api/bot/winners")
+def get_winners():
+    """Retrieve strategy winner configurations."""
+    try:
+        if not os.path.exists(RESULTS_DIR):
+            return JSONResponse(content=[], status_code=200)
+
+        winners = []
+        for file_name in os.listdir(RESULTS_DIR):
+            if file_name.endswith(".json"):
+                file_path = os.path.join(RESULTS_DIR, file_name)
+                try:
+                    with open(file_path, "r") as f:
+                        data = json.load(f)
+                        winners.append({
+                            "id": file_name.replace(".json", ""),
+                            "name": file_name.replace(".json", ""),
+                            "config": data
+                        })
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse JSON file {file_name}: {e}")
+                    continue
+
+        winners.sort(key=lambda x: x['config'].get('metrics', {}).get('totalReturn', 0), reverse=True)
+        return winners
+
+    except Exception as e:
+        logger.error(f"Failed to fetch winners: {traceback.format_exc()}")
+        return JSONResponse(content={"error": "Failed to fetch winners"}, status_code=500)
+
+
+@app.post('/api/backtest/combo')
+@app.post('/api/backtest/run')
+@app.post('/api/ml/run-combo-backtest')
+async def handle_backtest(request: Request):
+    """Run backtesting and return results."""
+    try:
+        body = await request.json()
+        symbol = body.get('symbol', 'BTC-USD').replace('-', '/')
+        timeframe = body.get('timeframe', '1h')
+
+        if not symbol or not timeframe:
+            raise HTTPException(status_code=400, detail="Missing 'symbol' or 'timeframe'.")
+
+        # Import libraries dynamically to reduce runtime memory usage
+        import ccxt
+        import pandas as pd
+        from .manager import PrecisionPyramidManager
+        from .strategies import compute_signal
+
+        # Fetch market data to a DataFrame
+        exchange = ccxt.coinbase()
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=1000)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df.set_index(pd.to_datetime(df['timestamp'], unit='ms', utc=True), inplace=True)
+
+        # Apply indicators
+        df.ta.sma(length=10, append=True)
+        df.ta.sma(length=50, append=True)
+        df.ta.macd(append=True)
+        df.ta.rsi(length=14, append=True)
+
+        # Initialize bot models
+        risk_pct = float(body.get('riskPercentage', 1)) / 100
+        mgr = PrecisionPyramidManager(
+            capital=body.get('initialBalance', 1000),
+            risk_mode=body.get('riskManagementMode', 'static'),
+            base_risk=risk_pct
+        )
+
+        # Backtest loop
+        curve = []
+        for i in range(50, len(df)):  # Skip the 1st 50 periods
+            close_price = df['close'].iloc[i]
+            mgr.handle(1, close_price, *df.iloc[i], close_price)
+            curve.append({'timestamp': df.index[i].isoformat(), 'balance': mgr.step_equity(close_price)})
+
+        res = {
+            "metrics": {
+                "totalReturn": round((curve[-1]['balance'] - body.get('initialBalance', 1000)) / 1000 * 100, 2)
+            },
+            "equityCurve": curve
+        }
+        return JSONResponse(content=jsonable_encoder(res))
+
+    except Exception as e:
+        logger.error(f"Backtest failed: {traceback.format_exc()}")
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+@app.get("/api/ml/available-models")
+def list_models():
+    """List all available ML models in the MODEL_DIR."""
+    try:
+        from .config import MODEL_DIR
+        if not os.path.exists(MODEL_DIR):
+            return []
+
+        return [{"id": f.split('.')[0], "name": f.split('.')[0]} for f in os.listdir(MODEL_DIR) if f.endswith('.joblib')]
+
+    except Exception as e:
+        logger.error(f"Error fetching ML models: {traceback.format_exc()}")
+        return JSONResponse({"error": str(e)}, status_code=500)

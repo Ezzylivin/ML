@@ -1,0 +1,96 @@
+[
+  {
+    "code": "rsi_crossover",
+    "params": {
+      "rsi_length": 14,
+      "overbought": 70,
+      "oversold": 30
+    },
+    "mlModel": "xgboost",
+    "mlThreshold": 0.6
+  },
+  {
+    "code": "rsi_crossover",
+    "params": {
+      "rsi_length": 21,
+      "overbought": 75,
+      "oversold": 25
+    },
+    "mlModel": "xgboost",
+    "mlThreshold": 0.55
+  },
+  {
+    "code": "ema_crossover",
+    "params": {
+      "ema_fast": 12,
+      "ema_slow": 26
+    },
+    "mlModel": "lightgbm",
+    "mlThreshold": 0.5
+  },
+  {
+    "code": "ema_crossover",
+    "params": {
+      "ema_fast": 20,
+      "ema_slow": 50
+    },
+    "mlModel": "lightgbm",
+    "mlThreshold": 0.55
+  },
+  {
+    "code": "macd_signal",
+    "params": {
+      "fast": 12,
+      "slow": 26,
+      "signal": 9
+    },
+    "mlModel": "catboost",
+    "mlThreshold": 0.6
+  },
+  {
+    "code": "macd_signal",
+    "params": {
+      "fast": 8,
+      "slow": 21,
+      "signal": 5
+    },
+    "mlModel": "catboost",
+    "mlThreshold": 0.55
+  },
+  {
+    "code": "atr_breakout",
+    "params": {
+      "atr_length": 14,
+      "atr_mult": 1.5
+    },
+    "mlModel": "xgboost",
+    "mlThreshold": 0.6
+  },
+  {
+    "code": "atr_breakout",
+    "params": {
+      "atr_length": 20,
+      "atr_mult": 2.0
+    },
+    "mlModel": "xgboost",
+    "mlThreshold": 0.55
+  },
+  {
+    "code": "bollinger_band",
+    "params": {
+      "length": 20,
+      "std_dev": 2.0
+    },
+    "mlModel": "lightgbm",
+    "mlThreshold": 0.6
+  },
+  {
+    "code": "bollinger_band",
+    "params": {
+      "length": 30,
+      "std_dev": 2.5
+    },
+    "mlModel": "lightgbm",
+    "mlThreshold": 0.55
+  }
+]

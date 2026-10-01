@@ -41,7 +41,7 @@ import tensorflow as tf
 sys.path.append(os.getcwd())
 
 from app.config2 import DATA_DIR, MODEL_STORAGE_DIR, FEATURE_COLUMNS
-from app.verify.engineer_and_train import apply_mega_features, create_strategic_labels
+from app.verify.engineer_and_train import apply_mega_features, create_atr_labels
 from xgboost import XGBClassifier
 from sklearn.ensemble import RandomForestClassifier
 
@@ -162,8 +162,8 @@ def retrain_turbo_judge():
             df, feats = apply_mega_features(df_raw)
             n_features = len(feats)
             
-            # Strategic labels (same as expert training)
-            df['target'] = create_strategic_labels(df, look_forward=24, tp=1.0, sl=1.0)
+            # ATR-based labels aligned to the live bot's exits (FIX #4), same as experts.
+            df['target'] = create_atr_labels(df, look_forward=24, tp_atr=3.0, sl_atr=1.5)
             
             X_all = df[feats].values
             y_all = df['target'].values

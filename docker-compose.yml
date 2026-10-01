@@ -1,0 +1,31 @@
+# NeoV6 engine — Docker Compose.
+#
+# Bind-mounts the whole project into /app, so:
+#   • you keep editing files exactly as now (MCP / editor), changes are live
+#   • state (bot_state.db, trading_state.db, data/, models/, exit_lab_results.json,
+#     logs, .env) persists on the HOST and survives container rebuilds
+#   • installed Python deps live in the image (not /app), so the mount never
+#     clobbers them
+#
+# Usage (on the server, from /root/Project/ML):
+#   1) free port 8000 from the old systemd service:
+#        sudo systemctl stop neo-engine.service && sudo systemctl disable neo-engine.service
+#   2) build + start:
+#        docker compose up -d --build
+#   3) logs:        docker compose logs -f engine
+#      restart (after a code edit):   docker compose restart engine
+#      rebuild (after a deps change): docker compose up -d --build
+#      stop:        docker compose down
+services:
+  engine:
+    build: .
+    image: neov6-engine:latest
+    container_name: neo-engine
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env            # ENGINE_API_KEY, INTERNAL_API_KEY, ENCRYPTION_KEY, SMTP_*, etc.
+    volumes:
+      - .:/app          # live source + persistent state on the host
+    stop_grace_period: 30s   # let the lifespan shutdown persist running bots

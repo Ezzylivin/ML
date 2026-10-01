@@ -1,0 +1,54 @@
+[2025-11-26 01:32:25 +0000] [1769715] [INFO] Starting gunicorn 23.0.0
+[2025-11-26 01:32:25 +0000] [1769715] [INFO] Listening at: http://0.0.0.0:8000 (1769715)
+[2025-11-26 01:32:25 +0000] [1769715] [INFO] Using worker: uvicorn.workers.UvicornWorker
+[2025-11-26 01:32:25 +0000] [1769716] [INFO] Booting worker with pid: 1769716
+[2025-11-26 01:32:25 +0000] [1769717] [INFO] Booting worker with pid: 1769717
+[2025-11-26 01:32:25 +0000] [1769732] [INFO] Booting worker with pid: 1769732
+[2025-11-26 01:32:26 +0000] [1769740] [INFO] Booting worker with pid: 1769740
+[2025-11-26 01:32:26 +0000] [1769741] [INFO] Booting worker with pid: 1769741
+[2025-11-26 01:32:26 +0000] [1769756] [INFO] Booting worker with pid: 1769756
+[2025-11-26 01:32:27 +0000] [1769732] [INFO] Started server process [1769732]
+[2025-11-26 01:32:27 +0000] [1769732] [INFO] Waiting for application startup.
+[2025-11-26 01:32:27 +0000] [1769732] [INFO] Application startup complete.
+[2025-11-26 01:32:27 +0000] [1769717] [INFO] Started server process [1769717]
+[2025-11-26 01:32:27 +0000] [1769717] [INFO] Waiting for application startup.
+[2025-11-26 01:32:27 +0000] [1769717] [INFO] Application startup complete.
+[2025-11-26 01:32:27 +0000] [1769741] [INFO] Started server process [1769741]
+[2025-11-26 01:32:27 +0000] [1769741] [INFO] Waiting for application startup.
+[2025-11-26 01:32:27 +0000] [1769741] [INFO] Application startup complete.
+[2025-11-26 01:32:27 +0000] [1769716] [INFO] Started server process [1769716]
+[2025-11-26 01:32:27 +0000] [1769716] [INFO] Waiting for application startup.
+[2025-11-26 01:32:27 +0000] [1769716] [INFO] Application startup complete.
+[2025-11-26 01:32:27 +0000] [1769740] [INFO] Started server process [1769740]
+[2025-11-26 01:32:27 +0000] [1769740] [INFO] Waiting for application startup.
+[2025-11-26 01:32:27 +0000] [1769740] [INFO] Application startup complete.
+[2025-11-26 01:32:28 +0000] [1769756] [INFO] Started server process [1769756]
+[2025-11-26 01:32:28 +0000] [1769756] [INFO] Waiting for application startup.
+[2025-11-26 01:32:28 +0000] [1769756] [INFO] Application startup complete.
+[2025-11-26 01:32:42 +0000] [1769772] [INFO] Starting gunicorn 23.0.0
+[2025-11-26 01:32:42 +0000] [1769772] [INFO] Listening at: http://0.0.0.0:8000 (1769772)
+[2025-11-26 01:32:42 +0000] [1769772] [INFO] Using worker: uvicorn.workers.UvicornWorker
+[2025-11-26 01:32:42 +0000] [1769773] [INFO] Booting worker with pid: 1769773
+[2025-11-26 01:32:42 +0000] [1769781] [INFO] Booting worker with pid: 1769781
+[2025-11-26 01:32:42 +0000] [1769789] [INFO] Booting worker with pid: 1769789
+[2025-11-26 01:32:42 +0000] [1769790] [INFO] Booting worker with pid: 1769790
+[2025-11-26 01:32:42 +0000] [1769798] [INFO] Booting worker with pid: 1769798
+[2025-11-26 01:32:42 +0000] [1769799] [INFO] Booting worker with pid: 1769799
+[2025-11-26 01:32:43 +0000] [1769773] [INFO] Started server process [1769773]
+[2025-11-26 01:32:43 +0000] [1769773] [INFO] Waiting for application startup.
+[2025-11-26 01:32:43 +0000] [1769773] [INFO] Application startup complete.
+[2025-11-26 01:32:43 +0000] [1769789] [INFO] Started server process [1769789]
+[2025-11-26 01:32:43 +0000] [1769789] [INFO] Waiting for application startup.
+[2025-11-26 01:32:43 +0000] [1769789] [INFO] Application startup complete.
+[2025-11-26 01:32:43 +0000] [1769798] [INFO] Started server process [1769798]
+[2025-11-26 01:32:43 +0000] [1769798] [INFO] Waiting for application startup.
+[2025-11-26 01:32:43 +0000] [1769798] [INFO] Application startup complete.
+[2025-11-26 01:32:43 +0000] [1769781] [INFO] Started server process [1769781]
+[2025-11-26 01:32:43 +0000] [1769781] [INFO] Waiting for application startup.
+[2025-11-26 01:32:43 +0000] [1769781] [INFO] Application startup complete.
+[2025-11-26 01:32:43 +0000] [1769790] [INFO] Started server process [1769790]
+[2025-11-26 01:32:43 +0000] [1769790] [INFO] Waiting for application startup.
+[2025-11-26 01:32:43 +0000] [1769790] [INFO] Application startup complete.
+[2025-11-26 01:32:43 +0000] [1769799] [INFO] Started server process [1769799]
+[2025-11-26 01:32:43 +0000] [1769799] [INFO] Waiting for application startup.
+[2025-11-26 01:32:43 +0000] [1769799] [INFO] Application startup complete.

@@ -610,6 +610,9 @@ RECALIB_MAX_LEGS = int(os.getenv("RECALIB_MAX_LEGS", "2"))  # pyramids capped at
 # Entry signals to hard-validate (not just the fleet's "regime") so we discover
 # which entry actually survives OOS + cost stress. From exit_lab.ENTRIES.
 RECALIB_ENTRIES  = [e.strip() for e in os.getenv("RECALIB_ENTRIES", "regime,trend,momentum").split(",") if e.strip()]
+# Timeframes the live gate validates across (dynamic). 1d often beats 4h once
+# fees bite (fewer, bigger trades amortize cost). Research flagged 1d winners.
+RECALIB_TIMEFRAMES = [t.strip() for t in os.getenv("RECALIB_TIMEFRAMES", "4h,1d").split(",") if t.strip()]
 # Fee profiles for "what-if" validation — each overrides the LONG (spot) maker
 # fee to a venue's rate so you can see which exchange keeps the edge alive.
 # Shorts stay on Kraken margin. "default" = the engine's configured real fee.
@@ -653,21 +656,22 @@ async def _run_recalibration(level="strict", max_legs=None, coinbase_one=False, 
             if _pfee is not None:  # override the LONG (spot) maker/taker fee for this venue
                 exit_lab.DEFAULT_MAKER_FEE = float(_pfee)
                 exit_lab.DEFAULT_TAKER_FEE = float(_pfee)
-            # Test EVERY entry signal (not just the fleet's "regime") x each
-            # pyramiding depth, so we learn which entry actually survives.
-            for entry in RECALIB_ENTRIES:
-                for legs in range(1, legs_max + 1):
-                    rep = await asyncio.to_thread(
-                        exit_lab.validate_exit, None, "4h", entry, "LONG", "trend_ride",
-                        float(lv["holdout"]), float(lv["fee_mult"]), float(lv["slip_mult"]),
-                        int(legs), 1.0)
-                    by_config.append({
-                        "entry": entry, "legs": legs, "verdict": rep.get("verdict"),
-                        "cleared_coins": rep.get("cleared_coins", []),
-                        "survives_oos": rep.get("survives_oos"),
-                        "survives_stress": rep.get("survives_stress"),
-                        "coins_tested": rep.get("coins_tested"),
-                    })
+            # Test EVERY timeframe x entry signal x pyramiding depth, so we learn
+            # which combo actually survives (1d often beats 4h once fees bite).
+            for tf in RECALIB_TIMEFRAMES:
+                for entry in RECALIB_ENTRIES:
+                    for legs in range(1, legs_max + 1):
+                        rep = await asyncio.to_thread(
+                            exit_lab.validate_exit, None, tf, entry, "LONG", "trend_ride",
+                            float(lv["holdout"]), float(lv["fee_mult"]), float(lv["slip_mult"]),
+                            int(legs), 1.0)
+                        by_config.append({
+                            "timeframe": tf, "entry": entry, "legs": legs, "verdict": rep.get("verdict"),
+                            "cleared_coins": rep.get("cleared_coins", []),
+                            "survives_oos": rep.get("survives_oos"),
+                            "survives_stress": rep.get("survives_stress"),
+                            "coins_tested": rep.get("coins_tested"),
+                        })
         finally:
             (exit_lab.MIN_HOLDOUT_TRADES, exit_lab.MIN_SURV_EXPECTANCY_R,
              exit_lab.MIN_SURV_PROFIT_FACTOR, exit_lab.MIN_COINS_GENERALIZE) = snap
@@ -676,7 +680,7 @@ async def _run_recalibration(level="strict", max_legs=None, coinbase_one=False, 
             "ran_at": datetime.now(timezone.utc).isoformat(),
             "level": level, "thresholds": lv,
             "fee_profile": prof, "coinbase_one": (prof == "coinbase_one"),
-            "entries": RECALIB_ENTRIES, "by_config": by_config,
+            "timeframes": RECALIB_TIMEFRAMES, "entries": RECALIB_ENTRIES, "by_config": by_config,
         }
         RECALIB_STATE["last"] = summary
         try:
@@ -760,6 +764,12 @@ async def _run_research():
             "configs_tested": rep.get("configs_tested"),
             "generalizing_configs": rep.get("generalizing_configs"),
         }
+        # AUTO-CHAIN: hard-validate the live gate right after every research sweep,
+        # so the eligibility registry always reflects the latest findings.
+        if RECALIB_ENABLED and not RECALIB_STATE.get("running"):
+            RECALIB_STATE["running"] = True
+            asyncio.create_task(_run_recalibration(RECALIB_LEVEL, RECALIB_MAX_LEGS))
+            logger.info("🔬→♻️ research complete; auto-recalibration started.")
     except Exception as e:
         logger.error(f"🔬 research failed: {e}")
     finally:
@@ -3357,6 +3367,7 @@ async def fleet_recalibration_status():
         "auto_hours": RECALIB_HOURS,
         "auto_level": RECALIB_LEVEL,
         "entries": RECALIB_ENTRIES,
+        "timeframes": RECALIB_TIMEFRAMES,
         "fee_profiles": list(FEE_PROFILES.keys()),
     }
 

@@ -610,6 +610,15 @@ RECALIB_MAX_LEGS = int(os.getenv("RECALIB_MAX_LEGS", "2"))  # pyramids capped at
 # Entry signals to hard-validate (not just the fleet's "regime") so we discover
 # which entry actually survives OOS + cost stress. From exit_lab.ENTRIES.
 RECALIB_ENTRIES  = [e.strip() for e in os.getenv("RECALIB_ENTRIES", "regime,trend,momentum").split(",") if e.strip()]
+# Fee profiles for "what-if" validation — each overrides the LONG (spot) maker
+# fee to a venue's rate so you can see which exchange keeps the edge alive.
+# Shorts stay on Kraken margin. "default" = the engine's configured real fee.
+FEE_PROFILES = {
+    "default":      None,     # no override (engine's real configured fee)
+    "coinbase_one": 0.0,      # Coinbase One: 0% up to its monthly volume cap
+    "binance_us":   0.0,      # Binance.US: 0% maker
+    "kraken":       0.0016,   # Kraken Pro: ~0.16% maker (entry tier)
+}
 RECALIB_LEVELS = {
     "normal":   {"min_trades": 6,  "exp_r": 0.02, "pf": 1.05, "coins": 3, "holdout": 0.25, "fee_mult": 2.0, "slip_mult": 3.0},
     "strict":   {"min_trades": 10, "exp_r": 0.05, "pf": 1.15, "coins": 4, "holdout": 0.30, "fee_mult": 3.0, "slip_mult": 4.0},
@@ -618,7 +627,7 @@ RECALIB_LEVELS = {
 RECALIB_STATE = {"running": False, "last": None}
 
 
-async def _run_recalibration(level="strict", max_legs=None, coinbase_one=False):
+async def _run_recalibration(level="strict", max_legs=None, coinbase_one=False, fee_profile=None):
     """Apply exit_lab's hardened thresholds for this run, re-validate the fleet's
     config (4h / regime / LONG / trend_ride) at each pyramiding depth, and let
     validate_exit rewrite the eligibility registry. Thresholds are ALWAYS restored
@@ -638,9 +647,11 @@ async def _run_recalibration(level="strict", max_legs=None, coinbase_one=False):
             exit_lab.MIN_SURV_EXPECTANCY_R  = lv["exp_r"]
             exit_lab.MIN_SURV_PROFIT_FACTOR = lv["pf"]
             exit_lab.MIN_COINS_GENERALIZE   = lv["coins"]
-            if coinbase_one:  # model a Coinbase One account: 0% Coinbase (long) fees
-                exit_lab.DEFAULT_MAKER_FEE = 0.0
-                exit_lab.DEFAULT_TAKER_FEE = 0.0
+            prof = fee_profile if fee_profile in FEE_PROFILES else ("coinbase_one" if coinbase_one else "default")
+            _pfee = FEE_PROFILES.get(prof)
+            if _pfee is not None:  # override the LONG (spot) maker/taker fee for this venue
+                exit_lab.DEFAULT_MAKER_FEE = float(_pfee)
+                exit_lab.DEFAULT_TAKER_FEE = float(_pfee)
             # Test EVERY entry signal (not just the fleet's "regime") x each
             # pyramiding depth, so we learn which entry actually survives.
             for entry in RECALIB_ENTRIES:
@@ -662,7 +673,8 @@ async def _run_recalibration(level="strict", max_legs=None, coinbase_one=False):
             (exit_lab.DEFAULT_MAKER_FEE, exit_lab.DEFAULT_TAKER_FEE) = fee_snap
         summary = {
             "ran_at": datetime.now(timezone.utc).isoformat(),
-            "level": level, "thresholds": lv, "coinbase_one": bool(coinbase_one),
+            "level": level, "thresholds": lv,
+            "fee_profile": prof, "coinbase_one": (prof == "coinbase_one"),
             "entries": RECALIB_ENTRIES, "by_config": by_config,
         }
         RECALIB_STATE["last"] = summary
@@ -3296,7 +3308,7 @@ async def fleet_eligibility():
 
 
 @app.post("/api/fleet/recalibrate")
-async def fleet_recalibrate(level: Optional[str] = None, max_legs: Optional[int] = None, coinbase_one: bool = False):
+async def fleet_recalibrate(level: Optional[str] = None, max_legs: Optional[int] = None, coinbase_one: bool = False, fee_profile: Optional[str] = None):
     """Harden the system NOW: re-run the hard out-of-sample + cost-stress validation
     that gates live pyramiding, at a chosen strictness (normal|strict|paranoid), and
     rewrite the eligibility registry. Runs in the background so this returns
@@ -3305,7 +3317,7 @@ async def fleet_recalibrate(level: Optional[str] = None, max_legs: Optional[int]
         return {"status": "already_running", "last": RECALIB_STATE.get("last")}
     lvl = level if level in RECALIB_LEVELS else RECALIB_LEVEL
     RECALIB_STATE["running"] = True
-    asyncio.create_task(_run_recalibration(lvl, max_legs, coinbase_one))
+    asyncio.create_task(_run_recalibration(lvl, max_legs, coinbase_one, fee_profile))
     return {"status": "started", "level": lvl}
 
 
@@ -3331,6 +3343,7 @@ async def fleet_recalibration_status():
         "auto_hours": RECALIB_HOURS,
         "auto_level": RECALIB_LEVEL,
         "entries": RECALIB_ENTRIES,
+        "fee_profiles": list(FEE_PROFILES.keys()),
     }
 
 

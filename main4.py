@@ -607,6 +607,9 @@ RECALIB_ENABLED  = os.getenv("RECALIB_ENABLED", "true").lower() == "true"
 RECALIB_HOURS    = float(os.getenv("RECALIB_INTERVAL_HOURS", "24"))
 RECALIB_LEVEL    = os.getenv("RECALIB_LEVEL", "strict")
 RECALIB_MAX_LEGS = int(os.getenv("RECALIB_MAX_LEGS", "2"))  # pyramids capped at 1-2 (fewer legs = less fee drag + less overfit)
+# Entry signals to hard-validate (not just the fleet's "regime") so we discover
+# which entry actually survives OOS + cost stress. From exit_lab.ENTRIES.
+RECALIB_ENTRIES  = [e.strip() for e in os.getenv("RECALIB_ENTRIES", "regime,trend,momentum").split(",") if e.strip()]
 RECALIB_LEVELS = {
     "normal":   {"min_trades": 6,  "exp_r": 0.02, "pf": 1.05, "coins": 3, "holdout": 0.25, "fee_mult": 2.0, "slip_mult": 3.0},
     "strict":   {"min_trades": 10, "exp_r": 0.05, "pf": 1.15, "coins": 4, "holdout": 0.30, "fee_mult": 3.0, "slip_mult": 4.0},
@@ -628,30 +631,34 @@ async def _run_recalibration(level="strict", max_legs=None):
         legs_max = max(1, int(max_legs or RECALIB_MAX_LEGS))
         snap = (exit_lab.MIN_HOLDOUT_TRADES, exit_lab.MIN_SURV_EXPECTANCY_R,
                 exit_lab.MIN_SURV_PROFIT_FACTOR, exit_lab.MIN_COINS_GENERALIZE)
-        by_legs = []
+        by_config = []
         try:
             exit_lab.MIN_HOLDOUT_TRADES     = lv["min_trades"]
             exit_lab.MIN_SURV_EXPECTANCY_R  = lv["exp_r"]
             exit_lab.MIN_SURV_PROFIT_FACTOR = lv["pf"]
             exit_lab.MIN_COINS_GENERALIZE   = lv["coins"]
-            for legs in range(1, legs_max + 1):
-                rep = await asyncio.to_thread(
-                    exit_lab.validate_exit, None, "4h", "regime", "LONG", "trend_ride",
-                    float(lv["holdout"]), float(lv["fee_mult"]), float(lv["slip_mult"]),
-                    int(legs), 1.0)
-                by_legs.append({
-                    "legs": legs, "verdict": rep.get("verdict"),
-                    "cleared_coins": rep.get("cleared_coins", []),
-                    "survives_oos": rep.get("survives_oos"),
-                    "survives_stress": rep.get("survives_stress"),
-                    "coins_tested": rep.get("coins_tested"),
-                })
+            # Test EVERY entry signal (not just the fleet's "regime") x each
+            # pyramiding depth, so we learn which entry actually survives.
+            for entry in RECALIB_ENTRIES:
+                for legs in range(1, legs_max + 1):
+                    rep = await asyncio.to_thread(
+                        exit_lab.validate_exit, None, "4h", entry, "LONG", "trend_ride",
+                        float(lv["holdout"]), float(lv["fee_mult"]), float(lv["slip_mult"]),
+                        int(legs), 1.0)
+                    by_config.append({
+                        "entry": entry, "legs": legs, "verdict": rep.get("verdict"),
+                        "cleared_coins": rep.get("cleared_coins", []),
+                        "survives_oos": rep.get("survives_oos"),
+                        "survives_stress": rep.get("survives_stress"),
+                        "coins_tested": rep.get("coins_tested"),
+                    })
         finally:
             (exit_lab.MIN_HOLDOUT_TRADES, exit_lab.MIN_SURV_EXPECTANCY_R,
              exit_lab.MIN_SURV_PROFIT_FACTOR, exit_lab.MIN_COINS_GENERALIZE) = snap
         summary = {
             "ran_at": datetime.now(timezone.utc).isoformat(),
-            "level": level, "thresholds": lv, "by_legs": by_legs,
+            "level": level, "thresholds": lv,
+            "entries": RECALIB_ENTRIES, "by_config": by_config,
         }
         RECALIB_STATE["last"] = summary
         try:
@@ -685,7 +692,7 @@ async def _recalibration_loop():
                 rep = await _run_recalibration(RECALIB_LEVEL, RECALIB_MAX_LEGS)
                 if rep:
                     logger.info("♻️ Auto-recalibration done: "
-                                + ", ".join(f"x{r['legs']}:{r['verdict']}" for r in rep.get("by_legs", [])))
+                                + ", ".join(f"{r['entry']}/x{r['legs']}:{r['verdict']}" for r in rep.get("by_config", [])))
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -3318,6 +3325,7 @@ async def fleet_recalibration_status():
         "enabled": RECALIB_ENABLED,
         "auto_hours": RECALIB_HOURS,
         "auto_level": RECALIB_LEVEL,
+        "entries": RECALIB_ENTRIES,
     }
 
 

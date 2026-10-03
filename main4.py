@@ -3387,6 +3387,21 @@ async def fleet_research_status():
     }
 
 
+@app.post("/api/fleet/execution_dryrun")
+async def fleet_execution_dryrun(exchange: str = "coinbase", symbol: str = "BTC-USD",
+                                 side: str = "buy", usd: float = 20.0,
+                                 price: Optional[float] = None):
+    """STAGE 1 (dry-run) of the limit-order execution build: compute the REAL
+    post-only limit order we WOULD place on an exchange and return it WITHOUT
+    sending anything. Verifies order params exchange-by-exchange, safely."""
+    try:
+        from execution import dry_run_preview
+        return await dry_run_preview(exchange, symbol, side, float(usd), price)
+    except Exception as e:
+        logger.error(f"execution dry-run error: {e}")
+        return JSONResponse(status_code=500, content={"status": "failed", "error": str(e)})
+
+
 @app.get("/api/fleet/learning")
 async def fleet_learning():
     """Self-learning status: the ledger models trained from the fleet's OWN closed

@@ -729,6 +729,10 @@ async def _recalibration_loop():
 RESEARCH_ENABLED = os.getenv("RESEARCH_ENABLED", "true").lower() == "true"
 RESEARCH_HOURS   = float(os.getenv("RESEARCH_INTERVAL_HOURS", "168"))  # weekly
 RESEARCH_FOLDS   = int(os.getenv("RESEARCH_FOLDS", "25"))
+# The research HUNT runs at REAL RETAIL fees (not the live 0% default), so it only
+# flags configs with a durable edge that survives real costs — not a 0%-only mirage.
+RESEARCH_MAKER_FEE = float(os.getenv("RESEARCH_MAKER_FEE", "0.004"))  # 0.4% retail maker
+RESEARCH_TAKER_FEE = float(os.getenv("RESEARCH_TAKER_FEE", "0.006"))  # 0.6% retail taker
 RESEARCH_STATE = {"running": False, "last_ran": None, "summary": None}
 
 
@@ -738,12 +742,21 @@ async def _run_research():
     loop; a running flag lets the UI show progress."""
     RESEARCH_STATE["running"] = True
     try:
+        import exit_lab
         from exit_lab import optimize_exits
-        rep = await asyncio.to_thread(optimize_exits, None, None, None, None, None,
-                                      RESEARCH_FOLDS, True)
+        fee_snap = (exit_lab.DEFAULT_MAKER_FEE, exit_lab.DEFAULT_TAKER_FEE)
+        try:
+            # HUNT at real retail fees (live still deploys fee-free via Coinbase One).
+            exit_lab.DEFAULT_MAKER_FEE = RESEARCH_MAKER_FEE
+            exit_lab.DEFAULT_TAKER_FEE = RESEARCH_TAKER_FEE
+            rep = await asyncio.to_thread(optimize_exits, None, None, None, None, None,
+                                          RESEARCH_FOLDS, True)
+        finally:
+            (exit_lab.DEFAULT_MAKER_FEE, exit_lab.DEFAULT_TAKER_FEE) = fee_snap
         RESEARCH_STATE["last_ran"] = datetime.now(timezone.utc).isoformat()
         RESEARCH_STATE["summary"] = {
             "ran_at": RESEARCH_STATE["last_ran"],
+            "fees": "retail",
             "configs_tested": rep.get("configs_tested"),
             "generalizing_configs": rep.get("generalizing_configs"),
         }

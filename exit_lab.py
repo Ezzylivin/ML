@@ -108,6 +108,11 @@ ENTRIES = {
     "trend":    [{"code": "supertrend"}, {"code": "ema_cloud"}],   # trend-follow
     "momentum": [{"code": "macd_crossover"}],                       # momentum
     "regime":   [{"code": "ema_cloud"}, {"code": "btc_regime"}],    # trend + only when BTC risk-on
+    # ── expanded hunt space: research sweeps ALL of these (at retail fees) ──
+    "meanrev":      [{"code": "rsi_threshold"}, {"code": "bb_fade"}],    # mean reversion
+    "breakout":     [{"code": "atr_breakout"}, {"code": "vol_profile"}], # volatility breakout
+    "rel_strength": [{"code": "rel_strength"}],                            # outperformance vs BTC
+    "trend_regime": [{"code": "supertrend"}, {"code": "ema_cloud"}, {"code": "btc_regime"}],  # trend gated by BTC regime
 }
 
 # ---- EXIT STYLES — the whole point of this lab ----------------------------

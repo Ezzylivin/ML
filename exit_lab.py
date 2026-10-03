@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from app.config2 import DATA_DIR, DEFAULT_TAKER_FEE
+from app.config2 import DATA_DIR, DEFAULT_TAKER_FEE, DEFAULT_MAKER_FEE, KRAKEN_TAKER_FEE
 from app.backtest2 import Backtester
 from app.verify.engineer_and_train import apply_mega_features
 from edge_discovery import _load_tf, _attach_btc
@@ -178,8 +178,12 @@ def _simulate_exit(df, votes, weighted, *, direction, rule, min_weighted,
     time_bars = style.get("time_bars")
     trend_exit = bool(style.get("trend_exit", False))
 
-    fee_rate  = float(DEFAULT_TAKER_FEE if fee_override is None else fee_override)
-    slip      = (5.0 if slip_bps is None else float(slip_bps)) / 10000.0  # bps adverse fill
+    # Per-side realistic costs: LONGS execute as MAKER (limit) on spot — low fee,
+    # ~no adverse slippage; SHORTS are taker on Kraken margin (higher fee + full
+    # slippage). fee_override/slip_bps (stress tests) still override when given.
+    _is_short = str(direction).upper() in ("SHORT", "BOTH")
+    fee_rate  = float((KRAKEN_TAKER_FEE if _is_short else DEFAULT_MAKER_FEE) if fee_override is None else fee_override)
+    slip      = ((5.0 if _is_short else 1.0) if slip_bps is None else float(slip_bps)) / 10000.0  # bps adverse fill
     funding_pb = 0.00005                    # per-bar carry on shorts/margin
     is_margin = (direction in ("BOTH", "SHORT"))
 
@@ -397,10 +401,12 @@ def _simulate_exit_pyr(df, votes, weighted, *, direction, rule, min_weighted,
     time_bars = style.get("time_bars")
     trend_exit = bool(style.get("trend_exit", False))
 
-    fee_rate  = float(DEFAULT_TAKER_FEE if fee_override is None else fee_override)
-    slip      = (5.0 if slip_bps is None else float(slip_bps)) / 10000.0
-    funding_pb = 0.00005
     is_margin = (direction in ("BOTH", "SHORT"))
+    # Per-side realistic costs (see _simulate_exit): maker + low slip for longs,
+    # Kraken taker + full slip for shorts/margin. Stress override still applies.
+    fee_rate  = float((KRAKEN_TAKER_FEE if is_margin else DEFAULT_MAKER_FEE) if fee_override is None else fee_override)
+    slip      = ((5.0 if is_margin else 1.0) if slip_bps is None else float(slip_bps)) / 10000.0
+    funding_pb = 0.00005
 
     closes = df["close"].values.astype(float)
     highs  = df["high"].values.astype(float)
@@ -896,7 +902,11 @@ def validate_exit(symbol=None, timeframe="4h", entry="trend", direction="LONG",
     if entry not in ENTRIES:
         return {"error": f"unknown entry '{entry}'", "known": list(ENTRIES.keys())}
     syms = [symbol] if symbol else SYMBOLS
-    base_fee = float(DEFAULT_TAKER_FEE)
+    # Validate against the REALISTIC per-side live cost: maker (limit) for longs,
+    # Kraken taker for shorts — a config must clear the fee it will actually face.
+    _is_short = str(direction).upper() in ("SHORT", "BOTH")
+    base_fee  = float(KRAKEN_TAKER_FEE if _is_short else DEFAULT_MAKER_FEE)
+    base_slip = 5.0 if _is_short else 1.0
     rows = []
     for sym in syms:
         feat = _prep(sym, timeframe)
@@ -920,8 +930,8 @@ def validate_exit(symbol=None, timeframe="4h", entry="trend", direction="LONG",
             return _simulate_exit(feat.iloc[ho], v[ho], w[ho], direction=direction,
                                   rule="OR", min_weighted=0.3, risk_pct=1.0, style=style_d,
                                   fee_override=fee, slip_bps=slb)
-        clean  = _run(base_fee, 5.0)
-        stress = _run(base_fee * fee_mult, 5.0 * slip_mult)
+        clean  = _run(base_fee, base_slip)
+        stress = _run(base_fee * fee_mult, base_slip * slip_mult)
         rows.append({
             "symbol": sym, "holdout_bars": n - cut,
             "oos_roi": clean["roi"], "oos_expR": clean["expectancy_r"],

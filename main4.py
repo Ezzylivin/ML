@@ -606,7 +606,7 @@ async def _monthly_audit_loop():
 RECALIB_ENABLED  = os.getenv("RECALIB_ENABLED", "true").lower() == "true"
 RECALIB_HOURS    = float(os.getenv("RECALIB_INTERVAL_HOURS", "24"))
 RECALIB_LEVEL    = os.getenv("RECALIB_LEVEL", "strict")
-RECALIB_MAX_LEGS = int(os.getenv("RECALIB_MAX_LEGS", "3"))
+RECALIB_MAX_LEGS = int(os.getenv("RECALIB_MAX_LEGS", "2"))  # pyramids capped at 1-2 (fewer legs = less fee drag + less overfit)
 RECALIB_LEVELS = {
     "normal":   {"min_trades": 6,  "exp_r": 0.02, "pf": 1.05, "coins": 3, "holdout": 0.25, "fee_mult": 2.0, "slip_mult": 3.0},
     "strict":   {"min_trades": 10, "exp_r": 0.05, "pf": 1.15, "coins": 4, "holdout": 0.30, "fee_mult": 3.0, "slip_mult": 4.0},

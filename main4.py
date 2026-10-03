@@ -594,6 +594,168 @@ async def _monthly_audit_loop():
 
 
 # ============================================================
+# ♻️  VALIDATION RECALIBRATION ("harden the system" — on demand + on a cadence)
+# ============================================================
+# Re-runs the HARD out-of-sample + cost-stress validation that decides which
+# coins may pyramid live (exit_lab.validate_exit rewrites the eligibility
+# registry the fleet reads). POST /api/fleet/recalibrate runs it now; a loop
+# runs it on a cadence. "Levels" tighten the per-coin survive bar (min trades,
+# expectancy-R margin, profit factor), how many coins must generalize, the
+# out-of-sample size, and the cost stress. All off the event loop — never blocks
+# trading, and thresholds are always restored so no other caller inherits them.
+RECALIB_ENABLED  = os.getenv("RECALIB_ENABLED", "true").lower() == "true"
+RECALIB_HOURS    = float(os.getenv("RECALIB_INTERVAL_HOURS", "24"))
+RECALIB_LEVEL    = os.getenv("RECALIB_LEVEL", "strict")
+RECALIB_MAX_LEGS = int(os.getenv("RECALIB_MAX_LEGS", "3"))
+RECALIB_LEVELS = {
+    "normal":   {"min_trades": 6,  "exp_r": 0.02, "pf": 1.05, "coins": 3, "holdout": 0.25, "fee_mult": 2.0, "slip_mult": 3.0},
+    "strict":   {"min_trades": 10, "exp_r": 0.05, "pf": 1.15, "coins": 4, "holdout": 0.30, "fee_mult": 3.0, "slip_mult": 4.0},
+    "paranoid": {"min_trades": 15, "exp_r": 0.10, "pf": 1.25, "coins": 4, "holdout": 0.35, "fee_mult": 4.0, "slip_mult": 6.0},
+}
+RECALIB_STATE = {"running": False, "last": None}
+
+
+async def _run_recalibration(level="strict", max_legs=None):
+    """Apply exit_lab's hardened thresholds for this run, re-validate the fleet's
+    config (4h / regime / LONG / trend_ride) at each pyramiding depth, and let
+    validate_exit rewrite the eligibility registry. Thresholds are ALWAYS restored
+    afterwards, and RECALIB_STATE['running'] is always cleared."""
+    RECALIB_STATE["running"] = True
+    summary = None
+    try:
+        import exit_lab
+        lv = RECALIB_LEVELS.get(level, RECALIB_LEVELS["strict"])
+        legs_max = max(1, int(max_legs or RECALIB_MAX_LEGS))
+        snap = (exit_lab.MIN_HOLDOUT_TRADES, exit_lab.MIN_SURV_EXPECTANCY_R,
+                exit_lab.MIN_SURV_PROFIT_FACTOR, exit_lab.MIN_COINS_GENERALIZE)
+        by_legs = []
+        try:
+            exit_lab.MIN_HOLDOUT_TRADES     = lv["min_trades"]
+            exit_lab.MIN_SURV_EXPECTANCY_R  = lv["exp_r"]
+            exit_lab.MIN_SURV_PROFIT_FACTOR = lv["pf"]
+            exit_lab.MIN_COINS_GENERALIZE   = lv["coins"]
+            for legs in range(1, legs_max + 1):
+                rep = await asyncio.to_thread(
+                    exit_lab.validate_exit, None, "4h", "regime", "LONG", "trend_ride",
+                    float(lv["holdout"]), float(lv["fee_mult"]), float(lv["slip_mult"]),
+                    int(legs), 1.0)
+                by_legs.append({
+                    "legs": legs, "verdict": rep.get("verdict"),
+                    "cleared_coins": rep.get("cleared_coins", []),
+                    "survives_oos": rep.get("survives_oos"),
+                    "survives_stress": rep.get("survives_stress"),
+                    "coins_tested": rep.get("coins_tested"),
+                })
+        finally:
+            (exit_lab.MIN_HOLDOUT_TRADES, exit_lab.MIN_SURV_EXPECTANCY_R,
+             exit_lab.MIN_SURV_PROFIT_FACTOR, exit_lab.MIN_COINS_GENERALIZE) = snap
+        summary = {
+            "ran_at": datetime.now(timezone.utc).isoformat(),
+            "level": level, "thresholds": lv, "by_legs": by_legs,
+        }
+        RECALIB_STATE["last"] = summary
+        try:
+            from app.config2 import DATA_DIR as _DD
+            with open(os.path.join(_DD, "recalibration_status.json"), "w") as _f:
+                json.dump(summary, _f, indent=2)
+        except Exception as _e:
+            logger.warning(f"♻️ recalibration status save failed: {_e}")
+    except Exception as e:
+        logger.error(f"♻️ recalibration failed: {e}")
+    finally:
+        RECALIB_STATE["running"] = False
+    return summary
+
+
+async def _recalibration_loop():
+    if not RECALIB_ENABLED:
+        logger.info("♻️ Auto-recalibration disabled (RECALIB_ENABLED != true).")
+        return
+    from app.config2 import DATA_DIR as _DD
+    status_path = os.path.join(_DD, "recalibration_status.json")
+    await asyncio.sleep(90)  # let the app settle before any heavy work
+    while True:
+        try:
+            due = True
+            if os.path.exists(status_path):
+                age_h = (time.time() - os.path.getmtime(status_path)) / 3600.0
+                due = age_h >= RECALIB_HOURS
+            if due and not RECALIB_STATE.get("running"):
+                logger.info(f"♻️ Auto-recalibration starting (level={RECALIB_LEVEL})…")
+                rep = await _run_recalibration(RECALIB_LEVEL, RECALIB_MAX_LEGS)
+                if rep:
+                    logger.info("♻️ Auto-recalibration done: "
+                                + ", ".join(f"x{r['legs']}:{r['verdict']}" for r in rep.get("by_legs", [])))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"♻️ recalibration loop error: {e}")
+        await asyncio.sleep(max(1.0, min(RECALIB_HOURS, 6.0)) * 3600)
+
+
+# ============================================================
+# 🔬 AUTOMATED RESEARCH (always hunt for the best-performing configs)
+# ============================================================
+# Sweeps exit/sizing styles across coins (walk-forward, ranked by CROSS-COIN
+# generalization) via exit_lab.optimize_exits — the "find the best performers"
+# search. POST /api/fleet/research runs it now; a loop runs it on a cadence.
+# Heavy, so it runs off the event loop with a file-age gate. Results land in
+# data/exit_lab_results.json (same file the Evidence panel + /results read).
+RESEARCH_ENABLED = os.getenv("RESEARCH_ENABLED", "true").lower() == "true"
+RESEARCH_HOURS   = float(os.getenv("RESEARCH_INTERVAL_HOURS", "168"))  # weekly
+RESEARCH_FOLDS   = int(os.getenv("RESEARCH_FOLDS", "25"))
+RESEARCH_STATE = {"running": False, "last_ran": None, "summary": None}
+
+
+async def _run_research():
+    """Run the cross-coin exit/sizing sweep (optimize_exits) and refresh
+    data/exit_lab_results.json with the ranked best performers. Off the event
+    loop; a running flag lets the UI show progress."""
+    RESEARCH_STATE["running"] = True
+    try:
+        from exit_lab import optimize_exits
+        rep = await asyncio.to_thread(optimize_exits, None, None, None, None, None,
+                                      RESEARCH_FOLDS, True)
+        RESEARCH_STATE["last_ran"] = datetime.now(timezone.utc).isoformat()
+        RESEARCH_STATE["summary"] = {
+            "ran_at": RESEARCH_STATE["last_ran"],
+            "configs_tested": rep.get("configs_tested"),
+            "generalizing_configs": rep.get("generalizing_configs"),
+        }
+    except Exception as e:
+        logger.error(f"🔬 research failed: {e}")
+    finally:
+        RESEARCH_STATE["running"] = False
+    return RESEARCH_STATE.get("summary")
+
+
+async def _research_loop():
+    if not RESEARCH_ENABLED:
+        logger.info("🔬 Auto-research disabled (RESEARCH_ENABLED != true).")
+        return
+    from app.config2 import DATA_DIR as _DD
+    results_path = os.path.join(_DD, "exit_lab_results.json")
+    await asyncio.sleep(120)  # settle after boot (and after the first recalibration)
+    while True:
+        try:
+            due = True
+            if os.path.exists(results_path):
+                age_h = (time.time() - os.path.getmtime(results_path)) / 3600.0
+                due = age_h >= RESEARCH_HOURS
+            if due and not RESEARCH_STATE.get("running"):
+                logger.info("🔬 Auto-research starting (cross-coin exit sweep)…")
+                rep = await _run_research()
+                if rep:
+                    logger.info(f"🔬 Auto-research done: {rep.get('generalizing_configs')}"
+                                f"/{rep.get('configs_tested')} configs generalize.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"🔬 research loop error: {e}")
+        await asyncio.sleep(max(1.0, min(RESEARCH_HOURS, 24.0)) * 3600)
+
+
+# ============================================================
 # 🔄 CROSS-RESTART PERSISTENCE (auto-resume running bots on startup)
 # ============================================================
 # On boot, relaunch every bot that was 'running' when the engine last went down
@@ -658,6 +820,12 @@ async def lifespan(app: FastAPI):
     _audit_task = asyncio.create_task(_monthly_audit_loop())
     logger.info(f"🗓️ Monthly exit-edge audit {'ENABLED' if AUDIT_ENABLED else 'disabled'} "
                 f"(every {AUDIT_INTERVAL_DAYS:.0f}d; structural re-validation, off the event loop).")
+    _recalib_task = asyncio.create_task(_recalibration_loop())
+    logger.info(f"♻️ Auto-recalibration {'ENABLED' if RECALIB_ENABLED else 'disabled'} "
+                f"(every {RECALIB_HOURS:.0f}h, level={RECALIB_LEVEL}; re-validates the live-pyramiding gate).")
+    _research_task = asyncio.create_task(_research_loop())
+    logger.info(f"🔬 Auto-research {'ENABLED' if RESEARCH_ENABLED else 'disabled'} "
+                f"(every {RESEARCH_HOURS:.0f}h; hunts for the best-performing configs).")
     yield
     if _self_learn_task is not None:
         _self_learn_task.cancel()
@@ -665,6 +833,14 @@ async def lifespan(app: FastAPI):
     _resume_task.cancel()
     try:
         _audit_task.cancel()
+    except Exception:
+        pass
+    try:
+        _recalib_task.cancel()
+    except Exception:
+        pass
+    try:
+        _research_task.cancel()
     except Exception:
         pass
     await GLOBAL_SESSION.close()
@@ -3107,6 +3283,83 @@ async def fleet_eligibility():
         return JSONResponse(status_code=500, content={"status": "failed", "error": str(e)})
 
 
+@app.post("/api/fleet/recalibrate")
+async def fleet_recalibrate(level: Optional[str] = None, max_legs: Optional[int] = None):
+    """Harden the system NOW: re-run the hard out-of-sample + cost-stress validation
+    that gates live pyramiding, at a chosen strictness (normal|strict|paranoid), and
+    rewrite the eligibility registry. Runs in the background so this returns
+    immediately; poll GET /api/fleet/recalibration for progress + the verdict."""
+    if RECALIB_STATE.get("running"):
+        return {"status": "already_running", "last": RECALIB_STATE.get("last")}
+    lvl = level if level in RECALIB_LEVELS else RECALIB_LEVEL
+    RECALIB_STATE["running"] = True
+    asyncio.create_task(_run_recalibration(lvl, max_legs))
+    return {"status": "started", "level": lvl}
+
+
+@app.get("/api/fleet/recalibration")
+async def fleet_recalibration_status():
+    """Last recalibration result (verdict + cleared coins per pyramiding depth) and
+    whether one is running now. Falls back to the persisted file after a restart."""
+    last = RECALIB_STATE.get("last")
+    if last is None:
+        try:
+            from app.config2 import DATA_DIR as _DD
+            _p = os.path.join(_DD, "recalibration_status.json")
+            if os.path.exists(_p):
+                with open(_p) as _f:
+                    last = json.load(_f)
+        except Exception:
+            last = None
+    return {
+        "running": bool(RECALIB_STATE.get("running")),
+        "last": last,
+        "levels": list(RECALIB_LEVELS.keys()),
+        "enabled": RECALIB_ENABLED,
+        "auto_hours": RECALIB_HOURS,
+        "auto_level": RECALIB_LEVEL,
+    }
+
+
+@app.post("/api/fleet/research")
+async def fleet_research():
+    """Run the cross-coin research sweep NOW (find the best-performing exit/sizing
+    configs). Background; poll GET /api/fleet/research for progress + the ranking."""
+    if RESEARCH_STATE.get("running"):
+        return {"status": "already_running"}
+    RESEARCH_STATE["running"] = True
+    asyncio.create_task(_run_research())
+    return {"status": "started"}
+
+
+@app.get("/api/fleet/research")
+async def fleet_research_status():
+    """Latest research ranking (top generalizing configs) + whether a sweep is
+    running now + the automated cadence. Reads data/exit_lab_results.json."""
+    results = None
+    try:
+        from app.config2 import DATA_DIR as _DD
+        _p = os.path.join(_DD, "exit_lab_results.json")
+        if os.path.exists(_p):
+            with open(_p) as _f:
+                _data = json.load(_f)
+            results = {
+                "generated": _data.get("generated"),
+                "configs_tested": _data.get("configs_tested"),
+                "generalizing_configs": _data.get("generalizing_configs"),
+                "top": (_data.get("top") or [])[:10],
+                "winners": (_data.get("winners") or [])[:10],
+            }
+    except Exception:
+        results = None
+    return {
+        "running": bool(RESEARCH_STATE.get("running")),
+        "enabled": RESEARCH_ENABLED,
+        "auto_hours": RESEARCH_HOURS,
+        "results": results,
+    }
+
+
 @app.get("/api/fleet/learning")
 async def fleet_learning():
     """Self-learning status: the ledger models trained from the fleet's OWN closed
@@ -3297,6 +3550,10 @@ async def fleet_start(req: FleetStartRequest, request: Request):
     single-bot start path per child, so nothing in the validated loop changes."""
     _require_fleet_key(request)
     base = req.userId.strip()
+    # Reset this fleet's portfolio-drawdown peak so a fresh / re-ignited fleet
+    # (especially a SMALLER one, e.g. a lower-budget tier) isn't instantly halted
+    # by a stale peak left over from a larger previous session.
+    FLEET_STATE.pop(base, None)
     symbols = req.symbols or ["BTC-USD", "ETH-USD", "SOL-USD"]
     cap = float(req.capitalEach or 1000.0)
     # Pyramiding gate: if the user enabled it (maxLegs>1), only coins CLEARED by
@@ -3512,6 +3769,7 @@ async def fleet_stop(req: BotStopRequest, request: Request):
     _require_fleet_key(request)
     base = req.userId.strip()
     prefix = f"{base}::"
+    FLEET_STATE.pop(base, None)  # drop the portfolio-drawdown peak when the fleet stops
     keys = set(k for k in list(TASK_REGISTRY.keys()) if k.startswith(prefix))
     keys |= set(k for k in list(ACTIVE_BOTS.keys()) if k.startswith(prefix))
     stopped = []
@@ -3559,6 +3817,40 @@ async def fleet_set_risk(request: Request, userId: str, riskPct: float):
     logger.info("⚙️ FLEET RISK %s -> %.2f%% on %d bots (new entries only)", base, rp, len(updated))
     return {"fleet": base, "risk_pct": rp, "updated": len(updated),
             "note": "Applies to NEW entries only; open positions keep their original size and stop."}
+
+
+@app.post("/api/fleet/reset_history")
+async def fleet_reset_history(request: Request, userId: str):
+    """HARD RESET of all trade-history data behind the charts: wipes each bot's
+    in-memory trade log + equity curve (the live feed, chart markers, drift and
+    equity chart) AND the persistent trade ledger (the Track Record). Does NOT
+    touch open positions or balances — it clears the HISTORY, not the money, so
+    the fleet keeps running from a clean slate. Requires the internal key."""
+    _require_fleet_key(request)
+    base = str(userId).strip()
+    prefix = f"{base}::"
+    FLEET_STATE.pop(base, None)  # clear the portfolio-drawdown peak on a full reset
+    reset = 0
+    for key, b in list(ACTIVE_BOTS.items()):
+        if not key.startswith(prefix):
+            continue
+        b["trade_history"] = []
+        b["equityCurve"] = []
+        b["winRate"] = 0
+        b["profitFactor"] = 1.0
+        try:
+            DatabaseHandler.save_state(key, b)
+        except Exception as e:
+            logger.warning(f"reset_history save_state {key} failed: {e}")
+        reset += 1
+    removed = 0
+    try:
+        removed = trade_recorder.clear(base)  # clears base + all uid::* ledger rows
+    except Exception as e:
+        logger.warning(f"reset_history ledger clear failed: {e}")
+    logger.warning("🧹 FLEET HISTORY RESET %s — %d bots cleared, %d ledger trades removed", base, reset, removed)
+    return {"fleet": base, "bots_reset": reset, "ledger_removed": removed,
+            "note": "Trade history + ledger cleared. Open positions and balances untouched."}
 
 
 # =============================================================

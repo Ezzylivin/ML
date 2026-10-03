@@ -141,6 +141,18 @@ MIN_PROFITABLE_FOLDS = 4
 # least this many coins to count as a real, non-overfit effect.
 MIN_COINS_GENERALIZE = 3
 
+# ── Hardened "survives" bar (per coin, per holdout run) ──────────────────
+# A coin counts as surviving a holdout only if it cleared a MEANINGFUL bar, not
+# merely ROI > 0 on a couple of lucky trades (the old test). These are module
+# globals so a recalibration run can tighten them AT WILL without code changes
+# (see main4 /api/fleet/recalibrate):
+#   MIN_HOLDOUT_TRADES     - enough closed trades for the result to mean anything
+#   MIN_SURV_EXPECTANCY_R  - positive edge WITH margin above breakeven (in R)
+#   MIN_SURV_PROFIT_FACTOR - gross wins / gross losses must clear > 1 with margin
+MIN_HOLDOUT_TRADES     = 6
+MIN_SURV_EXPECTANCY_R  = 0.02
+MIN_SURV_PROFIT_FACTOR = 1.05
+
 
 # ==========================================================================
 # core simulator — same costs as _simulate, fully parameterized exits
@@ -917,8 +929,8 @@ def validate_exit(symbol=None, timeframe="4h", entry="trend", direction="LONG",
             "oos_trades": clean["total_trades"], "oos_dd": clean["max_drawdown"],
             "stress_roi": stress["roi"], "stress_expR": stress["expectancy_r"],
             "stress_trades": stress["total_trades"],
-            "survives": bool(clean["roi"] > 0 and clean["expectancy_r"] > 0),
-            "survives_stress": bool(stress["roi"] > 0 and stress["expectancy_r"] > 0),
+            "survives": bool(clean["roi"] > 0 and clean["expectancy_r"] >= MIN_SURV_EXPECTANCY_R and clean["total_trades"] >= MIN_HOLDOUT_TRADES and clean["profit_factor"] >= MIN_SURV_PROFIT_FACTOR),
+            "survives_stress": bool(stress["roi"] > 0 and stress["expectancy_r"] >= MIN_SURV_EXPECTANCY_R and stress["total_trades"] >= MIN_HOLDOUT_TRADES and stress["profit_factor"] >= MIN_SURV_PROFIT_FACTOR),
         })
     valid = [r for r in rows if "oos_roi" in r]
     n_pos = sum(1 for r in valid if r["survives"])

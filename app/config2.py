@@ -71,10 +71,16 @@ ML_CONFIG = {
 #   - main4.py live engine: hardcoded 0.006 (0.6%) ✗ 10x higher!
 #
 # NEW: Single source of truth. Import these in main4 and backtest2.
-# Standard Coinbase Advanced taker fee for most volume tiers
-DEFAULT_TAKER_FEE = 0.0006     # 0.06% — Coinbase Advanced taker fee
-KRAKEN_TAKER_FEE = 0.0026      # 0.26% — Kraken margin taker fee
-SLIPPAGE_BPS = 1.0              # 0.1% expected slippage
+# REALISTIC RETAIL FEES so paper-trading matches what users actually pay LIVE.
+# 0.0006 (0.06%) was an institutional/high-volume rate — ~10x too low for a new
+# retail account, which made every backtest wildly over-optimistic. Entry-tier
+# 2026 spot TAKER is ~0.6-0.9% (Coinbase Advanced) / ~0.8% (Kraken Pro); MAKER
+# (limit orders) is lower (~0.4%). Override per YOUR exchange + 30-day-volume
+# tier via env so paper == live:  TAKER_FEE_PCT, MAKER_FEE_PCT, SLIPPAGE_BPS.
+DEFAULT_TAKER_FEE = float(os.getenv("TAKER_FEE_PCT", "0.006"))        # 0.6% — realistic retail taker (market orders)
+DEFAULT_MAKER_FEE = float(os.getenv("MAKER_FEE_PCT", "0.004"))        # 0.4% — maker (limit orders): the cheaper path
+KRAKEN_TAKER_FEE  = float(os.getenv("KRAKEN_TAKER_FEE_PCT", "0.008")) # 0.8% — Kraken Pro base taker (2026)
+SLIPPAGE_BPS      = float(os.getenv("SLIPPAGE_BPS", "1.0"))           # 0.1% expected slippage (market orders)
 
 # ============================================================
 # 🔧 FIX #3: CREDENTIALS REMOVED FROM SOURCE CODE

@@ -614,10 +614,11 @@ RECALIB_ENTRIES  = [e.strip() for e in os.getenv("RECALIB_ENTRIES", "regime,tren
 # fee to a venue's rate so you can see which exchange keeps the edge alive.
 # Shorts stay on Kraken margin. "default" = the engine's configured real fee.
 FEE_PROFILES = {
-    "default":      None,     # no override (engine's real configured fee)
-    "coinbase_one": 0.0,      # Coinbase One: 0% up to its monthly volume cap
-    "binance_us":   0.0,      # Binance.US: 0% maker
-    "kraken":       0.0016,   # Kraken Pro: ~0.16% maker (entry tier)
+    "default":           None,    # engine's configured fee (0% now that Coinbase One is default-on)
+    "coinbase_one":      0.0,     # Coinbase One: 0% up to its monthly volume cap
+    "binance_us":        0.0,     # Binance.US: 0% maker
+    "kraken":            0.0016,  # Kraken Pro: ~0.16% maker (entry tier)
+    "coinbase_advanced": 0.004,   # real Coinbase Advanced retail maker (the "fee killer" check)
 }
 RECALIB_LEVELS = {
     "normal":   {"min_trades": 6,  "exp_r": 0.02, "pf": 1.05, "coins": 3, "holdout": 0.25, "fee_mult": 2.0, "slip_mult": 3.0},

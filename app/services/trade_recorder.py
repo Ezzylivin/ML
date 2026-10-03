@@ -135,7 +135,9 @@ def clear(user_id=None):
     try:
         conn = _connect(); c = conn.cursor()
         if user_id:
-            c.execute("DELETE FROM trades WHERE user_id = ?", (user_id,))
+            # Clear the base id AND its fleet children ("<uid>::<symbol>::<side>").
+            c.execute("DELETE FROM trades WHERE user_id = ? OR user_id LIKE ?",
+                      (user_id, f"{user_id}::%"))
         else:
             c.execute("DELETE FROM trades")
         n = c.rowcount
@@ -154,9 +156,16 @@ def summary(recent_limit=25, user_id=None):
     """
     out = {"totals": {}, "by_symbol": [], "by_direction": [],
            "by_reason": [], "recent": [], "cum_pnl": []}
-    # Optional per-user filter, applied to every query.
-    w = "WHERE user_id = ?" if user_id else ""
-    p = (user_id,) if user_id else ()
+    # Optional per-user filter, applied to every query. A fleet records each
+    # child bot under a COMPOSITE id ("<uid>::<symbol>::<side>"), so scope by
+    # the base id OR any of its composite children — otherwise a user's fleet
+    # trades (the only kind the fleet writes) never roll up into their report.
+    if user_id:
+        w = "WHERE (user_id = ? OR user_id LIKE ?)"
+        p = (user_id, f"{user_id}::%")
+    else:
+        w = ""
+        p = ()
     try:
         conn = _connect(); conn.row_factory = sqlite3.Row; c = conn.cursor()
 

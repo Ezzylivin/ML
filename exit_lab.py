@@ -51,6 +51,45 @@ from edge_discovery import _load_tf, _attach_btc
 log = logging.getLogger("exit_lab")
 OUT_PATH = os.path.join(DATA_DIR, "exit_lab_results.json")
 
+
+def _fmt_ts(ix):
+    """Best-effort ISO string for a bar index value (Timestamp or anything)."""
+    try:
+        return ix.isoformat()
+    except Exception:
+        return str(ix)
+
+
+# ---- validation eligibility registry -------------------------------------
+# The bridge between the Strategy Lab's hard validation and the LIVE fleet: a
+# config may only be used live on the coins that SURVIVED both the out-of-sample
+# holdout AND the cost-stress test. validate_exit() writes this; fleet_start reads
+# it to decide which coins may pyramid. A coin that didn't clear falls back to the
+# safe single-leg behavior.
+ELIG_PATH = os.path.join(DATA_DIR, "exit_validation.json")
+
+
+def _elig_key(timeframe, entry, direction, style, max_legs):
+    return f"{timeframe}:{entry}:{direction}:{style}:legs{int(max_legs)}"
+
+
+def all_eligibility():
+    """The whole validation registry (every validated config -> cleared coins)."""
+    try:
+        if not os.path.exists(ELIG_PATH):
+            return {}
+        with open(ELIG_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def load_eligibility(timeframe="4h", entry="regime", direction="LONG", style="trend_ride", max_legs=1):
+    """Coins CLEARED (survived holdout + cost stress) for this exact config, from
+    the persisted registry. [] if the config was never validated."""
+    rec = all_eligibility().get(_elig_key(timeframe, entry, direction, style, max_legs))
+    return list(rec.get("cleared_coins", [])) if rec else []
+
 # ---- universe -------------------------------------------------------------
 SYMBOLS    = ["BTC-USD", "ETH-USD", "SOL-USD", "DOGE-USD", "XRP-USD"]
 TIMEFRAMES = ["4h", "1d"]          # 1h is fee-dominated; focus where survival is plausible
@@ -108,7 +147,7 @@ MIN_COINS_GENERALIZE = 3
 # ==========================================================================
 def _simulate_exit(df, votes, weighted, *, direction, rule, min_weighted,
                    risk_pct, style, cooldown_bars=0, initial_balance=1000.0,
-                   fee_override=None, slip_bps=None):
+                   fee_override=None, slip_bps=None, return_series=False):
     """Faithful single-slice simulation with a fully parameterized exit engine.
 
     Entry = the live StrategyBrain signal (votes/weighted already computed for the
@@ -144,6 +183,8 @@ def _simulate_exit(df, votes, weighted, *, direction, rule, min_weighted,
     trade_pnls = []      # net $ per closed trade (sum of partial + final)
     trade_rs   = []      # R multiple per closed trade
     equity = [balance]
+    equity_ts = [{"ts": _fmt_ts(idx[0]), "equity": round(float(balance), 2)}] if (return_series and len(idx)) else []
+    trade_log = []       # per-trade detail, only populated when return_series=True
     signal_has_reset = True
     last_exit_bar = -10**9
 
@@ -228,6 +269,18 @@ def _simulate_exit(df, votes, weighted, *, direction, rule, min_weighted,
                 risk0 = position["risk0"]
                 trade_rs.append(net / risk0 if risk0 > 0 else 0.0)
                 equity.append(balance)
+                if return_series:
+                    trade_log.append({
+                        "entry_ts": _fmt_ts(idx[position["entry_bar"]]),
+                        "exit_ts": _fmt_ts(idx[i]),
+                        "direction": position["type"],
+                        "entry_price": round(float(position["entry"]), 6),
+                        "exit_price": round(float(fill), 6),
+                        "pnl": round(float(net), 2),
+                        "r": round(float(net / risk0), 3) if risk0 > 0 else 0.0,
+                        "reason": reason,
+                    })
+                    equity_ts.append({"ts": _fmt_ts(idx[i]), "equity": round(float(balance), 2)})
                 position = None
                 last_exit_bar = i
 
@@ -272,6 +325,18 @@ def _simulate_exit(df, votes, weighted, *, direction, rule, min_weighted,
         risk0 = position["risk0"]
         trade_rs.append(net / risk0 if risk0 > 0 else 0.0)
         equity.append(balance)
+        if return_series:
+            trade_log.append({
+                "entry_ts": _fmt_ts(idx[position["entry_bar"]]),
+                "exit_ts": _fmt_ts(idx[len(df) - 1]),
+                "direction": position["type"],
+                "entry_price": round(float(position["entry"]), 6),
+                "exit_price": round(float(fill), 6),
+                "pnl": round(float(net), 2),
+                "r": round(float(net / risk0), 3) if risk0 > 0 else 0.0,
+                "reason": "EOD",
+            })
+            equity_ts.append({"ts": _fmt_ts(idx[len(df) - 1]), "equity": round(float(balance), 2)})
 
     roi = ((balance - initial_balance) / initial_balance) * 100.0
     wins = [p for p in trade_pnls if p > 0]
@@ -284,12 +349,225 @@ def _simulate_exit(df, votes, weighted, *, direction, rule, min_weighted,
     eq = np.array(equity, dtype=float)
     peak = np.maximum.accumulate(eq)
     max_dd = round(float(np.max((peak - eq) / peak) * 100.0), 1) if len(eq) else 0.0
-    return {
+    out = {
         "roi": round(roi, 2), "final_balance": round(balance, 2),
         "total_trades": entries, "win_rate": win_rate,
         "profit_factor": profit_factor if np.isfinite(profit_factor) else 99.0,
         "expectancy_r": expectancy_r, "avg_r": avg_r, "max_drawdown": max_dd,
     }
+    if return_series:
+        out["equity"] = equity_ts
+        out["trades"] = trade_log
+    return out
+
+
+# ==========================================================================
+# PYRAMIDING variant — holds up to max_legs concurrent legs, adding ONLY in a
+# confirmed trend (never in chop). Separate from _simulate_exit so the validated
+# single-leg math stays byte-for-byte identical; this runs only when max_legs > 1.
+# ==========================================================================
+def _simulate_exit_pyr(df, votes, weighted, *, direction, rule, min_weighted,
+                       risk_pct, style, max_legs=2, add_atr=1.0, add_spacing=2,
+                       cooldown_bars=0, initial_balance=1000.0,
+                       fee_override=None, slip_bps=None, return_series=False):
+    """Like _simulate_exit but pyramids: it ADDS a leg (up to max_legs) only when
+    the trend keeps confirming — the entry signal is still active in the same
+    direction AND price has advanced >= add_atr ATR beyond the most recent leg.
+    That price-progress gate is the anti-chop rule: a ranging/choppy market never
+    makes sustained ATR-scaled progress, so no extra legs are stacked; a real
+    trend does, so winners get added to. Each leg carries its own stop/trail/BE; a
+    signal flip (or per-leg stop/time) closes legs. Same cost model as the single
+    simulator. Partial take-profit is intentionally omitted here (adds replace it)."""
+    tp_atr    = style.get("tp_atr")
+    sl_atr    = float(style.get("sl_atr", 1.5))
+    trail_atr = style.get("trail_atr")
+    be_atr    = style.get("be_atr")
+    time_bars = style.get("time_bars")
+    trend_exit = bool(style.get("trend_exit", False))
+
+    fee_rate  = float(DEFAULT_TAKER_FEE if fee_override is None else fee_override)
+    slip      = (5.0 if slip_bps is None else float(slip_bps)) / 10000.0
+    funding_pb = 0.00005
+    is_margin = (direction in ("BOTH", "SHORT"))
+
+    closes = df["close"].values.astype(float)
+    highs  = df["high"].values.astype(float)
+    lows   = df["low"].values.astype(float)
+    idx    = df.index
+    atr_a  = df["atr"].values.astype(float) if "atr" in df.columns else (closes * 0.01)
+
+    balance = float(initial_balance)
+    legs = []
+    entries = 0
+    trade_pnls = []
+    trade_rs   = []
+    equity = [balance]
+    equity_ts = [{"ts": _fmt_ts(idx[0]), "equity": round(float(balance), 2)}] if (return_series and len(idx)) else []
+    trade_log = []
+    last_exit_bar = -10**9
+    last_add_bar = -10**9
+    signal_has_reset = True
+    max_legs = max(1, int(max_legs))
+    add_dist = float(add_atr) if add_atr is not None else 1.0
+    add_spacing = max(1, int(add_spacing))
+
+    def _sig(i):
+        v = votes[i]; wv = weighted[i]
+        n_strats = max(1, int(round(np.nanmax(np.abs(votes)) if len(votes) else 1)))
+        if rule == "AND":
+            if v >= n_strats and wv > 0:    return 1
+            if v <= -n_strats and wv < 0:   return -1
+            return 0
+        if v > 0 and wv >= min_weighted:    return 1
+        if v < 0 and wv <= -min_weighted:   return -1
+        return 0
+
+    def _open_leg(sdir, price, atr, i):
+        stop_dist = atr * sl_atr
+        if stop_dist <= 0:
+            return None
+        size = (balance * (risk_pct / 100.0)) / stop_dist
+        notional = size * price
+        if notional > balance:            # spot: no leverage
+            size = balance / price; notional = size * price
+        if size <= 0:
+            return None
+        entry_fill = price * (1 + slip) if sdir > 0 else price * (1 - slip)
+        tp = None
+        if tp_atr is not None:
+            tp = entry_fill + atr * tp_atr if sdir > 0 else entry_fill - atr * tp_atr
+        sl = entry_fill - atr * sl_atr if sdir > 0 else entry_fill + atr * sl_atr
+        return {"type": "long" if sdir > 0 else "short", "entry": entry_fill,
+                "size": size, "tp": tp, "sl": sl, "entry_bar": i, "entry_atr": atr,
+                "be_done": False, "risk0": stop_dist * size, "_fee": notional * fee_rate}
+
+    def _record_close(leg, fill, bar_i, reason):
+        nonlocal balance
+        size = leg["size"]
+        if leg["type"] == "long":
+            gross = (fill - leg["entry"]) * size
+        else:
+            gross = (leg["entry"] - fill) * size
+        fee = abs(size * fill) * fee_rate
+        held = max(0, bar_i - leg["entry_bar"])
+        fund = (abs(size * leg["entry"]) * funding_pb * held) if (leg["type"] == "short" or is_margin) else 0.0
+        net = gross - fee - fund
+        balance += net
+        trade_pnls.append(net)
+        risk0 = leg["risk0"]
+        r_mult = net / risk0 if risk0 > 0 else 0.0
+        trade_rs.append(r_mult)
+        equity.append(balance)
+        if return_series:
+            trade_log.append({
+                "entry_ts": _fmt_ts(idx[leg["entry_bar"]]), "exit_ts": _fmt_ts(idx[bar_i]),
+                "direction": leg["type"], "entry_price": round(float(leg["entry"]), 6),
+                "exit_price": round(float(fill), 6), "pnl": round(float(net), 2),
+                "r": round(float(r_mult), 3), "reason": reason})
+            equity_ts.append({"ts": _fmt_ts(idx[bar_i]), "equity": round(float(balance), 2)})
+
+    for i in range(len(df)):
+        price = closes[i]
+        dir_sign = (1 if legs[0]["type"] == "long" else -1) if legs else 0
+
+        if legs:
+            # trailing / breakeven per leg
+            for leg in legs:
+                atr0 = leg["entry_atr"]
+                if trail_atr is not None and atr0 > 0:
+                    if leg["type"] == "long":
+                        leg["sl"] = max(leg["sl"], price - trail_atr * atr0)
+                    else:
+                        leg["sl"] = min(leg["sl"], price + trail_atr * atr0)
+                if be_atr is not None and not leg["be_done"] and atr0 > 0:
+                    if leg["type"] == "long" and highs[i] >= leg["entry"] + be_atr * atr0:
+                        leg["sl"] = max(leg["sl"], leg["entry"]); leg["be_done"] = True
+                    elif leg["type"] == "short" and lows[i] <= leg["entry"] - be_atr * atr0:
+                        leg["sl"] = min(leg["sl"], leg["entry"]); leg["be_done"] = True
+
+            # signal flip closes EVERY leg at once
+            flip = False
+            if trend_exit:
+                s0 = _sig(i)
+                flip = (dir_sign > 0 and s0 < 0) or (dir_sign < 0 and s0 > 0)
+            if flip:
+                for leg in legs:
+                    fill = price * (1 - slip) if leg["type"] == "long" else price * (1 + slip)
+                    _record_close(leg, fill, i, "FLIP")
+                legs = []; last_exit_bar = i
+            else:
+                survivors = []
+                for leg in legs:
+                    exit_price = None; reason = None
+                    hit_sl = (lows[i] <= leg["sl"]) if leg["type"] == "long" else (highs[i] >= leg["sl"])
+                    hit_tp = False
+                    if tp_atr is not None and leg.get("tp") is not None:
+                        hit_tp = (highs[i] >= leg["tp"]) if leg["type"] == "long" else (lows[i] <= leg["tp"])
+                    if hit_sl:
+                        exit_price, reason = leg["sl"], "SL"
+                    elif hit_tp:
+                        exit_price, reason = leg["tp"], "TP"
+                    elif time_bars is not None and (i - leg["entry_bar"]) >= int(time_bars):
+                        exit_price, reason = price, "TIME"
+                    if exit_price is not None:
+                        fill = exit_price * (1 - slip) if leg["type"] == "long" else exit_price * (1 + slip)
+                        _record_close(leg, fill, i, reason)
+                    else:
+                        survivors.append(leg)
+                if legs and not survivors:
+                    last_exit_bar = i
+                legs = survivors
+
+        s = _sig(i)
+        if s == 1 and direction == "SHORT": s = 0
+        if s == -1 and direction == "LONG": s = 0
+        if s == 0:
+            signal_has_reset = True
+
+        if not legs:
+            can_enter = signal_has_reset and (i - last_exit_bar) >= cooldown_bars
+            atr = atr_a[i]
+            if s != 0 and can_enter and atr > 0 and np.isfinite(atr):
+                leg = _open_leg(s, price, atr, i)
+                if leg:
+                    balance -= leg.pop("_fee"); legs.append(leg)
+                    entries += 1; last_add_bar = i; signal_has_reset = False
+        elif len(legs) < max_legs and (i - last_add_bar) >= add_spacing:
+            # ADD a leg only in a confirmed trend: signal still same-direction AND
+            # price advanced >= add_dist ATR beyond the last leg (the anti-chop gate).
+            last_leg = legs[-1]; atr0 = last_leg["entry_atr"]; atr = atr_a[i]
+            advanced = (price >= last_leg["entry"] + add_dist * atr0) if dir_sign > 0 else (price <= last_leg["entry"] - add_dist * atr0)
+            if s == dir_sign and atr0 > 0 and advanced and atr > 0 and np.isfinite(atr):
+                leg = _open_leg(dir_sign, price, atr, i)
+                if leg:
+                    balance -= leg.pop("_fee"); legs.append(leg)
+                    entries += 1; last_add_bar = i
+
+    for leg in legs:
+        fill = closes[-1] * (1 - slip) if leg["type"] == "long" else closes[-1] * (1 + slip)
+        _record_close(leg, fill, len(df) - 1, "EOD")
+    legs = []
+
+    roi = ((balance - initial_balance) / initial_balance) * 100.0
+    wins = [p for p in trade_pnls if p > 0]
+    losses = [p for p in trade_pnls if p <= 0]
+    win_rate = round(100.0 * len(wins) / len(trade_pnls), 1) if trade_pnls else 0.0
+    gross_win = sum(wins); gross_loss = abs(sum(losses))
+    profit_factor = round(gross_win / gross_loss, 2) if gross_loss > 0 else (float("inf") if gross_win > 0 else 0.0)
+    expectancy_r = round(float(np.mean(trade_rs)), 3) if trade_rs else 0.0
+    eq = np.array(equity, dtype=float)
+    peak = np.maximum.accumulate(eq)
+    max_dd = round(float(np.max((peak - eq) / peak) * 100.0), 1) if len(eq) else 0.0
+    out = {
+        "roi": round(roi, 2), "final_balance": round(balance, 2),
+        "total_trades": entries, "win_rate": win_rate,
+        "profit_factor": profit_factor if np.isfinite(profit_factor) else 99.0,
+        "expectancy_r": expectancy_r, "avg_r": expectancy_r, "max_drawdown": max_dd,
+    }
+    if return_series:
+        out["equity"] = equity_ts
+        out["trades"] = trade_log
+    return out
 
 
 # ==========================================================================
@@ -371,6 +649,98 @@ def _score_one(symbol, tf, entry_name, direction, style_name):
         "mean_profit_factor": round(float(np.mean([p for p in pfs if np.isfinite(p)])), 2) if pfs else 0.0,
         "mean_max_dd": round(float(np.mean(dds)), 1), "total_trades": trades,
         "coin_edge": bool(has_edge),
+    }
+
+
+# ==========================================================================
+# single on-demand run — powers the Strategy Lab UI (read-only backtest)
+# ==========================================================================
+def lab_options():
+    """The choices the Strategy Lab UI offers, incl. the live fleet's defaults."""
+    return {
+        "symbols": SYMBOLS, "timeframes": TIMEFRAMES,
+        "directions": ["LONG", "SHORT", "BOTH"],
+        "entries": list(ENTRIES.keys()), "styles": list(EXIT_STYLES.keys()),
+        "fleet_default": {"entry": "regime", "style": "trend_ride",
+                          "long_tf": "4h", "short_tf": "1d",
+                          "note": "The live fleet runs entry=regime, exit=trend_ride: "
+                                  "LONG on 4h, SHORT on 1d. Pick those to backtest what "
+                                  "the fleet actually trades."},
+    }
+
+
+def run_single(symbol="BTC-USD", timeframe="4h", entry="regime", direction="LONG",
+               style="trend_ride", risk_pct=1.0, start=None, end=None,
+               initial_balance=1000.0, max_legs=1, add_atr=1.0):
+    """One config, full detail — the SAME validated simulator the fleet's exit
+    research uses (_simulate_exit), so the Strategy Lab shows exactly what the
+    fleet would trade. Returns metrics + equity curve + per-trade log + a
+    buy&hold benchmark over the same window. Read-only; never touches live bots."""
+    if entry not in ENTRIES:
+        return {"error": f"unknown entry '{entry}'", "known_entries": list(ENTRIES.keys())}
+    style_d = EXIT_STYLES.get(style)
+    if style_d is None:
+        return {"error": f"unknown style '{style}'", "known_styles": list(EXIT_STYLES.keys())}
+    direction = (direction or "LONG").upper()
+    if direction not in ("LONG", "SHORT", "BOTH"):
+        direction = "LONG"
+    feat = _prep(symbol, timeframe)
+    if feat is None:
+        return {"error": f"insufficient data for {symbol} {timeframe}"}
+    v, w = _votes_for(symbol, timeframe, entry, feat)
+    n = len(feat)
+    a, b = 0, n
+    # Date-range slice. The feature index is tz-aware (UTC); the incoming date
+    # strings are tz-naive, so align them to the index's tz before comparing
+    # (a tz-aware vs tz-naive comparison raises and would drop the whole filter).
+    _tz = getattr(feat.index, "tz", None)
+    def _align(x):
+        t = pd.Timestamp(x)
+        if _tz is not None and t.tzinfo is None:
+            t = t.tz_localize(_tz)
+        elif _tz is None and t.tzinfo is not None:
+            t = t.tz_localize(None)
+        return t
+    try:
+        if start:
+            a = int(feat.index.searchsorted(_align(start)))
+        if end:
+            b = int(feat.index.searchsorted(_align(end), side="right"))
+    except Exception as e:
+        log.warning(f"run_single date-slice failed ({start}..{end}): {e}")
+        a, b = 0, n
+    a = max(0, min(a, n)); b = max(a, min(b, n))
+    if b - a < 30:
+        return {"error": "selected window too small (need >= 30 bars of history)"}
+    sl_df = feat.iloc[a:b]
+    try:
+        _legs = max(1, int(max_legs or 1))
+        if _legs > 1:
+            m = _simulate_exit_pyr(sl_df, v[a:b], w[a:b], direction=direction, rule="OR",
+                                   min_weighted=0.3, risk_pct=float(risk_pct or 1.0), style=style_d,
+                                   max_legs=_legs, add_atr=float(add_atr or 1.0),
+                                   initial_balance=float(initial_balance), return_series=True)
+        else:
+            m = _simulate_exit(sl_df, v[a:b], w[a:b], direction=direction, rule="OR",
+                               min_weighted=0.3, risk_pct=float(risk_pct or 1.0), style=style_d,
+                               initial_balance=float(initial_balance), return_series=True)
+    except Exception as e:
+        log.warning(f"run_single {symbol} {timeframe} {entry}/{style} failed: {e}")
+        return {"error": f"simulation failed: {e}"}
+    closes = sl_df["close"].astype(float).values
+    bh = ((float(closes[-1]) / float(closes[0])) - 1.0) * 100.0 if len(closes) >= 2 and closes[0] > 0 else 0.0
+    return {
+        "symbol": symbol, "timeframe": timeframe, "entry": entry,
+        "direction": direction, "style": style, "risk_pct": float(risk_pct or 1.0),
+        "max_legs": max(1, int(max_legs or 1)), "add_atr": float(add_atr or 1.0),
+        "initial_balance": float(initial_balance),
+        "window": {"start": _fmt_ts(sl_df.index[0]), "end": _fmt_ts(sl_df.index[-1]), "bars": int(b - a)},
+        "metrics": {k: m.get(k) for k in ("roi", "final_balance", "total_trades",
+                                          "win_rate", "profit_factor", "expectancy_r",
+                                          "avg_r", "max_drawdown")},
+        "equity": m.get("equity", []),
+        "trades": m.get("trades", []),
+        "buy_hold_pct": round(float(bh), 2),
     }
 
 
@@ -503,7 +873,8 @@ def portfolio_test(symbols=None, timeframe="1d", entry="trend", direction="LONG"
 #   3) PER-COIN detail — see the coins that FAIL, not just the average.
 # ==========================================================================
 def validate_exit(symbol=None, timeframe="4h", entry="trend", direction="LONG",
-                  style="trend_ride", holdout_frac=0.25, fee_mult=2.0, slip_mult=3.0):
+                  style="trend_ride", holdout_frac=0.25, fee_mult=2.0, slip_mult=3.0,
+                  max_legs=1, add_atr=1.0, write=True):
     """Confirm ONE exit config out-of-sample + under cost stress, per coin.
     Returns a verdict: ROBUST only if it stays positive (ROI and expectancy R) on
     >= MIN_COINS_GENERALIZE coins in BOTH the clean holdout AND the stressed one."""
@@ -529,6 +900,11 @@ def validate_exit(symbol=None, timeframe="4h", entry="trend", direction="LONG",
             continue
 
         def _run(fee, slb):
+            if int(max_legs) > 1:
+                return _simulate_exit_pyr(feat.iloc[ho], v[ho], w[ho], direction=direction,
+                                          rule="OR", min_weighted=0.3, risk_pct=1.0, style=style_d,
+                                          max_legs=int(max_legs), add_atr=float(add_atr),
+                                          fee_override=fee, slip_bps=slb)
             return _simulate_exit(feat.iloc[ho], v[ho], w[ho], direction=direction,
                                   rule="OR", min_weighted=0.3, risk_pct=1.0, style=style_d,
                                   fee_override=fee, slip_bps=slb)
@@ -548,12 +924,33 @@ def validate_exit(symbol=None, timeframe="4h", entry="trend", direction="LONG",
     n_pos = sum(1 for r in valid if r["survives"])
     n_str = sum(1 for r in valid if r["survives_stress"])
     robust = n_pos >= MIN_COINS_GENERALIZE and n_str >= MIN_COINS_GENERALIZE
+    # A coin is CLEARED for live use only if it survives BOTH the clean holdout
+    # AND the cost-stress rerun. This exact list gates live pyramiding per coin.
+    cleared = [r["symbol"] for r in valid if r.get("survives") and r.get("survives_stress")]
+    cfg = {"timeframe": timeframe, "entry": entry, "direction": direction,
+           "style": style, "holdout_frac": holdout_frac,
+           "fee_mult": fee_mult, "slip_mult": slip_mult,
+           "max_legs": int(max_legs), "add_atr": float(add_atr)}
+    if write:
+        try:
+            reg = all_eligibility()
+            reg[_elig_key(timeframe, entry, direction, style, max_legs)] = {
+                "generated": datetime.now(timezone.utc).isoformat(),
+                "verdict": "ROBUST" if robust else "NOT ROBUST",
+                "cleared_coins": cleared, "config": cfg,
+                "per_coin": [{"symbol": r.get("symbol"), "survives": bool(r.get("survives")),
+                              "survives_stress": bool(r.get("survives_stress"))} for r in valid],
+            }
+            with open(ELIG_PATH, "w") as f:
+                json.dump(reg, f, indent=2)
+            log.info(f"eligibility: {_elig_key(timeframe, entry, direction, style, max_legs)} cleared={cleared}")
+        except Exception as e:
+            log.warning(f"eligibility write failed: {e}")
     return {
         "generated": datetime.now(timezone.utc).isoformat(),
-        "config": {"timeframe": timeframe, "entry": entry, "direction": direction,
-                   "style": style, "holdout_frac": holdout_frac,
-                   "fee_mult": fee_mult, "slip_mult": slip_mult},
+        "config": cfg,
         "coins_tested": len(valid), "survives_oos": n_pos, "survives_stress": n_str,
+        "cleared_coins": cleared,
         "verdict": "ROBUST" if robust else "NOT ROBUST",
         "note": ("Holdout is the final slice of history rerun for THIS one config only "
                  "(no 96-way selection), then stressed with harsher costs. A ROBUST "

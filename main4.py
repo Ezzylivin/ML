@@ -60,6 +60,10 @@ logger = logging.getLogger("NEO-Engine")
 GLOBAL_SESSION: Optional[aiohttp.ClientSession] = None
 ACTIVE_BOTS = {}
 TASK_REGISTRY = {}
+# 🛑 Global emergency kill switch. When on, ALL bots stop opening NEW entries
+# (open positions are still managed by their stops/exits). Toggle via
+# POST /api/fleet/killswitch. Resets to off on restart.
+KILL_SWITCH = {"on": False}
 
 # ============================================================
 # 🧠 PREDICTOR MODEL IN-MEMORY CACHE
@@ -387,6 +391,15 @@ SELF_LEARN_TF      = os.getenv("SELF_LEARN_TIMEFRAME", "1h")
 # judge). Default 4 => with a 6h cycle, a deep refresh once a day.
 SELF_LEARN_DEEP_EVERY = int(os.getenv("SELF_LEARN_DEEP_EVERY", "4"))
 
+# The live FLEET trades these coins on these timeframes. The self-learning ledger
+# model must be trained for exactly these (coin, tf) pairs — otherwise the file
+# the fleet bots look up ({coin}_{tf}_ledger_model.joblib) never exists and the
+# gate stays a no-op. (train_ledger_model keys the FILE by tf but reads a coin's
+# whole history, so training 4h + 1d just produces the names the fleet queries.)
+LEDGER_FLEET_SYMBOLS = [s.strip() for s in os.getenv(
+    "LEDGER_FLEET_SYMBOLS", "BTC-USD,ETH-USD,SOL-USD,DOGE-USD,XRP-USD").split(",") if s.strip()]
+LEDGER_FLEET_TFS = [s.strip() for s in os.getenv("LEDGER_FLEET_TFS", "4h,1d").split(",") if s.strip()]
+
 
 def _run_self_learn_once(deep=False):
     """Blocking (runs in a worker thread). Each cycle: retrain XGB+RF experts
@@ -406,12 +419,23 @@ def _run_self_learn_once(deep=False):
             logger.error(f"🧠 experts {sym} failed: {e}")
 
     # 2. Ledger model — learns from the bot's OWN closed trades (features->win/loss).
+    #    Train the (coin, tf) pairs the LIVE FLEET actually queries (5 coins x
+    #    4h/1d) PLUS the self-learn TF, so the self-learning gate can activate for
+    #    the fleet — not just the 1h self-learn models. Each (coin, tf) is a no-op
+    #    until that coin has enough closed trades (ledger_trainer.MIN_SAMPLES).
     try:
         from ledger_trainer import train_ledger_model
-        for sym in SELF_LEARN_SYMBOLS:
-            lr = train_ledger_model(sym, SELF_LEARN_TF)
-            changed = changed or bool(lr.get("trained"))
-            logger.info(f"🧠 ledger {sym}: {lr}")
+        _led_syms = sorted(set(SELF_LEARN_SYMBOLS) | set(LEDGER_FLEET_SYMBOLS))
+        _led_tfs = sorted(set([SELF_LEARN_TF]) | set(LEDGER_FLEET_TFS))
+        for sym in _led_syms:
+            for tf in _led_tfs:
+                try:
+                    lr = train_ledger_model(sym, tf)
+                    changed = changed or bool(lr.get("trained"))
+                    if lr.get("trained"):
+                        logger.info(f"🧠 ledger {sym} {tf}: {lr}")
+                except Exception as e:
+                    logger.error(f"🧠 ledger {sym} {tf} failed: {e}")
     except Exception as e:
         logger.error(f"🧠 ledger training failed: {e}")
 
@@ -1904,7 +1928,8 @@ async def live_neural_heartbeat(user_id: str):
                     not is_drawdown_tripped and under_daily_trade_cap and enough_votes and
                     is_trend_aligned and adx_trending and volume_confirmed and
                     adaptive_gate and market_gate_passed and is_short_allowed and time_gate_passed and
-                    direction_allowed and macro_ok and not fleet_halt and not system_halt
+                    direction_allowed and macro_ok and not fleet_halt and not system_halt and
+                    not KILL_SWITCH['on']
                 )
 
                 # STDOUT decision diagnostic (emit_log goes to the Node UI, not
@@ -2025,7 +2050,7 @@ async def live_neural_heartbeat(user_id: str):
                         ("Direction",    bool(direction_allowed)),
                         ("Macro tilt",   bool(macro_ok)),
                         ("Cooldown",     bool(market_gate_passed)),
-                        ("Risk breaker", not (is_circuit_breaker_tripped or is_drawdown_tripped or fleet_halt or system_halt)),
+                        ("Risk breaker", not (is_circuit_breaker_tripped or is_drawdown_tripped or fleet_halt or system_halt or KILL_SWITCH['on'])),
                     ]
                     _passed = sum(1 for _, _ok in _gate_flags if _ok)
                     _ntot = len(_gate_flags)
@@ -2040,8 +2065,19 @@ async def live_neural_heartbeat(user_id: str):
                             _frac += max(0.0, min(1.0, float(current_adx) / _minadx))
                         except Exception:
                             pass
-                    _readiness = 100 if all_filters_pass else min(99, round(100 * _frac / _ntot))
-                    _blocker = next((_k for _k, _ok in _gate_flags if not _ok), None)
+                    # A bot is only truly "about to fire" when the gates are clear AND a
+                    # directional entry signal actually exists (sig != 0). All gates green
+                    # with a FLAT signal = waiting for the setup to appear, NOT 100%.
+                    _has_signal = (sig != 0)
+                    if all_filters_pass and _has_signal:
+                        _readiness = 100
+                        _blocker = None
+                    elif all_filters_pass:
+                        _readiness = 95
+                        _blocker = "Signal"
+                    else:
+                        _readiness = min(99, round(100 * _frac / _ntot))
+                        _blocker = next((_k for _k, _ok in _gate_flags if not _ok), None)
 
                     bot.update({
                         "currentBalance":    round(current_equity, 2),
@@ -3002,18 +3038,111 @@ async def run_exitlab_portfolio(timeframe: str = "1d", entry: str = "trend",
 async def run_exitlab_validate(timeframe: str = "4h", entry: str = "trend",
                                direction: str = "LONG", style: str = "trend_ride",
                                holdout_frac: float = 0.25, fee_mult: float = 2.0,
-                               slip_mult: float = 3.0, symbol: Optional[str] = None):
+                               slip_mult: float = 3.0, symbol: Optional[str] = None,
+                               max_legs: int = 1, add_atr: float = 1.0):
     """Hard-validate ONE exit config: rerun it on ONLY the untouched final slice of
     history (one config, no 96-way selection) and again under fee/slippage stress,
-    per coin. Verdict ROBUST only if it stays positive on >=3 coins in BOTH."""
+    per coin. max_legs>1 validates the pyramiding variant. Verdict ROBUST only if it
+    stays positive on >=3 coins in BOTH."""
     try:
         from exit_lab import validate_exit
         return await asyncio.to_thread(
             validate_exit, symbol, timeframe, entry, direction, style,
-            float(holdout_frac), float(fee_mult), float(slip_mult))
+            float(holdout_frac), float(fee_mult), float(slip_mult),
+            int(max_legs), float(add_atr))
     except Exception as e:
         logger.error(f"❌ exit-lab validate error: {e}")
         return JSONResponse(status_code=500, content={"status": "failed", "error": str(e)})
+
+
+# =============================================================
+# STRATEGY LAB — on-demand single-config backtest for the UI.
+# Reuses the VALIDATED exit_lab simulator, so what a user backtests here is
+# exactly what the live fleet trades (regime entry + trend_ride fixed-stop exit).
+# Read-only: never touches ACTIVE_BOTS or the ledger.
+# =============================================================
+@app.get("/api/strategylab/options")
+async def strategylab_options():
+    """Choices for the Strategy Lab UI (coins, timeframes, entries, exit styles,
+    and the live fleet's default config)."""
+    try:
+        from exit_lab import lab_options
+        return lab_options()
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "failed", "error": str(e)})
+
+
+@app.post("/api/strategylab/run")
+async def strategylab_run(symbol: str = "BTC-USD", timeframe: str = "4h",
+                          entry: str = "regime", direction: str = "LONG",
+                          style: str = "trend_ride", risk_pct: float = 1.0,
+                          start: Optional[str] = None, end: Optional[str] = None,
+                          initial_balance: float = 1000.0,
+                          max_legs: int = 1, add_atr: float = 1.0):
+    """One-config backtest using exit_lab (the validated money-math behind the
+    fleet). max_legs>1 enables pyramiding (adds legs only in a confirmed trend,
+    never in chop). Returns metrics + equity curve + per-trade log + a buy&hold
+    benchmark. Read-only; runs off the event loop."""
+    try:
+        from exit_lab import run_single
+        return await asyncio.to_thread(
+            run_single, symbol, timeframe, entry, direction, style,
+            float(risk_pct), start, end, float(initial_balance),
+            int(max_legs), float(add_atr))
+    except Exception as e:
+        logger.error(f"❌ strategy-lab error: {e}")
+        return JSONResponse(status_code=500, content={"status": "failed", "error": str(e)})
+
+
+@app.get("/api/fleet/eligibility")
+async def fleet_eligibility():
+    """Which coins are CLEARED for live pyramiding, per validated config — the
+    bridge from the Strategy Lab's hard validation to the live fleet. A coin
+    appears here only if it survived BOTH the out-of-sample holdout and the
+    cost-stress test. Read-only."""
+    try:
+        from exit_lab import all_eligibility
+        return {"registry": all_eligibility()}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "failed", "error": str(e)})
+
+
+@app.get("/api/fleet/learning")
+async def fleet_learning():
+    """Self-learning status: the ledger models trained from the fleet's OWN closed
+    trades (entry features -> win/loss), and each coin's progress toward the
+    training threshold. The gate activates per coin/tf once it has enough trades.
+    Read-only."""
+    import glob
+    try:
+        from ledger_trainer import MIN_SAMPLES
+    except Exception:
+        MIN_SAMPLES = 60
+    models = []
+    try:
+        for p in glob.glob(os.path.join(MODEL_DIR, "*_ledger_model.joblib")):
+            try:
+                payload = joblib.load(p)
+                models.append({
+                    "model": os.path.basename(p).replace("_ledger_model.joblib", ""),
+                    "n_samples": int(payload.get("n_samples", 0)),
+                    "win_rate": round(float(payload.get("win_rate", 0)) * 100, 1),
+                })
+            except Exception:
+                pass
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "failed", "error": str(e)})
+    progress = []
+    for sym in LEDGER_FLEET_SYMBOLS:
+        try:
+            st = trade_recorder.stats(sym)
+            progress.append({"symbol": sym, "trades": int(st.get("trades", 0)), "needed": int(MIN_SAMPLES)})
+        except Exception:
+            pass
+    return {"enabled": SELF_LEARN_ENABLED, "min_trades": int(MIN_SAMPLES),
+            "refresh_hours": SELF_LEARN_HOURS, "models": models,
+            "fleet_symbols": LEDGER_FLEET_SYMBOLS, "fleet_tfs": LEDGER_FLEET_TFS,
+            "progress": progress}
 
 
 @app.get("/api/bot/status")
@@ -3088,12 +3217,15 @@ class FleetStartRequest(BaseModel):
     fleetMaxDrawdownPct: Optional[float] = 20.0   # portfolio-level drawdown halt
     sizeByConviction: Optional[bool] = False      # opt-in conviction position sizing
     longOnly: Optional[bool] = False              # True = SPOT mode (long legs only, no shorts/margin)
+    riskPct: Optional[float] = 1.0                # % of each bot's capital risked per trade (to the ATR stop)
+    maxLegs: Optional[int] = 1                    # pyramiding: max concurrent legs per LONG bot (only applied to validation-cleared coins)
     bots: Optional[List[Dict[str, Any]]] = None   # explicit override: [{suffix, config}]
 
 FleetStartRequest.model_rebuild()
 
 
-def _validated_fleet_specs(symbols, cap, long_tf="4h", short_tf="1d", include_shorts=True):
+def _validated_fleet_specs(symbols, cap, long_tf="4h", short_tf="1d", include_shorts=True, risk_pct=1.0,
+                           max_legs=1, cleared_coins=None):
     """The paper-deploy roster: per coin, the validated LONG stream (regime =
     ema_cloud + btc_regime, trend_ride) + the validated DAILY SHORT stream
     (regime, trend_ride). Longs harvest up-trends; daily shorts harvest risk-off
@@ -3104,23 +3236,46 @@ def _validated_fleet_specs(symbols, cap, long_tf="4h", short_tf="1d", include_sh
     trend_ride scored mean expectancy 0.596 R / PF 1.92 across 4 of 5 coins,
     vs 0.139 R / PF 1.27 for the old `macd_crossover` momentum entry."""
     specs = []
+    _cleared = set(cleared_coins or [])
     for sym in symbols:
+        # Pyramiding is allowed ONLY when the user asked for it (max_legs>1) AND
+        # this coin survived the hard validation (holdout + cost stress). Every
+        # other coin — and every SHORT leg — stays at the validated single leg.
+        # The live loop splits risk across legs (riskPercentage / maxPyramiding),
+        # so total per-trade risk is unchanged, and only adds in a confirmed,
+        # profitable climb (never in chop).
+        _mp = int(max_legs) if (int(max_legs) > 1 and sym in _cleared) else 1
         specs.append({"suffix": "long", "config": {
             "symbol": sym, "timeframe": long_tf, "strategies": [{"code": "ema_cloud"}, {"code": "btc_regime"}],
             "comboConfig": {"combinationRule": "OR"}, "trade_direction": "LONG",
             "exitMode": "trend_ride", "atrSlMultiplier": 2.0, "mlMode": "off",
-            "macroRegimeGate": True,
-            "riskPercentage": 1.0, "initialBalance": cap, "capitalAllocation": cap,
+            "macroRegimeGate": True, "maxPyramiding": _mp,
+            # Self-learning gate: once this coin has enough closed trades, the bot
+            # trains a win/loss model on its OWN trades and skips setups it has
+            # learned tend to lose (P(win) below the floor). No-op until trained.
+            "useLedgerGate": True, "ledgerMinPwin": 0.30,
+            # Safety stack, set explicitly (= the engine's active defaults) so the
+            # fleet's guards are intentional and locked against a future default
+            # change: ADX trend filter, volume floor, ATR volatility band,
+            # price/200-EMA alignment, a 5%/day per-bot loss breaker, and a daily
+            # trade-count runaway guard (the one previously effectively off).
+            "minAdx": 20.0, "minVolRatio": 0.2, "minAtrPct": 0.1, "maxAtrPct": 5.0,
+            "requireTrendAlignment": True, "maxDailyLoss": 5.0, "maxTradesPerDay": 8,
+            "riskPercentage": float(risk_pct), "initialBalance": cap, "capitalAllocation": cap,
             "enablePartialExit": False}})
         # SPOT mode (longOnly) skips the margin SHORT legs entirely — long side is
-        # the validated edge; shorts are an opt-in margin hedge.
+        # the validated edge; shorts are an opt-in margin hedge. Shorts stay single
+        # leg (the pyramiding validation was run on the LONG side).
         if include_shorts:
             specs.append({"suffix": "short", "config": {
                 "symbol": sym, "timeframe": short_tf, "strategies": [{"code": "ema_cloud"}, {"code": "btc_regime"}],
                 "comboConfig": {"combinationRule": "OR"}, "trade_direction": "SHORT",
                 "enable_shorting": True, "leverage": 1, "exitMode": "trend_ride",
-                "atrSlMultiplier": 2.0, "mlMode": "off", "macroRegimeGate": True,
-                "riskPercentage": 1.0, "initialBalance": cap, "capitalAllocation": cap,
+                "atrSlMultiplier": 2.0, "mlMode": "off", "macroRegimeGate": True, "maxPyramiding": 1,
+                "useLedgerGate": True, "ledgerMinPwin": 0.30,
+                "minAdx": 20.0, "minVolRatio": 0.2, "minAtrPct": 0.1, "maxAtrPct": 5.0,
+                "requireTrendAlignment": True, "maxDailyLoss": 5.0, "maxTradesPerDay": 8,
+                "riskPercentage": float(risk_pct), "initialBalance": cap, "capitalAllocation": cap,
                 "enablePartialExit": False}})
     return specs
 
@@ -3144,8 +3299,23 @@ async def fleet_start(req: FleetStartRequest, request: Request):
     base = req.userId.strip()
     symbols = req.symbols or ["BTC-USD", "ETH-USD", "SOL-USD"]
     cap = float(req.capitalEach or 1000.0)
+    # Pyramiding gate: if the user enabled it (maxLegs>1), only coins CLEARED by
+    # the Strategy Lab's hard validation may pyramid; everything else stays single.
+    _legs = int(req.maxLegs or 1)
+    _cleared = []
+    if _legs > 1:
+        try:
+            from exit_lab import load_eligibility
+            _cleared = load_eligibility(timeframe=(req.longTimeframe or "4h"), entry="regime",
+                                        direction="LONG", style="trend_ride", max_legs=_legs)
+            logger.info("⚙️ FLEET pyramiding x%d requested — validation-cleared coins: %s", _legs, _cleared)
+        except Exception as e:
+            logger.warning(f"fleet eligibility load failed (pyramiding disabled): {e}")
+            _cleared = []
     specs = req.bots or _validated_fleet_specs(symbols, cap, req.longTimeframe, req.shortTimeframe,
-                                               include_shorts=not bool(req.longOnly))
+                                               include_shorts=not bool(req.longOnly),
+                                               risk_pct=float(req.riskPct or 1.0),
+                                               max_legs=_legs, cleared_coins=_cleared)
     started, failed = [], []
     for spec in specs:
         cfg = spec.get("config", {})
@@ -3209,7 +3379,7 @@ async def fleet_status(userId: str):
     bots.sort(key=lambda x: (x.get("symbol") or "", x.get("direction") or ""))
     return {"fleet": base, "count": len(bots),
             "total_balance": round(total_eq, 2), "total_unrealized": round(total_upnl, 2),
-            "open_positions": total_pos, "ts": time.time(), "bots": bots}
+            "open_positions": total_pos, "kill_switch": KILL_SWITCH["on"], "ts": time.time(), "bots": bots}
 
 
 @app.get("/api/fleet/regime")
@@ -3304,6 +3474,7 @@ async def fleet_bot_detail(userId: str, symbol: str, side: str):
         "tradeHistory": th[-200:],
         "signalsMap": bot.get("signalsMap", {}),
         "currentConfidence": bot.get("currentConfidence", 50),
+        "lastTradeScore": bot.get("lastTradeScore"),  # TradeQualityScorer 0-100 composite at last entry
         "trades": len([t for t in th if t.get("type") == "exit"]),
     }
 
@@ -3351,6 +3522,43 @@ async def fleet_stop(req: BotStopRequest, request: Request):
         except Exception as e:
             logger.error(f"❌ fleet stop {key} failed: {e}")
     return {"status": "stopped", "fleet": base, "count": len(stopped), "stopped": sorted(stopped)}
+
+
+@app.post("/api/fleet/killswitch")
+async def fleet_killswitch(request: Request, on: bool = True):
+    """Emergency kill switch: when on, every bot stops opening NEW entries (open
+    positions keep being managed by their stops/exits). Requires the internal key."""
+    _require_fleet_key(request)
+    KILL_SWITCH["on"] = bool(on)
+    logger.warning("🛑 KILL SWITCH %s", "ENGAGED — all new entries halted" if KILL_SWITCH["on"] else "released")
+    return {"kill_switch": KILL_SWITCH["on"]}
+
+
+@app.post("/api/fleet/risk")
+async def fleet_set_risk(request: Request, userId: str, riskPct: float):
+    """Update the risk %% per trade on a RUNNING fleet without re-igniting. The
+    change is mutated into each child bot's live config in place, so it takes
+    effect on the NEXT entry; positions already open keep the size and stop they
+    were given at entry (we never resize a live trade). Requires the internal key."""
+    _require_fleet_key(request)
+    base = str(userId).strip()
+    prefix = f"{base}::"
+    rp = max(0.1, min(50.0, float(riskPct)))
+    updated = []
+    for key, b in list(ACTIVE_BOTS.items()):
+        if not key.startswith(prefix):
+            continue
+        cfg = b.setdefault("config", {})
+        cfg["riskPercentage"] = rp
+        cfg["risk_percentage"] = rp
+        try:
+            DatabaseHandler.save_state(key, b)
+        except Exception as e:
+            logger.warning(f"fleet risk save_state {key} failed: {e}")
+        updated.append(key)
+    logger.info("⚙️ FLEET RISK %s -> %.2f%% on %d bots (new entries only)", base, rp, len(updated))
+    return {"fleet": base, "risk_pct": rp, "updated": len(updated),
+            "note": "Applies to NEW entries only; open positions keep their original size and stop."}
 
 
 # =============================================================

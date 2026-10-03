@@ -91,7 +91,13 @@ def load_eligibility(timeframe="4h", entry="regime", direction="LONG", style="tr
     return list(rec.get("cleared_coins", [])) if rec else []
 
 # ---- universe -------------------------------------------------------------
-SYMBOLS    = ["BTC-USD", "ETH-USD", "SOL-USD", "DOGE-USD", "XRP-USD"]
+# ALL coins we have full (1h+4h+1d) data for. Testing/validation/research run
+# across this whole universe. Override with env UNIVERSE_SYMBOLS (comma-sep) and
+# just drop a {COIN}-1h.csv in data/ to add a coin.
+SYMBOLS    = [s.strip().upper() for s in os.getenv(
+    "UNIVERSE_SYMBOLS",
+    "BTC-USD,ETH-USD,SOL-USD,XRP-USD,DOGE-USD,ADA-USD,SUI-USD,PEPE-USD,SHIB-USD"
+).split(",") if s.strip()]
 TIMEFRAMES = ["4h", "1d"]          # 1h is fee-dominated; focus where survival is plausible
 DIRECTIONS = ["LONG", "BOTH"]
 

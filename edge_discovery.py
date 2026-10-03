@@ -31,7 +31,10 @@ log = logging.getLogger("edge_discovery")
 OUT_PATH = os.path.join(DATA_DIR, "discovered_edges.json")
 
 # ---- search space (edit to widen/narrow the hunt) ---------------------------
-SYMBOLS    = ["BTC-USD", "ETH-USD", "SOL-USD", "DOGE-USD", "XRP-USD"]
+SYMBOLS    = [s.strip().upper() for s in os.getenv(
+    "UNIVERSE_SYMBOLS",
+    "BTC-USD,ETH-USD,SOL-USD,XRP-USD,DOGE-USD,ADA-USD,SUI-USD,PEPE-USD,SHIB-USD"
+).split(",") if s.strip()]
 TIMEFRAMES = ["1h", "4h", "1d"]
 STRAT_SETS = {
     "trend":      [{"code": "supertrend"}, {"code": "ema_cloud"}, {"code": "sma_crossover"}],

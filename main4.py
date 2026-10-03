@@ -618,7 +618,7 @@ RECALIB_LEVELS = {
 RECALIB_STATE = {"running": False, "last": None}
 
 
-async def _run_recalibration(level="strict", max_legs=None):
+async def _run_recalibration(level="strict", max_legs=None, coinbase_one=False):
     """Apply exit_lab's hardened thresholds for this run, re-validate the fleet's
     config (4h / regime / LONG / trend_ride) at each pyramiding depth, and let
     validate_exit rewrite the eligibility registry. Thresholds are ALWAYS restored
@@ -631,12 +631,16 @@ async def _run_recalibration(level="strict", max_legs=None):
         legs_max = max(1, int(max_legs or RECALIB_MAX_LEGS))
         snap = (exit_lab.MIN_HOLDOUT_TRADES, exit_lab.MIN_SURV_EXPECTANCY_R,
                 exit_lab.MIN_SURV_PROFIT_FACTOR, exit_lab.MIN_COINS_GENERALIZE)
+        fee_snap = (exit_lab.DEFAULT_MAKER_FEE, exit_lab.DEFAULT_TAKER_FEE)
         by_config = []
         try:
             exit_lab.MIN_HOLDOUT_TRADES     = lv["min_trades"]
             exit_lab.MIN_SURV_EXPECTANCY_R  = lv["exp_r"]
             exit_lab.MIN_SURV_PROFIT_FACTOR = lv["pf"]
             exit_lab.MIN_COINS_GENERALIZE   = lv["coins"]
+            if coinbase_one:  # model a Coinbase One account: 0% Coinbase (long) fees
+                exit_lab.DEFAULT_MAKER_FEE = 0.0
+                exit_lab.DEFAULT_TAKER_FEE = 0.0
             # Test EVERY entry signal (not just the fleet's "regime") x each
             # pyramiding depth, so we learn which entry actually survives.
             for entry in RECALIB_ENTRIES:
@@ -655,9 +659,10 @@ async def _run_recalibration(level="strict", max_legs=None):
         finally:
             (exit_lab.MIN_HOLDOUT_TRADES, exit_lab.MIN_SURV_EXPECTANCY_R,
              exit_lab.MIN_SURV_PROFIT_FACTOR, exit_lab.MIN_COINS_GENERALIZE) = snap
+            (exit_lab.DEFAULT_MAKER_FEE, exit_lab.DEFAULT_TAKER_FEE) = fee_snap
         summary = {
             "ran_at": datetime.now(timezone.utc).isoformat(),
-            "level": level, "thresholds": lv,
+            "level": level, "thresholds": lv, "coinbase_one": bool(coinbase_one),
             "entries": RECALIB_ENTRIES, "by_config": by_config,
         }
         RECALIB_STATE["last"] = summary
@@ -3291,7 +3296,7 @@ async def fleet_eligibility():
 
 
 @app.post("/api/fleet/recalibrate")
-async def fleet_recalibrate(level: Optional[str] = None, max_legs: Optional[int] = None):
+async def fleet_recalibrate(level: Optional[str] = None, max_legs: Optional[int] = None, coinbase_one: bool = False):
     """Harden the system NOW: re-run the hard out-of-sample + cost-stress validation
     that gates live pyramiding, at a chosen strictness (normal|strict|paranoid), and
     rewrite the eligibility registry. Runs in the background so this returns
@@ -3300,7 +3305,7 @@ async def fleet_recalibrate(level: Optional[str] = None, max_legs: Optional[int]
         return {"status": "already_running", "last": RECALIB_STATE.get("last")}
     lvl = level if level in RECALIB_LEVELS else RECALIB_LEVEL
     RECALIB_STATE["running"] = True
-    asyncio.create_task(_run_recalibration(lvl, max_legs))
+    asyncio.create_task(_run_recalibration(lvl, max_legs, coinbase_one))
     return {"status": "started", "level": lvl}
 
 

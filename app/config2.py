@@ -82,6 +82,15 @@ DEFAULT_MAKER_FEE = float(os.getenv("MAKER_FEE_PCT", "0.004"))        # 0.4% —
 KRAKEN_TAKER_FEE  = float(os.getenv("KRAKEN_TAKER_FEE_PCT", "0.008")) # 0.8% — Kraken Pro base taker (2026)
 SLIPPAGE_BPS      = float(os.getenv("SLIPPAGE_BPS", "1.0"))           # 0.1% expected slippage (market orders)
 
+# Coinbase One (flat ~$30/mo subscription) = 0% Coinbase trading fees up to a
+# monthly volume cap (standard fees above it). With COINBASE_ONE=true the
+# Coinbase (spot / LONG) maker+taker fees drop to 0 here, so paper/validation ==
+# a Coinbase One account. Kraken (shorts) is NOT covered and keeps its fee.
+COINBASE_ONE = os.getenv("COINBASE_ONE", "false").lower() == "true"
+if COINBASE_ONE:
+    DEFAULT_TAKER_FEE = 0.0
+    DEFAULT_MAKER_FEE = 0.0
+
 # ============================================================
 # 🔧 FIX #3: CREDENTIALS REMOVED FROM SOURCE CODE
 # ============================================================
